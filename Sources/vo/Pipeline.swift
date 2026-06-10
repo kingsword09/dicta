@@ -124,17 +124,11 @@ struct Pipeline {
             throw VoError.noCompatibleAudioFormat
         }
 
-        // Warm the model / ANE before the first audio frame arrives. Without this
-        // the first finalized chunk takes ~2.2 s while the analyzer compiles on
-        // the Neural Engine; calling `prepareToAnalyze(in:)` ahead of `start`
-        // brings that down to ~1.45 s in our testing, and as a side effect makes
-        // the first volatile fragment land sooner too.
-        try await analyzer.prepareToAnalyze(in: analyzerFormat)
-
-        let (inputSeq, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
-        try await analyzer.start(inputSequence: inputSeq)
-
-        // Start the appropriate audio source.
+        // Start audio capture and the resampler BEFORE warming the analyzer so
+        // any speech the user produces during the ANE compile window lands in
+        // the inputBuilder buffer instead of being lost. Without this ordering
+        // the ~1.5 s `prepareToAnalyze` would silently drop the first words of
+        // a session.
         let audioStream: AsyncStream<AVAudioPCMBuffer>
         let stopper: () async -> Void
 
@@ -155,6 +149,35 @@ struct Pipeline {
         // mic and speaker capture before any save prompt blocks the main task.
         await stops.register(AsyncStopper(action: stopper))
 
+        let (inputSeq, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
+
+        // Audio resampling task: pull from the source, convert to analyzer format,
+        // and push into the SpeechAnalyzer input stream. Starting it now means
+        // buffers accumulate in `inputBuilder` while the analyzer warms up; the
+        // analyzer drains them once `start(inputSequence:)` connects below.
+        let resampler = Task.detached {
+            for await buffer in audioStream {
+                if let converted = convertBuffer(buffer, to: analyzerFormat) {
+                    inputBuilder.yield(AnalyzerInput(buffer: converted))
+                }
+            }
+            inputBuilder.finish()
+        }
+
+        // Warm the model / ANE in parallel with the now-flowing capture so the
+        // first finalized chunk comes back in ~1.45 s instead of ~2.2 s. If
+        // either prepare/start throws, the resampler we just spawned would be
+        // orphaned, so cancel it explicitly before propagating.
+        do {
+            try await analyzer.prepareToAnalyze(in: analyzerFormat)
+            try await analyzer.start(inputSequence: inputSeq)
+        } catch {
+            resampler.cancel()
+            inputBuilder.finish()
+            await stopper()
+            throw error
+        }
+
         // Translation worker for this channel (only when targetLocale is set).
         // TranslationSession is non-Sendable so we create it inside the Task closure.
         let (chunkSeq, chunkBuilder) = AsyncStream<(Int, String)>.makeStream()
@@ -173,17 +196,6 @@ struct Pipeline {
                 }
             }
         } : nil
-
-        // Audio resampling task: pull from the source, convert to analyzer format,
-        // and push into the SpeechAnalyzer input stream.
-        let resampler = Task.detached {
-            for await buffer in audioStream {
-                if let converted = convertBuffer(buffer, to: analyzerFormat) {
-                    inputBuilder.yield(AnalyzerInput(buffer: converted))
-                }
-            }
-            inputBuilder.finish()
-        }
 
         // Drain transcriber results.
         do {
