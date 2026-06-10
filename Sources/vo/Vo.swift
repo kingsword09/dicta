@@ -36,6 +36,9 @@ struct Vo: AsyncParsableCommand {
     @Flag(name: .long, help: "Force machine-readable JSON output. Without this, auto-detects based on whether STDOUT is a TTY.")
     var json: Bool = false
 
+    @Option(name: .long, help: "Save finalized chunks as JSONL to this path on exit. Skips the interactive save prompt.")
+    var log: String?
+
     // MARK: - Run
 
     func run() async throws {
@@ -50,7 +53,8 @@ struct Vo: AsyncParsableCommand {
             json: json,
             mic: !noMic,
             speaker: !noSpeaker,
-            voiceProcessing: voiceProcessing
+            voiceProcessing: voiceProcessing,
+            log: log
         )
     }
 }
