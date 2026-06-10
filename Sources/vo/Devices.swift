@@ -90,14 +90,21 @@ private func queryInputChannelCount(_ deviceID: AudioDeviceID) throws -> Int {
     )
     var size: UInt32 = 0
     var status = AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &size)
+    guard status == noErr, size > 0 else { return 0 }
+
+    // AudioBufferList is variable-length; devices with multiple streams report a
+    // size larger than a single AudioBufferList, so allocate the reported size
+    // instead of one fixed-size element.
+    let raw = UnsafeMutableRawPointer.allocate(
+        byteCount: Int(size),
+        alignment: MemoryLayout<AudioBufferList>.alignment
+    )
+    defer { raw.deallocate() }
+    let listPtr = raw.bindMemory(to: AudioBufferList.self, capacity: 1)
+    status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, listPtr)
     guard status == noErr else { return 0 }
 
-    let buffer = UnsafeMutablePointer<AudioBufferList>.allocate(capacity: 1)
-    defer { buffer.deallocate() }
-    status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, buffer)
-    guard status == noErr else { return 0 }
-
-    let abl = UnsafeMutableAudioBufferListPointer(buffer)
+    let abl = UnsafeMutableAudioBufferListPointer(listPtr)
     var channels = 0
     for i in 0..<abl.count {
         channels += Int(abl[i].mNumberChannels)

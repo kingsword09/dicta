@@ -172,13 +172,17 @@ extension CMSampleBuffer {
         )
         guard status == noErr else { return nil }
 
-        // Copy from the source ABL into the freshly allocated PCM buffer.
-        let srcList = UnsafeMutableAudioBufferListPointer(ablPtr)
-        let dstList = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
-        for i in 0..<min(srcList.count, dstList.count) {
-            let copyBytes = Int(min(srcList[i].mDataByteSize, dstList[i].mDataByteSize))
-            if let s = srcList[i].mData, let d = dstList[i].mData {
-                memcpy(d, s, copyBytes)
+        // Copy from the source ABL into the freshly allocated PCM buffer. The ABL's
+        // mData pointers point into blockBuffer, and ARC is free to release it after
+        // its last use above, so pin it for the duration of the copy.
+        withExtendedLifetime(blockBuffer) {
+            let srcList = UnsafeMutableAudioBufferListPointer(ablPtr)
+            let dstList = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
+            for i in 0..<min(srcList.count, dstList.count) {
+                let copyBytes = Int(min(srcList[i].mDataByteSize, dstList[i].mDataByteSize))
+                if let s = srcList[i].mData, let d = dstList[i].mData {
+                    memcpy(d, s, copyBytes)
+                }
             }
         }
         return buffer

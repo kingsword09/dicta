@@ -200,8 +200,14 @@ struct Pipeline {
         // Drain transcriber results.
         do {
             for try await result in transcriber.results {
-                let text = String(result.text.characters)
+                // SpeechTranscriber emits every chunk after the first with a leading
+                // space (stream-concatenation artifact). Trim so TTY columns stay
+                // aligned and the space doesn't leak into JSONL or translation input.
+                let text = String(result.text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
                 if result.isFinal {
+                    // Whitespace-only finals carry no content; skip them so they
+                    // don't burn a seq or emit blank lines.
+                    guard !text.isEmpty else { continue }
                     let seq = await counter.next()
                     let timing = ChunkTiming(
                         timestamp: Date(),
