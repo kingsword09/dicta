@@ -148,25 +148,33 @@ func resolveSessionLog(sessionLog: SessionLog, canPrompt: Bool) -> String? {
         return nil
     }
 
-    guard canPrompt, let target = promptForLogPath(defaultPath: sessionLog.suggestedPath) else {
+    guard canPrompt else {
         sessionLog.discard()
         return nil
     }
 
-    if !confirmOverwriteIfNeeded(path: (target as NSString).expandingTildeInPath) {
-        sessionLog.discard()
-        return "Discarded log (declined overwrite of \(target))"
-    }
+    // Loop so that declining an overwrite returns the user to the save prompt
+    // for a different path rather than throwing the captured session away.
+    while true {
+        guard let target = promptForLogPath(defaultPath: sessionLog.suggestedPath) else {
+            sessionLog.discard()
+            return nil
+        }
 
-    do {
-        try sessionLog.move(to: target)
-        return "Saved log: \(target)"
-    } catch {
-        // Move failed (bad path, permission, etc.). Keep the temp file so the user
-        // can recover it manually, and mark it so the Listen.swift safety-net defer
-        // will not discard the file we just told the user we preserved.
-        sessionLog.preservedForRecovery = true
-        return "Failed to save log to \(target): \(error.localizedDescription)\n  Log preserved at: \(sessionLog.path)"
+        if !confirmOverwriteIfNeeded(path: (target as NSString).expandingTildeInPath) {
+            continue
+        }
+
+        do {
+            try sessionLog.move(to: target)
+            return "Saved log: \(target)"
+        } catch {
+            // Move failed (bad path, permission, etc.). Keep the temp file so the user
+            // can recover it manually, and mark it so the Listen.swift safety-net defer
+            // will not discard the file we just told the user we preserved.
+            sessionLog.preservedForRecovery = true
+            return "Failed to save log to \(target): \(error.localizedDescription)\n  Log preserved at: \(sessionLog.path)"
+        }
     }
 }
 
