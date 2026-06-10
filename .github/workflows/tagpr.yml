@@ -1,0 +1,72 @@
+name: tagpr
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  tagpr:
+    runs-on: ubuntu-latest
+    outputs:
+      tagpr-tag: ${{ steps.run-tagpr.outputs.tag }}
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - id: run-tagpr
+        name: Run tagpr
+        uses: Songmu/tagpr@v1.20.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  assets:
+    needs: tagpr
+    if: needs.tagpr.outputs.tagpr-tag != ''
+    runs-on: macos-26
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.tagpr.outputs.tagpr-tag }}
+          fetch-depth: 0
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcode-select -p
+          swift --version
+
+      - name: Build release binary
+        run: ./scripts/build.sh
+
+      - name: Package archive
+        id: pkg
+        run: |
+          TAG="${{ needs.tagpr.outputs.tagpr-tag }}"
+          VERSION="${TAG#v}"
+          BIN="$(swift build -c release --arch arm64 --show-bin-path)/vo"
+          STAGE="$(mktemp -d)"
+          cp "$BIN" "$STAGE/vo"
+          cp LICENSE README.md "$STAGE/"
+          ARCHIVE="vo_v${VERSION}_darwin_arm64.tar.gz"
+          tar -C "$STAGE" -czf "$ARCHIVE" .
+          shasum -a 256 "$ARCHIVE" | tee "${ARCHIVE}.sha256"
+          {
+            echo "archive=${ARCHIVE}"
+            echo "checksum=${ARCHIVE}.sha256"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload assets to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ needs.tagpr.outputs.tagpr-tag }}" \
+            "${{ steps.pkg.outputs.archive }}" \
+            "${{ steps.pkg.outputs.checksum }}" \
+            --clobber

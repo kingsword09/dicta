@@ -1,0 +1,6 @@
+[tagpr]
+	vPrefix = true
+	releaseBranch = main
+	release = draft
+	versionFile = Sources/vo/Vo.swift
+	command = "./scripts/sync-version.sh"
