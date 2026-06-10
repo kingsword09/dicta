@@ -112,6 +112,15 @@ final class SessionLog: @unchecked Sendable {
     func move(to destination: String) throws {
         precondition(!isExplicit, "move() is for temp mode only")
         let resolvedDst = (destination as NSString).expandingTildeInPath
+
+        // Belt and suspenders: the prompt layer already rejects directory targets, but
+        // refuse here too so a future caller can't accidentally `removeItem` a whole
+        // directory tree just because they reused move() with a different prompt.
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: resolvedDst, isDirectory: &isDir), isDir.boolValue {
+            throw SessionLogError.destinationIsDirectory(path: resolvedDst)
+        }
+
         let dst = URL(fileURLWithPath: resolvedDst)
         let src = URL(fileURLWithPath: path)
         try? FileManager.default.removeItem(at: dst)
@@ -191,7 +200,14 @@ func resolveSessionLog(sessionLog: SessionLog, canPrompt: Bool) -> String? {
 /// `false` to abort. In non-TTY contexts we proceed silently (matching existing semantics
 /// of file creation), since there is no human to ask.
 private func confirmOverwriteIfNeeded(path: String) -> Bool {
-    guard FileManager.default.fileExists(atPath: path) else { return true }
+    var isDir: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir) else { return true }
+    // Refuse directory targets up front. "Overwrite a directory?" is the wrong
+    // question — saying yes here would let move() delete the whole tree.
+    if isDir.boolValue {
+        print("\(path) is a directory; choose a file path instead.")
+        return false
+    }
     guard canPromptForLog() else { return true }
     print("\(path) already exists. Overwrite? [y/N]: ", terminator: "")
     // stdout is line-buffered on a TTY, so a no-newline prompt would otherwise
@@ -200,6 +216,17 @@ private func confirmOverwriteIfNeeded(path: String) -> Bool {
     guard let line = readLine() else { return false }
     let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     return trimmed == "y" || trimmed == "yes"
+}
+
+enum SessionLogError: Error, CustomStringConvertible {
+    case destinationIsDirectory(path: String)
+
+    var description: String {
+        switch self {
+        case .destinationIsDirectory(let path):
+            return "Cannot write log to \(path): path is a directory."
+        }
+    }
 }
 
 /// Interactive prompt. Returns the chosen path, or nil if the user declined.
