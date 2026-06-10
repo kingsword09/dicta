@@ -102,7 +102,7 @@ actor StreamRenderer: Renderer {
             finalizedCount += 1
             if translationEnabled {
                 commitQueue.append(Pair(seq: seq, channel: channel, source: source, timing: timing, target: nil))
-                // Drain before redrawing: drainCommitQueue clears the live region
+                // Drain before redrawing. drainCommitQueue clears the live region
                 // as a side effect, so the reverse order would blank the pending
                 // "(translating…)" lines until the next event arrives.
                 drainCommitQueue()
