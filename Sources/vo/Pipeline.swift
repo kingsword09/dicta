@@ -103,10 +103,18 @@ struct Pipeline {
         counter: SeqCounter
     ) async throws {
         let willTranslate = targetLocale != nil
+        // `.fastResults` biases the transcriber toward a shorter context window so
+        // both volatile and finalized chunks arrive with lower latency. Apple
+        // documents an accuracy trade-off but it is acceptable here: the live
+        // region is a preview that gets replaced by the finalized line, and the
+        // finalized line still benefits from the lower latency. This pair of
+        // options (volatileResults + fastResults) is what
+        // `SpeechTranscriber.Preset.timeIndexedProgressiveTranscription` would
+        // give us; we spell it out explicitly to keep the trade-off readable.
         let transcriber = SpeechTranscriber(
             locale: sourceLocale,
             transcriptionOptions: [],
-            reportingOptions: [.volatileResults],
+            reportingOptions: [.volatileResults, .fastResults],
             attributeOptions: [.audioTimeRange]
         )
         let analyzer = SpeechAnalyzer(modules: [transcriber])
@@ -116,10 +124,11 @@ struct Pipeline {
             throw VoError.noCompatibleAudioFormat
         }
 
-        let (inputSeq, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
-        try await analyzer.start(inputSequence: inputSeq)
-
-        // Start the appropriate audio source.
+        // Start audio capture and the resampler BEFORE warming the analyzer so
+        // any speech the user produces during the ANE compile window lands in
+        // the inputBuilder buffer instead of being lost. Without this ordering
+        // the ~1.5 s `prepareToAnalyze` would silently drop the first words of
+        // a session.
         let audioStream: AsyncStream<AVAudioPCMBuffer>
         let stopper: () async -> Void
 
@@ -140,6 +149,35 @@ struct Pipeline {
         // mic and speaker capture before any save prompt blocks the main task.
         await stops.register(AsyncStopper(action: stopper))
 
+        let (inputSeq, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
+
+        // Audio resampling task: pull from the source, convert to analyzer format,
+        // and push into the SpeechAnalyzer input stream. Starting it now means
+        // buffers accumulate in `inputBuilder` while the analyzer warms up; the
+        // analyzer drains them once `start(inputSequence:)` connects below.
+        let resampler = Task.detached {
+            for await buffer in audioStream {
+                if let converted = convertBuffer(buffer, to: analyzerFormat) {
+                    inputBuilder.yield(AnalyzerInput(buffer: converted))
+                }
+            }
+            inputBuilder.finish()
+        }
+
+        // Warm the model / ANE in parallel with the now-flowing capture so the
+        // first finalized chunk comes back in ~1.45 s instead of ~2.2 s. If
+        // either prepare/start throws, the resampler we just spawned would be
+        // orphaned, so cancel it explicitly before propagating.
+        do {
+            try await analyzer.prepareToAnalyze(in: analyzerFormat)
+            try await analyzer.start(inputSequence: inputSeq)
+        } catch {
+            resampler.cancel()
+            inputBuilder.finish()
+            await stopper()
+            throw error
+        }
+
         // Translation worker for this channel (only when targetLocale is set).
         // TranslationSession is non-Sendable so we create it inside the Task closure.
         let (chunkSeq, chunkBuilder) = AsyncStream<(Int, String)>.makeStream()
@@ -158,17 +196,6 @@ struct Pipeline {
                 }
             }
         } : nil
-
-        // Audio resampling task: pull from the source, convert to analyzer format,
-        // and push into the SpeechAnalyzer input stream.
-        let resampler = Task.detached {
-            for await buffer in audioStream {
-                if let converted = convertBuffer(buffer, to: analyzerFormat) {
-                    inputBuilder.yield(AnalyzerInput(buffer: converted))
-                }
-            }
-            inputBuilder.finish()
-        }
 
         // Drain transcriber results.
         do {
