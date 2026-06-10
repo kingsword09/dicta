@@ -69,6 +69,12 @@ func runListen(
         printBanner(sourceLocale: sourceLocale, targetLocale: targetLocale, mic: mic, speaker: speaker)
     }
 
+    // pipeline.cancel() lets pipeline.run() below return, so after SIGINT the natural
+    // completion path races the handler to finalizeSession. The gate makes exactly one
+    // of them finalize (a double run would print the save prompt and summary twice and
+    // have two readLine calls fighting over stdin).
+    let finalizeGate = FinalizeGate()
+
     let signalSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
     signalSource.setEventHandler {
         Task {
@@ -76,6 +82,12 @@ func runListen(
             // and speaker capture keep running for as long as the user is reading
             // the prompt, which is wasted work and a small privacy footgun.
             await pipeline.cancel()
+            guard await finalizeGate.claim() else {
+                // Finalization is already underway (a repeat Ctrl-C, likely at the
+                // save prompt). Abort hard but leave the temp file in place so the
+                // captured session is still recoverable.
+                Foundation.exit(130)
+            }
             await renderer.handle(.eof)
             await renderer.flush()
             let count = await renderer.utteranceCount
@@ -93,13 +105,34 @@ func runListen(
 
     try await pipeline.run()
 
-    let count = await renderer.utteranceCount
-    await finalizeSession(
-        sessionLog: sessionLog,
-        isTTY: isTTY,
-        count: count,
-        duration: Date().timeIntervalSince(startedAt)
-    )
+    if await finalizeGate.claim() {
+        let count = await renderer.utteranceCount
+        await finalizeSession(
+            sessionLog: sessionLog,
+            isTTY: isTTY,
+            count: count,
+            duration: Date().timeIntervalSince(startedAt)
+        )
+    } else {
+        // The SIGINT handler claimed finalization and will exit the process.
+        // Returning here would tear it down mid-prompt, so park until that exit.
+        while true {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+    }
+}
+
+/// One-shot gate so the SIGINT handler and the natural completion path cannot both
+/// run finalizeSession.
+private actor FinalizeGate {
+    private var claimed = false
+
+    /// Returns `true` exactly once; every later call returns `false`.
+    func claim() -> Bool {
+        if claimed { return false }
+        claimed = true
+        return true
+    }
 }
 
 /// Close the session log, run save/discard logic, then print the exit summary.
