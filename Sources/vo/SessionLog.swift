@@ -47,11 +47,21 @@ final class SessionLog: @unchecked Sendable {
 
         if let explicitPath {
             let resolved = (explicitPath as NSString).expandingTildeInPath
+            // Treat each failure mode as a distinct early-exit path so the message
+            // the user sees matches what actually went wrong — previously a directory
+            // target produced two prints ("is a directory; ..." plus "Aborted: ...
+            // already exists.") that contradicted each other.
+            if isDirectory(resolved) {
+                print("Cannot write transcript to \(resolved): path is a directory.")
+                Foundation.exit(0)
+            }
             if !confirmOverwriteIfNeeded(path: resolved) {
                 print("Aborted: \(resolved) already exists.")
                 Foundation.exit(0)
             }
-            FileManager.default.createFile(atPath: resolved, contents: nil)
+            guard FileManager.default.createFile(atPath: resolved, contents: nil) else {
+                throw SessionLogError.createFailed(path: resolved)
+            }
             let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: resolved))
             // createFile already truncates an existing file to 0 bytes, but make the
             // overwrite-semantics explicit at the handle level so no future reader has
@@ -68,7 +78,9 @@ final class SessionLog: @unchecked Sendable {
         let tmpDir = NSTemporaryDirectory()
         let pid = ProcessInfo.processInfo.processIdentifier
         let tempPath = (tmpDir as NSString).appendingPathComponent("vo-\(stamp)-\(pid).jsonl")
-        FileManager.default.createFile(atPath: tempPath, contents: nil)
+        guard FileManager.default.createFile(atPath: tempPath, contents: nil) else {
+            throw SessionLogError.createFailed(path: tempPath)
+        }
         let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: tempPath))
         try? handle.truncate(atOffset: 0)
         return SessionLog(
@@ -144,6 +156,14 @@ final class SessionLog: @unchecked Sendable {
     }
 }
 
+/// `true` if `path` exists and is a directory. Used to refuse directory targets at the
+/// save prompt and at explicit-mode startup with a clear message instead of letting
+/// the failure surface as a confusing FileHandle / move() error later on.
+private func isDirectory(_ path: String) -> Bool {
+    var isDir: ObjCBool = false
+    return FileManager.default.fileExists(atPath: path, isDirectory: &isDir) && isDir.boolValue
+}
+
 /// Decide what to do with the session log on exit and execute it.
 /// Returns a short human-readable status message (or nil for silent).
 func resolveSessionLog(sessionLog: SessionLog, canPrompt: Bool) -> String? {
@@ -179,7 +199,12 @@ func resolveSessionLog(sessionLog: SessionLog, canPrompt: Bool) -> String? {
             return nil
         }
 
-        if !confirmOverwriteIfNeeded(path: (target as NSString).expandingTildeInPath) {
+        let resolvedTarget = (target as NSString).expandingTildeInPath
+        if isDirectory(resolvedTarget) {
+            print("\(resolvedTarget) is a directory; choose a file path instead.")
+            continue
+        }
+        if !confirmOverwriteIfNeeded(path: resolvedTarget) {
             continue
         }
 
@@ -199,15 +224,11 @@ func resolveSessionLog(sessionLog: SessionLog, canPrompt: Bool) -> String? {
 /// Prompt for overwrite confirmation if `path` already exists. Returns `true` to proceed,
 /// `false` to abort. In non-TTY contexts we proceed silently (matching existing semantics
 /// of file creation), since there is no human to ask.
+///
+/// Callers must check `isDirectory(_:)` first — this helper only handles the file-exists
+/// case and the dir branch was removed to keep failure messages single-purpose.
 private func confirmOverwriteIfNeeded(path: String) -> Bool {
-    var isDir: ObjCBool = false
-    guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir) else { return true }
-    // Refuse directory targets up front. "Overwrite a directory?" is the wrong
-    // question — saying yes here would let move() delete the whole tree.
-    if isDir.boolValue {
-        print("\(path) is a directory; choose a file path instead.")
-        return false
-    }
+    guard FileManager.default.fileExists(atPath: path) else { return true }
     guard canPromptForLog() else { return true }
     print("\(path) already exists. Overwrite? [y/N]: ", terminator: "")
     // stdout is line-buffered on a TTY, so a no-newline prompt would otherwise
@@ -220,11 +241,14 @@ private func confirmOverwriteIfNeeded(path: String) -> Bool {
 
 enum SessionLogError: Error, CustomStringConvertible {
     case destinationIsDirectory(path: String)
+    case createFailed(path: String)
 
     var description: String {
         switch self {
         case .destinationIsDirectory(let path):
-            return "Cannot write log to \(path): path is a directory."
+            return "Cannot write transcript to \(path): path is a directory."
+        case .createFailed(let path):
+            return "Could not create transcript file at \(path) (check that the parent directory exists and is writable)."
         }
     }
 }
