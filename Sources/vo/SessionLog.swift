@@ -84,9 +84,13 @@ final class SessionLog: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard !isClosed else { return }
-        if let data = (line + "\n").data(using: .utf8) {
-            try? fileHandle.write(contentsOf: data)
+        guard let data = (line + "\n").data(using: .utf8) else { return }
+        do {
+            try fileHandle.write(contentsOf: data)
             hasContent = true
+        } catch {
+            // Swallow but do not flip hasContent so the save/preserve path won't
+            // be triggered for a file that never received any bytes.
         }
     }
 
