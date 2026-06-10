@@ -21,6 +21,9 @@
 $ brew install k1LoW/tap/vo
 ```
 
+> [!NOTE]
+> `vo` is distributed as an ad-hoc signed binary. macOS attaches `com.apple.quarantine` to the downloaded tarball at the network-stack layer, so the formula runs `xattr -cr` against the installed binary in its `install` step to strip the attribute. Without this step, Gatekeeper would block the binary from launching on first run.
+
 **manually:**
 
 Download binary from [releases page](https://github.com/k1LoW/voio/releases)
