@@ -116,8 +116,12 @@ func runListen(
     } else {
         // The SIGINT handler claimed finalization and will exit the process.
         // Returning here would tear it down mid-prompt, so park until that exit.
+        // The handler calls Foundation.exit long before one interval elapses, so
+        // a long interval (rather than once per second) just avoids needless
+        // wakeups while we wait. The loop reparks if the sleep is ever cancelled.
+        let parkInterval: UInt64 = 3600 * 1_000_000_000  // 1 hour
         while true {
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            try? await Task.sleep(nanoseconds: parkInterval)
         }
     }
 }
