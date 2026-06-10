@@ -16,7 +16,21 @@ swift build -c release --arch arm64    # release
 .build/debug/vo --doctor               # environment check (no TCC required)
 ```
 
-There are no tests yet.
+## Test
+
+```bash
+./scripts/test.sh                      # Swift Testing suite (swift test under the hood)
+```
+
+Tests use Swift Testing (`import Testing`, `@Test`) in `Tests/voTests/`. They cover only the
+TCC-free pure logic: `StreamRenderer` JSONL output (source-order commit, volatile suppression,
+null-target on EOF), `VoError` messages, and `detectRenderMode`. The audio / Speech / Translation
+paths require TCC grants and macOS 26 hardware, so they are not unit-tested.
+
+`scripts/test.sh` exists because on a Command Line Tools-only install (no full Xcode) the Swift
+Testing framework and its `lib_TestingInterop` dylib are off the default search / rpath; the script
+injects the needed `-F` / `-rpath` flags only when that layout is detected. Under full Xcode (CI's
+`macos-26` runner) it runs a plain `swift test`. CI lives in `.github/workflows/test.yml`.
 
 ## Runtime requirements
 
