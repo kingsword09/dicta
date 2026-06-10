@@ -168,6 +168,17 @@ private func isDirectory(_ path: String) -> Bool {
     return FileManager.default.fileExists(atPath: path, isDirectory: &isDir) && isDir.boolValue
 }
 
+/// Render an `Error` for the user. Prefer the type's own `CustomStringConvertible`
+/// description so our `SessionLogError` cases show their action-oriented message
+/// ("path is a directory.") instead of NSError's generic
+/// "The operation couldn't be completed." that `localizedDescription` would produce.
+private func describe(_ error: Error) -> String {
+    if let custom = error as? CustomStringConvertible {
+        return custom.description
+    }
+    return error.localizedDescription
+}
+
 /// Decide what to do with the session log on exit and execute it.
 /// Returns a short human-readable status message (or nil for silent).
 func resolveSessionLog(sessionLog: SessionLog, canPrompt: Bool) -> String? {
@@ -220,7 +231,7 @@ func resolveSessionLog(sessionLog: SessionLog, canPrompt: Bool) -> String? {
             // can recover it manually, and mark it so the Listen.swift safety-net defer
             // will not discard the file we just told the user we preserved.
             sessionLog.preservedForRecovery = true
-            return "Failed to save transcript to \(target): \(error.localizedDescription)\n  Transcript preserved at: \(sessionLog.path)"
+            return "Failed to save transcript to \(target): \(describe(error))\n  Transcript preserved at: \(sessionLog.path)"
         }
     }
 }
