@@ -1,0 +1,232 @@
+import Foundation
+@preconcurrency import AVFoundation
+import Speech
+import Translation
+
+/// Monotonic sequence counter shared across channels.
+actor SeqCounter {
+    private var n = 0
+    func next() -> Int {
+        defer { n += 1 }
+        return n
+    }
+}
+
+/// End-to-end pipeline that orchestrates one or more audio channels.
+///
+/// For each enabled channel:
+///   AudioSource -> AVAudioConverter -> SpeechTranscriber -> finalized chunk
+///                                                       -> TranslationSession
+///                                                       -> Renderer
+///
+/// Mic and Speaker run concurrently in a TaskGroup but share one renderer + one seq counter,
+/// so the output order reflects which channel finalized first.
+struct Pipeline {
+    let sourceLocale: Locale
+    let targetLocale: Locale?  // nil = transcribe only, no translation
+    let renderer: any Renderer
+    let enableMic: Bool
+    let enableSpeaker: Bool
+    let voiceProcessing: Bool  // apply AEC + NR + AGC on mic input
+
+    func run() async throws {
+        let counter = SeqCounter()
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            if enableMic {
+                group.addTask {
+                    try await self.runChannel(channel: .mic, counter: counter)
+                }
+            }
+            if enableSpeaker {
+                group.addTask {
+                    try await self.runChannel(channel: .speaker, counter: counter)
+                }
+            }
+            for try await _ in group {}
+        }
+
+        await renderer.handle(.eof)
+        await renderer.flush()
+    }
+
+    // MARK: - Per-channel
+
+    private func runChannel(
+        channel: AudioChannel,
+        counter: SeqCounter
+    ) async throws {
+        let willTranslate = targetLocale != nil
+        let transcriber = SpeechTranscriber(
+            locale: sourceLocale,
+            transcriptionOptions: [],
+            reportingOptions: [.volatileResults],
+            attributeOptions: [.audioTimeRange]
+        )
+        let analyzer = SpeechAnalyzer(modules: [transcriber])
+        try await ensureSpeechAsset(for: transcriber, locale: sourceLocale)
+
+        guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
+            throw VoError.noCompatibleAudioFormat
+        }
+
+        let (inputSeq, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
+        try await analyzer.start(inputSequence: inputSeq)
+
+        // Start the appropriate audio source.
+        let audioStream: AsyncStream<AVAudioPCMBuffer>
+        let stopper: () async -> Void
+
+        switch channel {
+        case .mic:
+            let cap = MicCapture(voiceProcessing: voiceProcessing)
+            try cap.start()
+            audioStream = cap.stream
+            stopper = { cap.stop() }
+        case .speaker:
+            let cap = SpeakerCapture()
+            try await cap.start()
+            audioStream = cap.stream
+            stopper = { await cap.stop() }
+        }
+
+        // Translation worker for this channel (only when targetLocale is set).
+        // TranslationSession is non-Sendable so we create it inside the Task closure.
+        let (chunkSeq, chunkBuilder) = AsyncStream<(Int, String)>.makeStream()
+        let renderer = renderer
+        let sourceLang = sourceLocale.language
+        let targetLang = targetLocale?.language
+        let translator: Task<Void, Never>? = willTranslate ? Task {
+            guard let targetLang else { return }
+            let session = TranslationSession(installedSource: sourceLang, target: targetLang)
+            for await (seq, text) in chunkSeq {
+                do {
+                    let response = try await session.translate(text)
+                    await renderer.handle(.translated(seq: seq, target: response.targetText))
+                } catch {
+                    await renderer.handle(.translated(seq: seq, target: "[translation failed: \(error.localizedDescription)]"))
+                }
+            }
+        } : nil
+
+        // Audio resampling task: pull from the source, convert to analyzer format,
+        // and push into the SpeechAnalyzer input stream.
+        let resampler = Task.detached {
+            for await buffer in audioStream {
+                if let converted = convertBuffer(buffer, to: analyzerFormat) {
+                    inputBuilder.yield(AnalyzerInput(buffer: converted))
+                }
+            }
+            inputBuilder.finish()
+        }
+
+        // Drain transcriber results.
+        do {
+            for try await result in transcriber.results {
+                let text = String(result.text.characters)
+                if result.isFinal {
+                    let seq = await counter.next()
+                    let timing = ChunkTiming(
+                        timestamp: Date(),
+                        audioStart: result.range.start.isValid ? result.range.start.seconds : nil,
+                        audioEnd:   result.range.end.isValid   ? result.range.end.seconds   : nil
+                    )
+                    await renderer.handle(.finalized(channel: channel, seq: seq, source: text, timing: timing))
+                    if willTranslate {
+                        chunkBuilder.yield((seq, text))
+                    }
+                } else {
+                    await renderer.handle(.volatile(channel: channel, text: text))
+                }
+            }
+        } catch {
+            resampler.cancel()
+            chunkBuilder.finish()
+            translator?.cancel()
+            await stopper()
+            throw error
+        }
+
+        resampler.cancel()
+        await stopper()
+        chunkBuilder.finish()
+        await translator?.value
+    }
+
+    // MARK: - Helpers
+
+    private func ensureSpeechAsset(for transcriber: SpeechTranscriber, locale: Locale) async throws {
+        let supportedIDs = (await SpeechTranscriber.supportedLocales).map { $0.identifier(.bcp47) }
+        let isSupported = supportedIDs.contains(locale.identifier(.bcp47))
+        guard isSupported else {
+            throw VoError.unsupportedSpeechLocale(locale, supported: supportedIDs)
+        }
+
+        let installed = await SpeechTranscriber.installedLocales
+        let isInstalled = installed.contains { $0.identifier(.bcp47) == locale.identifier(.bcp47) }
+        if !isInstalled {
+            if let req = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
+                try await req.downloadAndInstall()
+            }
+        }
+    }
+}
+
+/// Convert one PCM buffer to the analyzer's preferred format. Handles sample-rate conversion.
+private func convertBuffer(_ source: AVAudioPCMBuffer, to dstFormat: AVAudioFormat) -> AVAudioPCMBuffer? {
+    let srcFormat = source.format
+    if srcFormat == dstFormat {
+        return source
+    }
+    guard let converter = AVAudioConverter(from: srcFormat, to: dstFormat) else { return nil }
+
+    let ratio = dstFormat.sampleRate / srcFormat.sampleRate
+    let outCapacity = AVAudioFrameCount(Double(source.frameLength) * ratio + 1024)
+    guard let dst = AVAudioPCMBuffer(pcmFormat: dstFormat, frameCapacity: outCapacity) else { return nil }
+
+    final class State: @unchecked Sendable { var consumed = false }
+    let state = State()
+    var error: NSError?
+    converter.convert(to: dst, error: &error) { _, status in
+        if state.consumed {
+            status.pointee = .endOfStream
+            return nil
+        }
+        state.consumed = true
+        status.pointee = .haveData
+        return source
+    }
+    return error == nil ? dst : nil
+}
+
+enum VoError: Error, CustomStringConvertible {
+    case noCompatibleAudioFormat
+    case unsupportedSpeechLocale(Locale, supported: [String])
+    case noDisplayForScreenCapture
+
+    var description: String {
+        switch self {
+        case .noCompatibleAudioFormat:
+            return "No audio format compatible with SpeechTranscriber is available on this device."
+
+        case .unsupportedSpeechLocale(let l, let supported):
+            let id = l.identifier(.bcp47)
+            let langCode = l.language.languageCode?.identifier ?? ""
+            let nearby = supported
+                .filter { $0.hasPrefix(langCode + "-") }
+                .sorted()
+            if !nearby.isEmpty {
+                return """
+                SpeechTranscriber does not support locale \(id). Try one of these regional variants:
+                  \(nearby.joined(separator: ", "))
+                """
+            }
+            return """
+            SpeechTranscriber does not support locale \(id). Run `vo --doctor` to see all supported locales.
+            """
+
+        case .noDisplayForScreenCapture:
+            return "No display available for ScreenCaptureKit. Speaker capture requires at least one display."
+        }
+    }
+}
