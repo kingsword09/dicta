@@ -103,10 +103,18 @@ struct Pipeline {
         counter: SeqCounter
     ) async throws {
         let willTranslate = targetLocale != nil
+        // `.fastResults` biases the transcriber toward a shorter context window so
+        // both volatile and finalized chunks arrive with lower latency. Apple
+        // documents an accuracy trade-off but it is acceptable here: the live
+        // region is a preview that gets replaced by the finalized line, and the
+        // finalized line still benefits from the lower latency. This pair of
+        // options (volatileResults + fastResults) is what
+        // `SpeechTranscriber.Preset.timeIndexedProgressiveTranscription` would
+        // give us; we spell it out explicitly to keep the trade-off readable.
         let transcriber = SpeechTranscriber(
             locale: sourceLocale,
             transcriptionOptions: [],
-            reportingOptions: [.volatileResults],
+            reportingOptions: [.volatileResults, .fastResults],
             attributeOptions: [.audioTimeRange]
         )
         let analyzer = SpeechAnalyzer(modules: [transcriber])
