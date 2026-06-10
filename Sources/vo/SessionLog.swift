@@ -19,6 +19,11 @@ final class SessionLog: @unchecked Sendable {
     /// `true` when `--log` was given. Explicit mode skips the prompt and bypasses the temp
     /// machinery entirely (no temp file ever exists).
     let isExplicit: Bool
+    /// Set when `resolveSessionLog` has intentionally kept the temp file in place (e.g. the
+    /// chosen move target failed and we surfaced its temp path to the user). The cleanup
+    /// `defer` in `Listen.swift` checks this so the safety-net discard does not destroy the
+    /// very recovery file we just promised to preserve.
+    fileprivate(set) var preservedForRecovery: Bool = false
 
     private let fileHandle: FileHandle
     private var hasContent: Bool = false
@@ -158,7 +163,9 @@ func resolveSessionLog(sessionLog: SessionLog, canPrompt: Bool) -> String? {
         return "Saved log: \(target)"
     } catch {
         // Move failed (bad path, permission, etc.). Keep the temp file so the user
-        // can recover it manually, and report where it is.
+        // can recover it manually, and mark it so the Listen.swift safety-net defer
+        // will not discard the file we just told the user we preserved.
+        sessionLog.preservedForRecovery = true
         return "Failed to save log to \(target): \(error.localizedDescription)\n  Log preserved at: \(sessionLog.path)"
     }
 }

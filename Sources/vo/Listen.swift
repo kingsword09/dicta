@@ -28,10 +28,13 @@ func runListen(
 
     // If we throw out of this function before finalizeSession runs (e.g. the pipeline
     // errors mid-stream), make sure no temp file is left behind. In explicit mode we
-    // leave the user-supplied file in place.
+    // leave the user-supplied file in place. We also skip discard when resolveSessionLog
+    // has flagged the temp file as preserved for manual recovery (move-target failure),
+    // since that is the one case where the temp file holding the captured data is what
+    // we want the user to find.
     defer {
         sessionLog.close()
-        if !sessionLog.isExplicit {
+        if !sessionLog.isExplicit && !sessionLog.preservedForRecovery {
             sessionLog.discard()
         }
     }
