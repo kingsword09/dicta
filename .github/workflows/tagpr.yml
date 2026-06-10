@@ -70,3 +70,20 @@ jobs:
             "${{ steps.pkg.outputs.archive }}" \
             "${{ steps.pkg.outputs.checksum }}" \
             --clobber
+
+  release:
+    needs: [tagpr, assets]
+    if: needs.tagpr.outputs.tagpr-tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api /repos/${{ github.repository }}/releases/generate-notes \
+              -f tag_name=${{ needs.tagpr.outputs.tagpr-tag }} --jq .body \
+            | gh release edit ${{ needs.tagpr.outputs.tagpr-tag }} \
+                --repo ${{ github.repository }} \
+                --draft=false --latest --notes-file=-
