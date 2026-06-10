@@ -194,6 +194,9 @@ private func confirmOverwriteIfNeeded(path: String) -> Bool {
     guard FileManager.default.fileExists(atPath: path) else { return true }
     guard canPromptForLog() else { return true }
     print("\(path) already exists. Overwrite? [y/N]: ", terminator: "")
+    // stdout is line-buffered on a TTY, so a no-newline prompt would otherwise
+    // sit in the buffer until readLine returns — the user would never see it.
+    fflush(stdout)
     guard let line = readLine() else { return false }
     let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     return trimmed == "y" || trimmed == "yes"
@@ -203,6 +206,7 @@ private func confirmOverwriteIfNeeded(path: String) -> Bool {
 private func promptForLogPath(defaultPath: String) -> String? {
     print("")
     print("Save log to \(defaultPath)? [Y/n/<path>]: ", terminator: "")
+    fflush(stdout)
     guard let line = readLine() else { return nil }
     let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
     if trimmed.isEmpty { return defaultPath }

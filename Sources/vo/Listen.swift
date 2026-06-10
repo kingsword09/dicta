@@ -98,7 +98,11 @@ private func finalizeSession(
     count: Int,
     duration: TimeInterval
 ) async {
-    let status = resolveSessionLog(sessionLog: sessionLog, canPrompt: canPromptForLog())
+    // Gate the save prompt on isTTY (renderer mode), not just on canPromptForLog().
+    // Otherwise `vo --json` run from an interactive shell — where STDIN and STDOUT
+    // are both TTYs but the renderer is emitting machine-readable JSONL — would
+    // interleave the prompt text into the JSONL stream and corrupt it.
+    let status = resolveSessionLog(sessionLog: sessionLog, canPrompt: isTTY && canPromptForLog())
     if isTTY {
         if let status { print(status) }
         printSummary(count: count, duration: duration)
