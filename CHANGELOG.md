@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.2.1](https://github.com/k1LoW/vo/compare/v0.2.0...v0.2.1) - 2026-06-10
+
+### Other Changes
+- fix: correctness and stability bugs surfaced by live runs by @k1LoW in https://github.com/k1LoW/vo/pull/10
+
 ## [v0.2.0](https://github.com/k1LoW/vo/compare/v0.1.1...v0.2.0) - 2026-06-10
 
 ### New Features 🎉
