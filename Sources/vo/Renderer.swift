@@ -51,6 +51,8 @@ actor StreamRenderer: Renderer {
     private let sourceLang: String
     private let targetLang: String
     private let translationEnabled: Bool
+    private let showChannelLabel: Bool
+    private let sourceColumnPad: String
     private let logSink: SessionLog?
 
     private var commitQueue: [Pair] = []
@@ -72,6 +74,7 @@ actor StreamRenderer: Renderer {
         sourceLang: String,
         targetLang: String,
         translationEnabled: Bool = true,
+        showChannelLabel: Bool = true,
         out: FileHandle = .standardOutput,
         logSink: SessionLog? = nil
     ) {
@@ -80,6 +83,10 @@ actor StreamRenderer: Renderer {
         self.sourceLang = sourceLang
         self.targetLang = targetLang
         self.translationEnabled = translationEnabled
+        self.showChannelLabel = showChannelLabel
+        // With label: "HH:MM:SS" (8) + " " (1) + "[mic]" (5) + "  " (2) = 16.
+        // Without:    "HH:MM:SS" (8) + "   " (3)                        = 11.
+        self.sourceColumnPad = String(repeating: " ", count: showChannelLabel ? 16 : 11)
         self.logSink = logSink
     }
 
@@ -158,7 +165,7 @@ actor StreamRenderer: Renderer {
 
         switch mode {
         case .tty:
-            writeLine("\(ttyTimestamp(timing.timestamp))  \(ttyChannel(channel))  \(source)")
+            writeLine("\(ttyHeader(timing.timestamp, channel))\(source)")
         case .jsonl:
             if let jsonl { writeLine(jsonl) }
         }
@@ -173,11 +180,11 @@ actor StreamRenderer: Renderer {
 
         switch mode {
         case .tty:
-            writeLine("\(ttyTimestamp(pair.timing.timestamp))  \(ttyChannel(pair.channel))  \(pair.source)")
+            writeLine("\(ttyHeader(pair.timing.timestamp, pair.channel))\(pair.source)")
             if let target {
-                writeLine("\(Self.sourceColumnPad)\u{001B}[38;5;244m\(target)\u{001B}[0m")
+                writeLine("\(sourceColumnPad)\u{001B}[38;5;244m\(target)\u{001B}[0m")
             } else {
-                writeLine("\(Self.sourceColumnPad)\u{001B}[38;5;240m(no translation)\u{001B}[0m")
+                writeLine("\(sourceColumnPad)\u{001B}[38;5;240m(no translation)\u{001B}[0m")
             }
         case .jsonl:
             if let jsonl { writeLine(jsonl) }
@@ -203,23 +210,35 @@ actor StreamRenderer: Renderer {
 
     // MARK: - TTY formatting helpers
 
-    /// Source text starts at column 17 = "HH:MM:SS" (8) + "  " (2) + "[MIC]" (5) + "  " (2).
-    /// Translation and (translating…) lines are indented to align with source text.
-    private static let sourceColumnPad = String(repeating: " ", count: 17)
+    /// Pad to where [mic]/[spk] starts on volatile lines (no timestamp). Only used
+    /// when channel labels are shown.
+    private static let channelColumnPad = String(repeating: " ", count: 9)
 
-    /// Pad to where [MIC]/[SPK] starts on volatile lines (no timestamp).
-    private static let channelColumnPad = String(repeating: " ", count: 10)
+    /// 256-color palette code for the given channel. Shared by the timestamp and
+    /// the [mic]/[spk] label so the eye reads both as the same channel.
+    private func channelColor(_ channel: AudioChannel) -> Int {
+        switch channel {
+        case .mic:     return 130
+        case .speaker: return 24
+        }
+    }
 
-    private func ttyTimestamp(_ date: Date) -> String {
+    private func ttyTimestamp(_ date: Date, channel: AudioChannel) -> String {
         let s = StreamRenderer.ttyTime.string(from: date)
-        return "\u{001B}[38;5;244m\(s)\u{001B}[0m"
+        return "\u{001B}[38;5;\(channelColor(channel))m\(s)\u{001B}[0m"
     }
 
     private func ttyChannel(_ channel: AudioChannel) -> String {
-        switch channel {
-        case .mic:     return "\u{001B}[1;38;5;166m[MIC]\u{001B}[0m"  // bold darker orange
-        case .speaker: return "\u{001B}[1;38;5;38m[SPK]\u{001B}[0m"   // bold darker cyan
-        }
+        let label = (channel == .mic) ? "[mic]" : "[spk]"
+        return "\u{001B}[38;5;\(channelColor(channel))m\(label)\u{001B}[0m"
+    }
+
+    /// Build the leading "<timestamp> [mic]  " (or "<timestamp>   " when only one
+    /// channel is active and the label is suppressed) segment.
+    private func ttyHeader(_ timestamp: Date, _ channel: AudioChannel) -> String {
+        showChannelLabel
+            ? "\(ttyTimestamp(timestamp, channel: channel)) \(ttyChannel(channel))  "
+            : "\(ttyTimestamp(timestamp, channel: channel))   "
     }
 
     private func jsonlBase(seq: Int, channel: AudioChannel, timing: ChunkTiming) -> [String: Any] {
@@ -264,8 +283,8 @@ actor StreamRenderer: Renderer {
         // Pending pairs (translation not yet arrived) plus per-channel volatile lines.
         var lines: [String] = []
         for pair in commitQueue where pair.target == nil {
-            lines.append("\(ttyTimestamp(pair.timing.timestamp))  \(ttyChannel(pair.channel))  \(pair.source)")
-            lines.append("\(Self.sourceColumnPad)\u{001B}[38;5;240m(translating…)\u{001B}[0m")
+            lines.append("\(ttyHeader(pair.timing.timestamp, pair.channel))\(pair.source)")
+            lines.append("\(sourceColumnPad)\u{001B}[38;5;240m(translating…)\u{001B}[0m")
         }
         for channel in AudioChannel.allCases {
             if let v = volatileTexts[channel], !v.isEmpty {
@@ -275,7 +294,11 @@ actor StreamRenderer: Renderer {
                 // rather than as the start of the fragment text itself.
                 let leader = "\u{001B}[38;5;240m… \u{001B}[0m"
                 let body = "\u{001B}[38;5;244m\(v)\u{001B}[0m"
-                lines.append("\(Self.channelColumnPad)\(ttyChannel(channel))  \(leader)\(body)")
+                if showChannelLabel {
+                    lines.append("\(Self.channelColumnPad)\(ttyChannel(channel))  \(leader)\(body)")
+                } else {
+                    lines.append("\(sourceColumnPad)\(leader)\(body)")
+                }
             }
         }
 
