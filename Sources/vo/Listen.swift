@@ -64,6 +64,10 @@ func runListen(
     let signalSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
     signalSource.setEventHandler {
         Task {
+            // Stop the audio sources before the save prompt blocks. Otherwise mic
+            // and speaker capture keep running for as long as the user is reading
+            // the prompt, which is wasted work and a small privacy footgun.
+            await pipeline.cancel()
             await renderer.handle(.eof)
             await renderer.flush()
             let count = await renderer.utteranceCount
