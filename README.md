@@ -26,7 +26,17 @@ $ brew install k1LoW/tap/vo
 
 **manually:**
 
-Download binary from [releases page](https://github.com/k1LoW/voio/releases)
+Download the binary from the [releases page](https://github.com/k1LoW/vo/releases), then strip the quarantine attribute and place it on your `PATH`.
+
+```console
+$ tar -xzf vo_*_darwin_arm64.tar.gz
+$ xattr -cr vo
+$ chmod +x vo
+$ mv vo /usr/local/bin/
+```
+
+> [!NOTE]
+> `xattr -cr` strips `com.apple.quarantine` that macOS attaches to downloaded archives. Without it, Gatekeeper blocks the ad-hoc signed binary from launching.
 
 ## Usage
 
