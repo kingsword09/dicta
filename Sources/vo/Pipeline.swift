@@ -124,6 +124,13 @@ struct Pipeline {
             throw VoError.noCompatibleAudioFormat
         }
 
+        // Warm the model / ANE before the first audio frame arrives. Without this
+        // the first finalized chunk takes ~2.2 s while the analyzer compiles on
+        // the Neural Engine; calling `prepareToAnalyze(in:)` ahead of `start`
+        // brings that down to ~1.45 s in our testing, and as a side effect makes
+        // the first volatile fragment land sooner too.
+        try await analyzer.prepareToAnalyze(in: analyzerFormat)
+
         let (inputSeq, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
         try await analyzer.start(inputSequence: inputSeq)
 
