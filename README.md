@@ -71,9 +71,9 @@ Translation lines are shown in dim text under the source. Pairs are emitted in s
 |------|---------|-------------|
 | `--src` | system locale | Source locale (BCP-47, must be in `SpeechTranscriber.supportedLocales`) |
 | `--dst` | (none) | Target locale. Omit to skip translation |
-| `--mic / --no-mic` | `--mic` | Capture from microphone |
-| `--speaker / --no-speaker` | `--speaker` | Capture system audio via ScreenCaptureKit |
-| `--voice-processing / --no-voice-processing` | `--no-voice-processing` | Apply echo cancellation on mic input |
+| `--no-mic` | (off, mic on) | Disable microphone capture |
+| `--no-speaker` | (off, speaker on) | Disable system audio capture |
+| `--voice-processing` | off | Apply echo cancellation on mic input |
 | `--json` | | Force JSONL output |
 | `--doctor` | | Print full environment diagnostics and exit |
 

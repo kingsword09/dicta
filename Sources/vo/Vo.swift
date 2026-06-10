@@ -17,13 +17,13 @@ struct Vo: AsyncParsableCommand {
     @Option(name: .long, help: "Target locale, BCP-47. Omit to skip translation.")
     var dst: String?
 
-    @Flag(name: .long, inversion: .prefixedNo, help: "Capture from microphone")
-    var mic: Bool = true
+    @Flag(name: .long, help: "Disable microphone capture")
+    var noMic: Bool = false
 
-    @Flag(name: .long, inversion: .prefixedNo, help: "Capture system audio (speaker) via ScreenCaptureKit")
-    var speaker: Bool = true
+    @Flag(name: .long, help: "Disable system audio (speaker) capture via ScreenCaptureKit")
+    var noSpeaker: Bool = false
 
-    @Flag(name: .long, inversion: .prefixedNo, help: "Apply system voice processing (echo cancellation + noise reduction) on mic input. Note: this lowers system speaker volume while active.")
+    @Flag(name: .long, help: "Apply system voice processing (echo cancellation + noise reduction) on mic input. Note: this lowers system speaker volume while active.")
     var voiceProcessing: Bool = false
 
     // MARK: - Diagnostic
@@ -48,8 +48,8 @@ struct Vo: AsyncParsableCommand {
             src: src,
             dst: dst,
             json: json,
-            mic: mic,
-            speaker: speaker,
+            mic: !noMic,
+            speaker: !noSpeaker,
             voiceProcessing: voiceProcessing
         )
     }

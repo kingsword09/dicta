@@ -29,8 +29,8 @@ There are no tests yet.
 Flat command (no subcommands). `--doctor` is the only "different mode"; everything else configures the live listen loop.
 
 ```
-vo [--src LOCALE] [--dst LOCALE] [--mic|--no-mic] [--speaker|--no-speaker]
-   [--voice-processing|--no-voice-processing] [--doctor] [--json]
+vo [--src LOCALE] [--dst LOCALE] [--no-mic] [--no-speaker]
+   [--voice-processing] [--doctor] [--json]
 ```
 
 - `--src` defaults to `Locale.current.identifier(.bcp47)`. Must be in `SpeechTranscriber.supportedLocales` (all regional, no bare `en` / `ja`). Unsupported values produce a helpful error suggesting matching regional variants.

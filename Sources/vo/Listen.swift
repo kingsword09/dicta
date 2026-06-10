@@ -11,7 +11,7 @@ func runListen(
     voiceProcessing: Bool
 ) async throws {
     guard mic || speaker else {
-        throw ValidationError("At least one of --mic or --speaker must be enabled.")
+        throw ValidationError("Cannot disable both mic and speaker. Drop one of --no-mic / --no-speaker.")
     }
 
     let sourceLocale = Locale(identifier: src)
