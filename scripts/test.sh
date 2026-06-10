@@ -25,4 +25,6 @@ if [ -d "$CLT_FRAMEWORKS/Testing.framework" ]; then
     )
 fi
 
-exec swift test "${EXTRA[@]}" "$@"
+# `${EXTRA[@]+...}` so an empty array does not trip `set -u` (older bash treats an
+# empty array reference as an unbound variable, which is what CI's bash does).
+exec swift test ${EXTRA[@]+"${EXTRA[@]}"} "$@"
