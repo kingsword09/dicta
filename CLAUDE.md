@@ -140,7 +140,7 @@ One JSON object per finalized chunk. `dst` is present only when `--dst` was supp
 ## Distribution plan (not yet implemented)
 
 - Ship as a bare Mach-O binary, **ad-hoc signed** (not Developer ID). `scripts/build.sh` embeds `Resources/Info.plist` into `__TEXT,__info_plist` via linker, then `codesign -s -` with `Resources/vo.entitlements`.
-- Distribute via a personal Homebrew tap (`k1LoW/homebrew-tap`) with a Cask using `binary "vo"`. A `postflight` block strips `com.apple.quarantine` via `xattr -cr staged_path/"vo"` so users don't have to handle Gatekeeper manually. This pattern is rejected by `homebrew/cask` reviewers but is fine in a personal tap.
+- Distribute via a personal Homebrew tap (`k1LoW/homebrew-tap`) as a Formula. Homebrew Formula installs do not apply `com.apple.quarantine` to the staged binary (only Casks do, via `Library/Homebrew/cask/installer.rb`), so Gatekeeper does not gate the launch of the ad-hoc-signed binary, and no postflight `xattr -cr` workaround is needed. Users install with `brew install k1LoW/tap/vo`.
 - `.app` bundle is **not** required for ad-hoc signing or for TCC; embedding Info.plist into the Mach-O is sufficient.
 
 ## Style notes

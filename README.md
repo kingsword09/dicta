@@ -18,11 +18,8 @@
 **homebrew tap:**
 
 ```console
-$ brew install --cask k1LoW/tap/vo
+$ brew install k1LoW/tap/vo
 ```
-
-> [!NOTE]
-> `vo` is distributed as an ad-hoc signed binary, so the cask runs `xattr -cr` against the staged binary during `postflight` to strip the `com.apple.quarantine` attribute. Without this step, Gatekeeper would block the binary from launching on first run.
 
 **manually:**
 
