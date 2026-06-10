@@ -51,6 +51,7 @@ func runListen(
         sourceLang: sourceLocale.identifier(.bcp47),
         targetLang: targetLocale?.identifier(.bcp47) ?? "",
         translationEnabled: targetLocale != nil,
+        showChannelLabel: mic && speaker,
         logSink: sessionLog
     )
 

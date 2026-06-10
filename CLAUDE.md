@@ -102,7 +102,7 @@ There is no global lock between the mic and speaker channels — they each const
 - The `Renderer` actor (serializes all event handling).
 - A `SeqCounter` actor (gives a monotonic `seq` across both channels so output order corresponds to which channel finalized first).
 
-This is why the mic re-capturing speaker audio (acoustic feedback) appears as duplicate `[MIC]` + `[SPK]` events with similar content. `--voice-processing` is the only software mitigation we have; otherwise the user is expected to use headphones or `--no-mic`.
+This is why the mic re-capturing speaker audio (acoustic feedback) appears as duplicate `[mic]` + `[spk]` events with similar content. `--voice-processing` is the only software mitigation we have; otherwise the user is expected to use headphones or `--no-mic`.
 
 ## Output formats
 
@@ -111,19 +111,25 @@ This is why the mic re-capturing speaker audio (acoustic feedback) appears as du
 ```
 vo 0.1.0 — listening on mic + speaker (en-US → ja-JP)
 
-08:34:56  [MIC]  How are you doing?
-                 元気ですか？
-08:34:58  [SPK]  I'm fine, thanks.
-                 元気だよ、ありがとう。
+08:34:56 [mic]  How are you doing?
+                元気ですか？
+08:34:58 [spk]  I'm fine, thanks.
+                元気だよ、ありがとう。
                                                         ← live region below
-          [MIC]  … in-progress fragment                 ← volatile, redrawn in place
+         [mic]  … in-progress fragment                  ← volatile, redrawn in place
 ```
 
-Colors (256-color palette, Terminal.app safe):
+When only one channel is active (`--no-mic` or `--no-speaker`), the `[mic]` / `[spk]` label is suppressed and source text follows the timestamp directly with a three-space gap:
 
-- `[MIC]` 166 + bold
-- `[SPK]` 38 + bold
-- Timestamp 244 (gray)
+```
+08:34:56   How are you doing?
+           元気ですか？
+```
+
+Colors (256-color palette, Terminal.app safe). Both the timestamp and the channel label use the channel's tint, so the eye reads them as one unit:
+
+- mic timestamp + `[mic]` label: 130 (amber)
+- speaker timestamp + `[spk]` label: 24 (teal)
 - Translation 244 (gray, sits behind source)
 - In-progress volatile fragment text: 244 (same dim as translation, so it reads as "not committed yet")
 - `(translating…)`, `(no translation)`, `… ` volatile leader: 240 (darker gray)

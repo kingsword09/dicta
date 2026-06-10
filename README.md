@@ -56,13 +56,15 @@ $ vo --doctor                         # Environment diagnostics
 ```
 vo 0.1.0 — listening on mic + speaker (en-US → ja-JP)
 
-08:34:56  [MIC]  How are you doing?
-                 元気ですか？
-08:34:58  [SPK]  I'm fine, thanks.
-                 元気だよ、ありがとう。
+08:34:56 [mic]  How are you doing?
+                元気ですか？
+08:34:58 [spk]  I'm fine, thanks.
+                元気だよ、ありがとう。
 ```
 
-Translation lines are shown in dim text under the source. Pairs are emitted in source order — a slow translation holds back subsequent pairs to keep the output coherent.
+The `[mic]` / `[spk]` label is shown only when both channels are active; with `--no-mic` or `--no-speaker` it is omitted and the timestamp alone marks each line. The timestamp shares the channel's tint (amber for mic, teal for speaker), so a single glance tells you which side just spoke.
+
+Translation lines are shown in dim text under the source. Pairs are emitted in source order, so a slow translation holds back subsequent pairs to keep the output coherent.
 
 ### JSONL output
 
