@@ -128,14 +128,18 @@ final class SessionLog: @unchecked Sendable {
         // Belt and suspenders: the prompt layer already rejects directory targets, but
         // refuse here too so a future caller can't accidentally `removeItem` a whole
         // directory tree just because they reused move() with a different prompt.
-        var isDir: ObjCBool = false
-        if FileManager.default.fileExists(atPath: resolvedDst, isDirectory: &isDir), isDir.boolValue {
+        if isDirectory(resolvedDst) {
             throw SessionLogError.destinationIsDirectory(path: resolvedDst)
         }
 
         let dst = URL(fileURLWithPath: resolvedDst)
         let src = URL(fileURLWithPath: path)
-        try? FileManager.default.removeItem(at: dst)
+        // Propagate removeItem errors instead of letting moveItem surface them
+        // later as a confusing "file exists" — a locked or permission-denied
+        // destination should fail with its actual reason and preserve the temp.
+        if FileManager.default.fileExists(atPath: resolvedDst) {
+            try FileManager.default.removeItem(at: dst)
+        }
         try FileManager.default.moveItem(at: src, to: dst)
     }
 
