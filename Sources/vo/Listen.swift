@@ -23,8 +23,12 @@ func runListen(
 
     // Stream JSONL to disk as utterances finalize, so memory stays bounded for long
     // sessions. With --log we write straight to the user-specified path. Without it,
-    // we use a temp file and decide at shutdown whether to keep or discard.
-    let sessionLog = try SessionLog.open(explicitPath: log)
+    // we use a temp file and decide at shutdown whether to keep or discard. If the
+    // session can do neither (no --log AND no save prompt — e.g. piped JSONL run),
+    // skip the temp file entirely so we don't burn disk I/O writing bytes we know we
+    // are about to discard, and don't leave a large temp behind on a SIGKILL.
+    let canSaveLog = log != nil || (isTTY && canPromptForLog())
+    let sessionLog: SessionLog? = canSaveLog ? try SessionLog.open(explicitPath: log) : nil
 
     // If we throw out of this function before finalizeSession runs (e.g. the pipeline
     // errors mid-stream), make sure no temp file is left behind. In explicit mode we
@@ -33,9 +37,11 @@ func runListen(
     // since that is the one case where the temp file holding the captured data is what
     // we want the user to find.
     defer {
-        sessionLog.close()
-        if !sessionLog.isExplicit && !sessionLog.preservedForRecovery {
-            sessionLog.discard()
+        if let sessionLog {
+            sessionLog.close()
+            if !sessionLog.isExplicit && !sessionLog.preservedForRecovery {
+                sessionLog.discard()
+            }
         }
     }
 
@@ -97,21 +103,25 @@ func runListen(
 /// Close the session log, run save/discard logic, then print the exit summary.
 /// Called from both the SIGINT handler and the natural-completion path.
 private func finalizeSession(
-    sessionLog: SessionLog,
+    sessionLog: SessionLog?,
     isTTY: Bool,
     count: Int,
     duration: TimeInterval
 ) async {
-    // Gate the save prompt on isTTY (renderer mode), not just on canPromptForLog().
-    // Otherwise `vo --json` run from an interactive shell — where STDIN and STDOUT
-    // are both TTYs but the renderer is emitting machine-readable JSONL — would
-    // interleave the prompt text into the JSONL stream and corrupt it.
-    let status = resolveSessionLog(sessionLog: sessionLog, canPrompt: isTTY && canPromptForLog())
+    if let sessionLog {
+        // Gate the save prompt on isTTY (renderer mode), not just on canPromptForLog().
+        // Otherwise `vo --json` run from an interactive shell — where STDIN and STDOUT
+        // are both TTYs but the renderer is emitting machine-readable JSONL — would
+        // interleave the prompt text into the JSONL stream and corrupt it.
+        let status = resolveSessionLog(sessionLog: sessionLog, canPrompt: isTTY && canPromptForLog())
+        if isTTY {
+            if let status { print(status) }
+        } else if let status, sessionLog.isExplicit {
+            FileHandle.standardError.write(Data((status + "\n").utf8))
+        }
+    }
     if isTTY {
-        if let status { print(status) }
         printSummary(count: count, duration: duration)
-    } else if let status, sessionLog.isExplicit {
-        FileHandle.standardError.write(Data((status + "\n").utf8))
     }
 }
 
