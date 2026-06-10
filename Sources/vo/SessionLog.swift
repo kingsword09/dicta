@@ -53,6 +53,10 @@ final class SessionLog: @unchecked Sendable {
             }
             FileManager.default.createFile(atPath: resolved, contents: nil)
             let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: resolved))
+            // createFile already truncates an existing file to 0 bytes, but make the
+            // overwrite-semantics explicit at the handle level so no future reader has
+            // to reason about NSFileManager's documented behavior.
+            try? handle.truncate(atOffset: 0)
             return SessionLog(
                 path: resolved,
                 suggestedPath: resolved,
@@ -66,6 +70,7 @@ final class SessionLog: @unchecked Sendable {
         let tempPath = (tmpDir as NSString).appendingPathComponent("vo-\(stamp)-\(pid).jsonl")
         FileManager.default.createFile(atPath: tempPath, contents: nil)
         let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: tempPath))
+        try? handle.truncate(atOffset: 0)
         return SessionLog(
             path: tempPath,
             suggestedPath: "./vo-\(stamp).jsonl",
