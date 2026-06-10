@@ -269,8 +269,13 @@ actor StreamRenderer: Renderer {
         }
         for channel in AudioChannel.allCases {
             if let v = volatileTexts[channel], !v.isEmpty {
+                // In-progress fragment is rendered in the same dim 244 the
+                // translation lines use, so the eye knows it's not committed yet.
+                // The "… " leader stays at 240 (darker) so it reads as a leader
+                // rather than as the start of the fragment text itself.
                 let leader = "\u{001B}[38;5;240m… \u{001B}[0m"
-                lines.append("\(Self.channelColumnPad)\(ttyChannel(channel))  \(leader)\(v)")
+                let body = "\u{001B}[38;5;244m\(v)\u{001B}[0m"
+                lines.append("\(Self.channelColumnPad)\(ttyChannel(channel))  \(leader)\(body)")
             }
         }
 

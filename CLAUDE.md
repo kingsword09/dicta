@@ -125,6 +125,7 @@ Colors (256-color palette, Terminal.app safe):
 - `[SPK]` 38 + bold
 - Timestamp 244 (gray)
 - Translation 244 (gray, sits behind source)
+- In-progress volatile fragment text: 244 (same dim as translation, so it reads as "not committed yet")
 - `(translating…)`, `(no translation)`, `… ` volatile leader: 240 (darker gray)
 
 ### JSONL (`--json` or non-TTY)
