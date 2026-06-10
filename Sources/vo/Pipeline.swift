@@ -12,6 +12,43 @@ actor SeqCounter {
     }
 }
 
+/// Wrapper that lets us pass MicCapture/SpeakerCapture stop closures across actor
+/// boundaries without making the capture classes themselves Sendable. They are owned
+/// strictly by their channel Task and the registry is only ever invoked from a
+/// serialized actor context (or from `runChannel`'s own defer), so this is safe.
+struct AsyncStopper: @unchecked Sendable {
+    let action: () async -> Void
+}
+
+/// Holds per-channel "stop the audio source" closures so the SIGINT handler can
+/// stop capture before blocking on the save prompt. Without this the OS keeps
+/// pulling mic/speaker frames while the user is deciding where to save the log.
+actor StopRegistry {
+    private var stoppers: [AsyncStopper] = []
+    private var stopped: Bool = false
+
+    /// Register a stopper. If `stopAll()` has already run, the stopper is invoked
+    /// immediately instead of being stored — otherwise a channel that finished
+    /// starting its audio source after SIGINT would leave that source running
+    /// while the save prompt blocks.
+    func register(_ stopper: AsyncStopper) async {
+        if stopped {
+            await stopper.action()
+            return
+        }
+        stoppers.append(stopper)
+    }
+
+    /// Run every registered stopper exactly once, in registration order. Subsequent
+    /// `register` calls invoke the stopper inline; subsequent `stopAll` calls are no-ops.
+    func stopAll() async {
+        stopped = true
+        let pending = stoppers
+        stoppers.removeAll()
+        for s in pending { await s.action() }
+    }
+}
+
 /// End-to-end pipeline that orchestrates one or more audio channels.
 ///
 /// For each enabled channel:
@@ -28,6 +65,9 @@ struct Pipeline {
     let enableMic: Bool
     let enableSpeaker: Bool
     let voiceProcessing: Bool  // apply AEC + NR + AGC on mic input
+    /// Lets callers (notably the SIGINT handler in Listen.swift) stop every active
+    /// audio source without having to wait for `run()` to unwind on its own.
+    let stops: StopRegistry = StopRegistry()
 
     func run() async throws {
         let counter = SeqCounter()
@@ -48,6 +88,12 @@ struct Pipeline {
 
         await renderer.handle(.eof)
         await renderer.flush()
+    }
+
+    /// Stop every registered audio source. Idempotent. Use this to halt the mic and
+    /// speaker captures before the SIGINT handler blocks on an interactive prompt.
+    func cancel() async {
+        await stops.stopAll()
     }
 
     // MARK: - Per-channel
@@ -89,6 +135,10 @@ struct Pipeline {
             audioStream = cap.stream
             stopper = { await cap.stop() }
         }
+
+        // Register the per-channel stopper so a SIGINT-triggered cancel() halts
+        // mic and speaker capture before any save prompt blocks the main task.
+        await stops.register(AsyncStopper(action: stopper))
 
         // Translation worker for this channel (only when targetLocale is set).
         // TranslationSession is non-Sendable so we create it inside the Task closure.

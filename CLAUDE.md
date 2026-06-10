@@ -30,13 +30,14 @@ Flat command (no subcommands). `--doctor` is the only "different mode"; everythi
 
 ```
 vo [--src LOCALE] [--dst LOCALE] [--no-mic] [--no-speaker]
-   [--voice-processing] [--doctor] [--json]
+   [--voice-processing] [--transcript PATH] [--doctor] [--json]
 ```
 
 - `--src` defaults to `Locale.current.identifier(.bcp47)`. Must be in `SpeechTranscriber.supportedLocales` (all regional, no bare `en` / `ja`). Unsupported values produce a helpful error suggesting matching regional variants.
 - `--dst` is optional. Without it, `vo` is transcribe-only and never calls `TranslationSession`.
 - `--voice-processing` enables AVAudioInputNode voice processing (echo cancellation + noise reduction). **Default off** because enabling it puts the OS audio session into communication mode and lowers system speaker volume. Use only when running mic + speaker on the same physical device without headphones.
 - `--json` forces JSONL output. Without it, auto-detects: TTY → ANSI redraw, non-TTY → JSONL.
+- `--transcript PATH` streams finalized chunks as JSONL into `PATH`. Without it, vo streams the same JSONL into a temp file under `TMPDIR` and at Ctrl-C asks `Save transcript to ./vo-<stamp>.jsonl? [Y/n/<path>]`. If the chosen target (or `PATH` itself) exists, vo prompts `Overwrite? [y/N]`. Memory usage stays bounded across long sessions because nothing is buffered.
 
 ## Architecture
 
@@ -84,6 +85,7 @@ The whole pipeline is one TaskGroup orchestrating two parallel channels (mic + s
 | `Doctor.swift` | `runDoctor(json:)`. Gathers OS info, speech model status, translation language list, input device list via the helpers below, then renders human text or JSON. |
 | `Locales.swift` | `collectSpeechLocales()` and `collectTranslationLanguages()`. Pure data collection, no I/O. |
 | `Devices.swift` | `collectInputDevices()`. Direct Core Audio enumeration via `AudioObjectGetPropertyData`. |
+| `SessionLog.swift` | Streaming JSONL transcript file. Two modes: explicit (`--transcript <path>` writes directly there) or temp (`TMPDIR` file moved/discarded on exit). Owns the overwrite-confirm and `Save transcript?` prompts. |
 
 ### Key invariants in `StreamRenderer`
 

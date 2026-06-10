@@ -51,11 +51,13 @@ actor StreamRenderer: Renderer {
     private let sourceLang: String
     private let targetLang: String
     private let translationEnabled: Bool
+    private let logSink: SessionLog?
 
     private var commitQueue: [Pair] = []
     private var volatileTexts: [AudioChannel: String] = [:]
     private var liveRegionLines: Int = 0   // how many lines we currently own at the bottom
     private var finalizedCount: Int = 0    // total utterances finalized (for exit summary)
+    private var isShuttingDown: Bool = false
 
     /// Total utterances finalized so far (across all channels).
     var utteranceCount: Int { finalizedCount }
@@ -65,15 +67,24 @@ actor StreamRenderer: Renderer {
         case jsonl
     }
 
-    init(mode: Mode, sourceLang: String, targetLang: String, translationEnabled: Bool = true, out: FileHandle = .standardOutput) {
+    init(
+        mode: Mode,
+        sourceLang: String,
+        targetLang: String,
+        translationEnabled: Bool = true,
+        out: FileHandle = .standardOutput,
+        logSink: SessionLog? = nil
+    ) {
         self.mode = mode
         self.out = out
         self.sourceLang = sourceLang
         self.targetLang = targetLang
         self.translationEnabled = translationEnabled
+        self.logSink = logSink
     }
 
     func handle(_ event: RenderEvent) async {
+        if isShuttingDown { return }
         switch event {
         case .volatile(let channel, let text):
             volatileTexts[channel] = text
@@ -105,6 +116,9 @@ actor StreamRenderer: Renderer {
             if mode == .tty {
                 clearLiveRegion()
             }
+            // After eof, ignore any straggler events so audio threads can't redraw
+            // over the exit prompt/summary that follows.
+            isShuttingDown = true
         }
     }
 
@@ -132,17 +146,31 @@ actor StreamRenderer: Renderer {
     }
 
     private func emitSourceOnly(channel: AudioChannel, seq: Int, source: String, timing: ChunkTiming) {
+        // Skip the JSONSerialization unless someone is going to consume it. In TTY
+        // mode with no transcript sink (e.g. `vo < /dev/null` where stdout is a TTY
+        // but stdin isn't, so SessionLog is never opened) the serialized bytes
+        // would just be thrown away.
+        let jsonl: String? = (mode == .jsonl || logSink != nil)
+            ? buildJSONL(seq: seq, channel: channel, source: source, target: nil, timing: timing, includeTarget: false)
+            : nil
+
+        if let jsonl { logSink?.append(jsonl) }
+
         switch mode {
         case .tty:
             writeLine("\(ttyTimestamp(timing.timestamp))  \(ttyChannel(channel))  \(source)")
         case .jsonl:
-            var obj: [String: Any] = jsonlBase(seq: seq, channel: channel, timing: timing)
-            obj["src"] = ["lang": sourceLang, "text": source]
-            writeJSONLine(obj)
+            if let jsonl { writeLine(jsonl) }
         }
     }
 
     private func emitCommittedPair(pair: Pair, target: String?) {
+        let jsonl: String? = (mode == .jsonl || logSink != nil)
+            ? buildJSONL(seq: pair.seq, channel: pair.channel, source: pair.source, target: target, timing: pair.timing, includeTarget: translationEnabled)
+            : nil
+
+        if let jsonl { logSink?.append(jsonl) }
+
         switch mode {
         case .tty:
             writeLine("\(ttyTimestamp(pair.timing.timestamp))  \(ttyChannel(pair.channel))  \(pair.source)")
@@ -151,14 +179,26 @@ actor StreamRenderer: Renderer {
             } else {
                 writeLine("\(Self.sourceColumnPad)\u{001B}[38;5;240m(no translation)\u{001B}[0m")
             }
-
         case .jsonl:
-            var obj: [String: Any] = jsonlBase(seq: pair.seq, channel: pair.channel, timing: pair.timing)
-            obj["src"] = ["lang": sourceLang, "text": pair.source]
+            if let jsonl { writeLine(jsonl) }
+        }
+    }
+
+    private func buildJSONL(
+        seq: Int,
+        channel: AudioChannel,
+        source: String,
+        target: String?,
+        timing: ChunkTiming,
+        includeTarget: Bool
+    ) -> String? {
+        var obj: [String: Any] = jsonlBase(seq: seq, channel: channel, timing: timing)
+        obj["src"] = ["lang": sourceLang, "text": source]
+        if includeTarget {
             obj["dst"] = target.map { ["lang": targetLang, "text": $0] }
                 ?? ["lang": targetLang, "text": NSNull()]
-            writeJSONLine(obj)
         }
+        return jsonString(obj)
     }
 
     // MARK: - TTY formatting helpers
@@ -194,11 +234,9 @@ actor StreamRenderer: Renderer {
         return obj
     }
 
-    private func writeJSONLine(_ obj: [String: Any]) {
-        if let data = try? JSONSerialization.data(withJSONObject: obj),
-           let line = String(data: data, encoding: .utf8) {
-            writeLine(line)
-        }
+    private func jsonString(_ obj: [String: Any]) -> String? {
+        guard let data = try? JSONSerialization.data(withJSONObject: obj) else { return nil }
+        return String(data: data, encoding: .utf8)
     }
 
     // ISO8601DateFormatter's `string(from:)` is documented as thread-safe.
