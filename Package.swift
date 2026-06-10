@@ -19,6 +19,11 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser")
             ],
             path: "Sources/vo"
+        ),
+        .testTarget(
+            name: "voTests",
+            dependencies: ["vo"],
+            path: "Tests/voTests"
         )
     ]
 )
