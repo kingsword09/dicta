@@ -25,14 +25,24 @@ struct AsyncStopper: @unchecked Sendable {
 /// pulling mic/speaker frames while the user is deciding where to save the log.
 actor StopRegistry {
     private var stoppers: [AsyncStopper] = []
+    private var stopped: Bool = false
 
-    func register(_ stopper: AsyncStopper) {
+    /// Register a stopper. If `stopAll()` has already run, the stopper is invoked
+    /// immediately instead of being stored — otherwise a channel that finished
+    /// starting its audio source after SIGINT would leave that source running
+    /// while the save prompt blocks.
+    func register(_ stopper: AsyncStopper) async {
+        if stopped {
+            await stopper.action()
+            return
+        }
         stoppers.append(stopper)
     }
 
-    /// Run every registered stopper exactly once, in registration order. Safe to call
-    /// multiple times; the second call is a no-op.
+    /// Run every registered stopper exactly once, in registration order. Subsequent
+    /// `register` calls invoke the stopper inline; subsequent `stopAll` calls are no-ops.
     func stopAll() async {
+        stopped = true
         let pending = stoppers
         stoppers.removeAll()
         for s in pending { await s.action() }
