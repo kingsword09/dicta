@@ -9,7 +9,7 @@ func runListen(
     mic: Bool,
     speaker: Bool,
     voiceProcessing: Bool,
-    log: String?
+    transcript: String?
 ) async throws {
     guard mic || speaker else {
         throw ValidationError("Cannot disable both mic and speaker. Drop one of --no-mic / --no-speaker.")
@@ -22,13 +22,14 @@ func runListen(
     let isTTY = (mode == .tty)
 
     // Stream JSONL to disk as utterances finalize, so memory stays bounded for long
-    // sessions. With --log we write straight to the user-specified path. Without it,
-    // we use a temp file and decide at shutdown whether to keep or discard. If the
-    // session can do neither (no --log AND no save prompt — e.g. piped JSONL run),
-    // skip the temp file entirely so we don't burn disk I/O writing bytes we know we
-    // are about to discard, and don't leave a large temp behind on a SIGKILL.
-    let canSaveLog = log != nil || (isTTY && canPromptForLog())
-    let sessionLog: SessionLog? = canSaveLog ? try SessionLog.open(explicitPath: log) : nil
+    // sessions. With --transcript we write straight to the user-specified path.
+    // Without it, we use a temp file and decide at shutdown whether to keep or
+    // discard. If the session can do neither (no --transcript AND no save prompt —
+    // e.g. piped JSONL run), skip the temp file entirely so we don't burn disk I/O
+    // writing bytes we know we are about to discard, and don't leave a large temp
+    // behind on a SIGKILL.
+    let canSaveTranscript = transcript != nil || (isTTY && canPromptForLog())
+    let sessionLog: SessionLog? = canSaveTranscript ? try SessionLog.open(explicitPath: transcript) : nil
 
     // If we throw out of this function before finalizeSession runs (e.g. the pipeline
     // errors mid-stream), make sure no temp file is left behind. In explicit mode we

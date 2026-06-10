@@ -75,7 +75,7 @@ Translation lines are shown in dim text under the source. Pairs are emitted in s
 | `--no-speaker` | (off, speaker on) | Disable system audio capture |
 | `--voice-processing` | off | Apply echo cancellation on mic input |
 | `--json` | | Force JSONL output |
-| `--log <path>` | (none; prompts at exit in TTY) | Stream finalized chunks as JSONL to `<path>` incrementally. Skips the interactive save prompt |
+| `--transcript <path>` | (none; prompts at exit in TTY) | Stream finalized chunks as JSONL to `<path>` incrementally. Skips the interactive save prompt |
 | `--doctor` | | Print full environment diagnostics and exit |
 
 `vo --doctor` lists supported locales, installed speech models, available translation language pairs, and audio input devices. Run it first if something behaves unexpectedly.

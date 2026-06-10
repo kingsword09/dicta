@@ -37,7 +37,7 @@ struct Vo: AsyncParsableCommand {
     var json: Bool = false
 
     @Option(name: .long, help: "Stream finalized chunks as JSONL to this path (written incrementally so you can `tail -f` it; memory stays bounded for long sessions). Skips the interactive save prompt.")
-    var log: String?
+    var transcript: String?
 
     // MARK: - Run
 
@@ -54,7 +54,7 @@ struct Vo: AsyncParsableCommand {
             mic: !noMic,
             speaker: !noSpeaker,
             voiceProcessing: voiceProcessing,
-            log: log
+            transcript: transcript
         )
     }
 }

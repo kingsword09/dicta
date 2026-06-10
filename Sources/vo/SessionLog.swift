@@ -6,7 +6,7 @@ import Darwin
 /// Streaming JSONL log file used to persist a session without buffering events in memory.
 ///
 /// Two modes:
-///   - **Explicit**: `--log <path>` was given. We open that path directly and stream into it.
+///   - **Explicit**: `--transcript <path>` was given. We open that path directly and stream into it.
 ///     No temp file, no rename, no discard.
 ///   - **Temp**: opens a file under TMPDIR. At shutdown, the temp file is either moved to a
 ///     user-chosen path (via prompt) or removed.
@@ -16,8 +16,8 @@ final class SessionLog: @unchecked Sendable {
     let path: String
     /// Path used as the default in the interactive prompt. Same as `path` for explicit mode.
     let suggestedPath: String
-    /// `true` when `--log` was given. Explicit mode skips the prompt and bypasses the temp
-    /// machinery entirely (no temp file ever exists).
+    /// `true` when `--transcript` was given. Explicit mode skips the prompt and bypasses the
+    /// temp machinery entirely (no temp file ever exists).
     let isExplicit: Bool
     /// Set when `resolveSessionLog` has intentionally kept the temp file in place (e.g. the
     /// chosen move target failed and we surfaced its temp path to the user). The cleanup
@@ -155,9 +155,9 @@ func resolveSessionLog(sessionLog: SessionLog, canPrompt: Bool) -> String? {
         if sessionLog.isEmpty {
             // No utterances captured. Leave an empty file rather than silently delete
             // something the user explicitly named.
-            return "Saved log: \(sessionLog.path) (no utterances)"
+            return "Saved transcript: \(sessionLog.path) (no utterances)"
         }
-        return "Saved log: \(sessionLog.path)"
+        return "Saved transcript: \(sessionLog.path)"
     }
 
     // Temp mode: nothing captured, just clean up.
@@ -185,13 +185,13 @@ func resolveSessionLog(sessionLog: SessionLog, canPrompt: Bool) -> String? {
 
         do {
             try sessionLog.move(to: target)
-            return "Saved log: \(target)"
+            return "Saved transcript: \(target)"
         } catch {
             // Move failed (bad path, permission, etc.). Keep the temp file so the user
             // can recover it manually, and mark it so the Listen.swift safety-net defer
             // will not discard the file we just told the user we preserved.
             sessionLog.preservedForRecovery = true
-            return "Failed to save log to \(target): \(error.localizedDescription)\n  Log preserved at: \(sessionLog.path)"
+            return "Failed to save transcript to \(target): \(error.localizedDescription)\n  Transcript preserved at: \(sessionLog.path)"
         }
     }
 }
@@ -232,7 +232,7 @@ enum SessionLogError: Error, CustomStringConvertible {
 /// Interactive prompt. Returns the chosen path, or nil if the user declined.
 private func promptForLogPath(defaultPath: String) -> String? {
     print("")
-    print("Save log to \(defaultPath)? [Y/n/<path>]: ", terminator: "")
+    print("Save transcript to \(defaultPath)? [Y/n/<path>]: ", terminator: "")
     fflush(stdout)
     guard let line = readLine() else { return nil }
     let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
