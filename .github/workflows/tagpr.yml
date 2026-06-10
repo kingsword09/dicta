@@ -56,11 +56,7 @@ jobs:
           cp LICENSE README.md "$STAGE/"
           ARCHIVE="vo_v${VERSION}_darwin_arm64.tar.gz"
           tar -C "$STAGE" -czf "$ARCHIVE" .
-          shasum -a 256 "$ARCHIVE" | tee "${ARCHIVE}.sha256"
-          {
-            echo "archive=${ARCHIVE}"
-            echo "checksum=${ARCHIVE}.sha256"
-          } >> "$GITHUB_OUTPUT"
+          echo "archive=${ARCHIVE}" >> "$GITHUB_OUTPUT"
 
       - name: Upload assets to release
         env:
@@ -68,7 +64,6 @@ jobs:
         run: |
           gh release upload "${{ needs.tagpr.outputs.tagpr-tag }}" \
             "${{ steps.pkg.outputs.archive }}" \
-            "${{ steps.pkg.outputs.checksum }}" \
             --clobber
 
   release:
