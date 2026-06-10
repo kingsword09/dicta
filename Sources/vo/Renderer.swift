@@ -146,9 +146,13 @@ actor StreamRenderer: Renderer {
     }
 
     private func emitSourceOnly(channel: AudioChannel, seq: Int, source: String, timing: ChunkTiming) {
-        var obj: [String: Any] = jsonlBase(seq: seq, channel: channel, timing: timing)
-        obj["src"] = ["lang": sourceLang, "text": source]
-        let jsonl = jsonString(obj)
+        // Skip the JSONSerialization unless someone is going to consume it. In TTY
+        // mode with no transcript sink (e.g. `vo < /dev/null` where stdout is a TTY
+        // but stdin isn't, so SessionLog is never opened) the serialized bytes
+        // would just be thrown away.
+        let jsonl: String? = (mode == .jsonl || logSink != nil)
+            ? buildJSONL(seq: seq, channel: channel, source: source, target: nil, timing: timing, includeTarget: false)
+            : nil
 
         if let jsonl { logSink?.append(jsonl) }
 
@@ -161,13 +165,9 @@ actor StreamRenderer: Renderer {
     }
 
     private func emitCommittedPair(pair: Pair, target: String?) {
-        var obj: [String: Any] = jsonlBase(seq: pair.seq, channel: pair.channel, timing: pair.timing)
-        obj["src"] = ["lang": sourceLang, "text": pair.source]
-        if translationEnabled {
-            obj["dst"] = target.map { ["lang": targetLang, "text": $0] }
-                ?? ["lang": targetLang, "text": NSNull()]
-        }
-        let jsonl = jsonString(obj)
+        let jsonl: String? = (mode == .jsonl || logSink != nil)
+            ? buildJSONL(seq: pair.seq, channel: pair.channel, source: pair.source, target: target, timing: pair.timing, includeTarget: translationEnabled)
+            : nil
 
         if let jsonl { logSink?.append(jsonl) }
 
@@ -182,6 +182,23 @@ actor StreamRenderer: Renderer {
         case .jsonl:
             if let jsonl { writeLine(jsonl) }
         }
+    }
+
+    private func buildJSONL(
+        seq: Int,
+        channel: AudioChannel,
+        source: String,
+        target: String?,
+        timing: ChunkTiming,
+        includeTarget: Bool
+    ) -> String? {
+        var obj: [String: Any] = jsonlBase(seq: seq, channel: channel, timing: timing)
+        obj["src"] = ["lang": sourceLang, "text": source]
+        if includeTarget {
+            obj["dst"] = target.map { ["lang": targetLang, "text": $0] }
+                ?? ["lang": targetLang, "text": NSNull()]
+        }
+        return jsonString(obj)
     }
 
     // MARK: - TTY formatting helpers
