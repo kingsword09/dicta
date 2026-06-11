@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.4.0](https://github.com/k1LoW/vo/compare/v0.3.0...v0.4.0) - 2026-06-11
+
+### New Features 🎉
+- feat: attribute TCC permissions to vo, not the launching terminal by @k1LoW in https://github.com/k1LoW/vo/pull/16
+
 ## [v0.3.0](https://github.com/k1LoW/vo/compare/v0.2.1...v0.3.0) - 2026-06-11
 
 ### New Features 🎉
