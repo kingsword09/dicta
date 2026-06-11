@@ -173,7 +173,7 @@ private func isDirectory(_ path: String) -> Bool {
 /// ("path is a directory.") instead of NSError's generic
 /// "The operation couldn't be completed." that `localizedDescription` would produce.
 private func describe(_ error: Error) -> String {
-    if let custom = error as? CustomStringConvertible {
+    if let custom = error as? SessionLogError {
         return custom.description
     }
     return error.localizedDescription
