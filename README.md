@@ -21,7 +21,7 @@
 $ brew install k1LoW/tap/vo
 ```
 
-> [!NOTE]
+> [!IMPORTANT]
 > `vo` is distributed as an ad-hoc signed binary. macOS attaches `com.apple.quarantine` to the downloaded tarball at the network-stack layer, so the formula runs `xattr -cr` against the installed binary in its `install` step to strip the attribute. Without this step, Gatekeeper would block the binary from launching on first run.
 
 **manually:**
@@ -35,7 +35,7 @@ $ chmod +x vo
 $ mv vo /usr/local/bin/
 ```
 
-> [!NOTE]
+> [!IMPORTANT]
 > `xattr -cr` strips `com.apple.quarantine` that macOS attaches to downloaded archives. Without it, Gatekeeper blocks the ad-hoc signed binary from launching.
 
 ## Usage
@@ -100,6 +100,9 @@ Translation lines are shown in dim text under the source. Pairs are emitted in s
 - macOS 26+
 - Apple Silicon (Neural Engine)
 - TCC permissions: Microphone, Speech Recognition, and Audio Recording (speaker capture is on by default; disable it with `--no-speaker`)
+
+> [!IMPORTANT]
+> These TCC permissions are granted to the **terminal emulator** that launches `vo` (Terminal.app, iTerm2, etc.), not to `vo` itself. `vo` ships as a bare binary, so macOS attributes the Microphone / Speech Recognition / Audio Recording prompts to the host terminal app. Manage or reset them against that terminal app under System Settings > Privacy & Security, not under a `vo` entry.
 
 ## Models
 
