@@ -20,7 +20,7 @@
     <string>vo はマイク入力から文字起こしと翻訳を行うためにマイクを使用します。</string>
     <key>NSSpeechRecognitionUsageDescription</key>
     <string>vo はオンデバイスの音声認識でマイク入力を文字起こしします。すべての処理は端末上で完結します。</string>
-    <key>NSScreenCaptureUsageDescription</key>
-    <string>vo は他アプリの音声 (会議の相手の声など) を文字起こしするために、ScreenCaptureKit 経由でシステム音声を取得します。画面の映像は使用しません。</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>vo は他アプリの音声 (会議の相手の声など) を文字起こしするために、システム音声を取得します。画面の映像は取得しません。</string>
 </dict>
 </plist>

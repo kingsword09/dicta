@@ -1,7 +1,7 @@
 import Foundation
 @preconcurrency import AVFoundation
-@preconcurrency import ScreenCaptureKit
-import CoreMedia
+import CoreAudio
+import AudioToolbox
 
 enum AudioChannel: String, Sendable, CaseIterable {
     case mic
@@ -63,59 +63,163 @@ final class MicCapture: @unchecked Sendable {
     }
 }
 
-/// System audio (speaker) capture using ScreenCaptureKit.
-/// Requires Screen Recording TCC permission.
-final class SpeakerCapture: NSObject, @unchecked Sendable {
+/// System audio (speaker) capture using Core Audio process taps (macOS 14.4+).
+/// Requires the Audio Recording TCC permission, not Screen Recording: ScreenCaptureKit
+/// would force a screen-capture grant even though vo only ever wanted the audio.
+final class SpeakerCapture: @unchecked Sendable {
     let stream: AsyncStream<AVAudioPCMBuffer>
     private let builder: AsyncStream<AVAudioPCMBuffer>.Continuation
-    private var scStream: SCStream?
 
-    override init() {
+    private var tapID = AudioObjectID(kAudioObjectUnknown)
+    private var aggregateID = AudioObjectID(kAudioObjectUnknown)
+    private var ioProcID: AudioDeviceIOProcID?
+    // Runs the IOProc off Core Audio's real-time IO thread: the block deep-copies
+    // and yields into an AsyncStream, neither of which is safe on the RT thread.
+    private let ioQueue = DispatchQueue(label: "vo.spk.audio")
+
+    init() {
         let (s, b) = AsyncStream<AVAudioPCMBuffer>.makeStream()
         self.stream = s
         self.builder = b
-        super.init()
     }
 
     func start() async throws {
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-        guard let display = content.displays.first else {
-            throw VoError.noDisplayForScreenCapture
+        // Any step past the first allocation can throw, and Pipeline.runChannel only
+        // registers stop() once start() returns. So clean up partial allocations here
+        // before rethrowing, otherwise the tap / aggregate would dangle.
+        do {
+            try await startUnchecked()
+        } catch {
+            await stop()
+            throw error
         }
-        let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+    }
 
-        let config = SCStreamConfiguration()
-        config.capturesAudio = true
-        config.excludesCurrentProcessAudio = true
-        config.sampleRate = 48000
-        config.channelCount = 2
-        // Video is mandatory but we make it as cheap as possible.
-        config.width = 2
-        config.height = 2
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
-        config.queueDepth = 6
+    private func startUnchecked() async throws {
+        // Global system-output tap. vo never plays audio, so there is nothing of
+        // our own to exclude from the mix.
+        let tapDescription = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
+        tapDescription.uuid = UUID()
+        tapDescription.muteBehavior = .unmuted
+        tapDescription.isPrivate = true
 
-        let s = SCStream(filter: filter, configuration: config, delegate: nil)
-        try s.addStreamOutput(self, type: .audio, sampleHandlerQueue: DispatchQueue(label: "vo.spk.audio"))
-        try await s.startCapture()
-        self.scStream = s
+        var tap = AudioObjectID(kAudioObjectUnknown)
+        var status = AudioHardwareCreateProcessTap(tapDescription, &tap)
+        guard status == noErr else { throw CoreAudioError(code: status, op: "CreateProcessTap") }
+        self.tapID = tap
+
+        // A process tap carries no clock of its own, so it has to ride an aggregate
+        // device anchored to the current default output device.
+        let outputUID = try defaultOutputDeviceUID()
+        let aggregateUID = UUID().uuidString
+        let description: [String: Any] = [
+            kAudioAggregateDeviceNameKey: "vo-system-tap",
+            kAudioAggregateDeviceUIDKey: aggregateUID,
+            kAudioAggregateDeviceMainSubDeviceKey: outputUID,
+            kAudioAggregateDeviceIsPrivateKey: true,
+            kAudioAggregateDeviceIsStackedKey: false,
+            kAudioAggregateDeviceTapAutoStartKey: true,
+            kAudioAggregateDeviceSubDeviceListKey: [
+                [kAudioSubDeviceUIDKey: outputUID]
+            ],
+            kAudioAggregateDeviceTapListKey: [
+                [
+                    kAudioSubTapDriftCompensationKey: true,
+                    kAudioSubTapUIDKey: tapDescription.uuid.uuidString,
+                ]
+            ],
+        ]
+
+        var aggregate = AudioObjectID(kAudioObjectUnknown)
+        status = AudioHardwareCreateAggregateDevice(description as CFDictionary, &aggregate)
+        guard status == noErr else { throw CoreAudioError(code: status, op: "CreateAggregateDevice") }
+        self.aggregateID = aggregate
+
+        var asbd = try tapStreamFormat(tap)
+        guard let format = AVAudioFormat(streamDescription: &asbd) else {
+            throw VoError.noCompatibleAudioFormat
+        }
+
+        let builder = self.builder
+        var procID: AudioDeviceIOProcID?
+        status = AudioDeviceCreateIOProcIDWithBlock(&procID, aggregate, ioQueue) { _, inInputData, _, _, _ in
+            // The no-copy buffer aliases Core Audio's IO memory; downstream consumers
+            // run async and must own their data, so deep-copy before yielding.
+            guard let aliased = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: inInputData),
+                  let owned = aliased.copy() else { return }
+            builder.yield(owned)
+        }
+        guard status == noErr, let procID else {
+            throw CoreAudioError(code: status, op: "CreateIOProc")
+        }
+        self.ioProcID = procID
+
+        status = AudioDeviceStart(aggregate, procID)
+        guard status == noErr else { throw CoreAudioError(code: status, op: "DeviceStart") }
     }
 
     func stop() async {
-        if let s = scStream {
-            try? await s.stopCapture()
-            scStream = nil
+        if let procID = ioProcID, aggregateID != AudioObjectID(kAudioObjectUnknown) {
+            AudioDeviceStop(aggregateID, procID)
+            AudioDeviceDestroyIOProcID(aggregateID, procID)
+            ioProcID = nil
+        }
+        if aggregateID != AudioObjectID(kAudioObjectUnknown) {
+            AudioHardwareDestroyAggregateDevice(aggregateID)
+            aggregateID = AudioObjectID(kAudioObjectUnknown)
+        }
+        if tapID != AudioObjectID(kAudioObjectUnknown) {
+            AudioHardwareDestroyProcessTap(tapID)
+            tapID = AudioObjectID(kAudioObjectUnknown)
         }
         builder.finish()
     }
+
+    /// UID of the current default output device, used as the aggregate's main sub-device.
+    private func defaultOutputDeviceUID() throws -> String {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var deviceID = AudioObjectID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        var status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID
+        )
+        guard status == noErr else { throw CoreAudioError(code: status, op: "DefaultOutputDevice") }
+
+        address.mSelector = kAudioDevicePropertyDeviceUID
+        var cfStr: Unmanaged<CFString>?
+        size = UInt32(MemoryLayout<Unmanaged<CFString>>.size)
+        status = withUnsafeMutablePointer(to: &cfStr) {
+            AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, $0)
+        }
+        guard status == noErr, let cf = cfStr else {
+            throw CoreAudioError(code: status, op: "OutputDeviceUID")
+        }
+        return cf.takeRetainedValue() as String
+    }
+
+    /// Stream format the tap delivers, read from the tap object itself.
+    private func tapStreamFormat(_ tap: AudioObjectID) throws -> AudioStreamBasicDescription {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioTapPropertyFormat,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var asbd = AudioStreamBasicDescription()
+        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        let status = AudioObjectGetPropertyData(tap, &address, 0, nil, &size, &asbd)
+        guard status == noErr else { throw CoreAudioError(code: status, op: "TapFormat") }
+        return asbd
+    }
 }
 
-extension SpeakerCapture: SCStreamOutput {
-    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .audio else { return }
-        guard let pcm = sampleBuffer.asPCMBuffer() else { return }
-        builder.yield(pcm)
-    }
+struct CoreAudioError: Error, CustomStringConvertible {
+    let code: OSStatus
+    let op: String
+    var description: String { "CoreAudio error (\(op)): \(code)" }
 }
 
 extension AVAudioPCMBuffer {
@@ -133,58 +237,5 @@ extension AVAudioPCMBuffer {
             }
         }
         return out
-    }
-}
-
-extension CMSampleBuffer {
-    /// Materialize the sample buffer as an AVAudioPCMBuffer by copying the audio data.
-    func asPCMBuffer() -> AVAudioPCMBuffer? {
-        guard let formatDesc = CMSampleBufferGetFormatDescription(self),
-              let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) else {
-            return nil
-        }
-        var asbd = asbdPtr.pointee
-        guard let format = AVAudioFormat(streamDescription: &asbd) else { return nil }
-
-        let frameCount = AVAudioFrameCount(CMSampleBufferGetNumSamples(self))
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return nil }
-        buffer.frameLength = frameCount
-
-        let ablSize = MemoryLayout<AudioBufferList>.size
-            + MemoryLayout<AudioBuffer>.size * (Int(format.channelCount) - 1)
-        let rawPtr = UnsafeMutableRawPointer.allocate(
-            byteCount: ablSize,
-            alignment: MemoryLayout<AudioBufferList>.alignment
-        )
-        defer { rawPtr.deallocate() }
-        let ablPtr = rawPtr.bindMemory(to: AudioBufferList.self, capacity: 1)
-
-        var blockBuffer: CMBlockBuffer?
-        let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-            self,
-            bufferListSizeNeededOut: nil,
-            bufferListOut: ablPtr,
-            bufferListSize: ablSize,
-            blockBufferAllocator: kCFAllocatorDefault,
-            blockBufferMemoryAllocator: kCFAllocatorDefault,
-            flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
-            blockBufferOut: &blockBuffer
-        )
-        guard status == noErr else { return nil }
-
-        // Copy from the source ABL into the freshly allocated PCM buffer. The ABL's
-        // mData pointers point into blockBuffer, and ARC is free to release it after
-        // its last use above, so pin it for the duration of the copy.
-        withExtendedLifetime(blockBuffer) {
-            let srcList = UnsafeMutableAudioBufferListPointer(ablPtr)
-            let dstList = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
-            for i in 0..<min(srcList.count, dstList.count) {
-                let copyBytes = Int(min(srcList[i].mDataByteSize, dstList[i].mDataByteSize))
-                if let s = srcList[i].mData, let d = dstList[i].mData {
-                    memcpy(d, s, copyBytes)
-                }
-            }
-        }
-        return buffer
     }
 }
