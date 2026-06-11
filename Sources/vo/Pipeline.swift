@@ -198,8 +198,14 @@ struct Pipeline {
             let session = TranslationSession(installedSource: sourceLang, target: targetLang)
             // run() already verified the pair via ensureTranslationModel (it throws
             // otherwise), so warm the model now to keep the first chunk's translation
-            // off the lazy on-demand loading path.
-            try? await session.prepareTranslation()
+            // off the lazy on-demand loading path. A warm-up failure is non-fatal (the
+            // per-chunk translate path still surfaces real errors), but a cancellation
+            // means shutdown started, so bail instead of entering the chunk loop.
+            do {
+                try await session.prepareTranslation()
+            } catch is CancellationError {
+                return
+            } catch {}
             for await (seq, text) in chunkSeq {
                 do {
                     let response = try await session.translate(text)
