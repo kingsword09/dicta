@@ -1,4 +1,5 @@
 import Darwin
+import Dispatch
 import Foundation
 import MachO
 
@@ -12,18 +13,10 @@ import MachO
 private typealias SetDisclaimFn =
     @convention(c) (UnsafeMutablePointer<posix_spawnattr_t?>, Int32) -> Int32
 
-// Holds the disclaimed child's pid so the async-signal-safe forwarder can reach
-// it. Written once before the handlers are installed, then only read, so the
+// Holds the disclaimed child's pid so the signal-forwarding handlers can reach
+// it. Written once before the sources are resumed, then only read, so the
 // unchecked access is safe.
 nonisolated(unsafe) private var disclaimedChildPID: pid_t = 0
-
-// Forward a terminating signal from the launcher to the child that owns the
-// capture. `kill` is async-signal-safe, so this is safe to call from a handler.
-private func forwardSignalToChild(_ sig: Int32) {
-    if disclaimedChildPID > 0 {
-        kill(disclaimedChildPID, sig)
-    }
-}
 
 enum Responsibility {
     // Set on the spawned child so it does not spawn yet another copy.
@@ -51,9 +44,12 @@ enum Responsibility {
             return
         }
 
-        // RTLD_DEFAULT searches every loaded image, including the always-present
-        // libSystem; a nil result means this macOS lacks the symbol.
-        guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "responsibility_spawnattrs_setdisclaim") else {
+        // dlsym's RTLD_DEFAULT pseudo-handle (search every already-loaded image);
+        // Darwin doesn't surface the macro to Swift, so spell out its value.
+        // libSystem (which exports the symbol) is always loaded, so a nil result
+        // means this macOS lacks it.
+        let rtldDefault = UnsafeMutableRawPointer(bitPattern: -2)
+        guard let symbol = dlsym(rtldDefault, "responsibility_spawnattrs_setdisclaim") else {
             warn("the responsibility API is unavailable on this macOS; continuing under the terminal's identity")
             return
         }
@@ -92,27 +88,44 @@ enum Responsibility {
         // not forwarded: a terminal Ctrl-C already reaches the child directly via
         // the shared process group, and a forwarded second SIGINT would trip the
         // child's repeat-Ctrl-C hard abort and skip its save prompt.
+        //
+        // The forwarders run through DispatchSource (handlers fire on a dispatch
+        // queue, not in async-signal-unsafe handler context), mirroring how
+        // Listen.swift handles SIGINT. DispatchSource requires the default
+        // disposition be ignored first.
         disclaimedChildPID = pid
         signal(SIGINT, SIG_IGN)
-        signal(SIGTERM, forwardSignalToChild)
-        signal(SIGQUIT, forwardSignalToChild)
-
-        var wstatus: Int32 = 0
-        var reaped: pid_t = 0
-        repeat {
-            reaped = waitpid(pid, &wstatus, 0)
-        } while reaped == -1 && errno == EINTR
-        guard reaped != -1 else {
-            // Couldn't reap the child, so its real status is unknown; don't claim
-            // success.
-            warn("lost track of its helper process (\(String(cString: strerror(errno)))); exit status unknown")
-            exit(1)
+        signal(SIGTERM, SIG_IGN)
+        signal(SIGQUIT, SIG_IGN)
+        let forwarders: [DispatchSourceSignal] = [SIGTERM, SIGQUIT].map { sig in
+            let source = DispatchSource.makeSignalSource(signal: sig, queue: .global())
+            source.setEventHandler {
+                if disclaimedChildPID > 0 { kill(disclaimedChildPID, sig) }
+            }
+            source.resume()
+            return source
         }
 
-        if (wstatus & 0x7f) == 0 {
-            exit((wstatus >> 8) & 0xff)
+        // Hold the sources past the blocking wait, or the optimizer could release
+        // (and cancel) them while the launcher is parked in waitpid.
+        withExtendedLifetime(forwarders) {
+            var wstatus: Int32 = 0
+            var reaped: pid_t = 0
+            repeat {
+                reaped = waitpid(pid, &wstatus, 0)
+            } while reaped == -1 && errno == EINTR
+            guard reaped != -1 else {
+                // Couldn't reap the child, so its real status is unknown; don't
+                // claim success.
+                warn("lost track of its helper process (\(String(cString: strerror(errno)))); exit status unknown")
+                exit(1)
+            }
+
+            if (wstatus & 0x7f) == 0 {
+                exit((wstatus >> 8) & 0xff)
+            }
+            exit(128 + (wstatus & 0x7f))
         }
-        exit(128 + (wstatus & 0x7f))
     }
 
     private static func hasEmbeddedInfoPlist() -> Bool {
