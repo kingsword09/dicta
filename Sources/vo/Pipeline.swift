@@ -196,8 +196,9 @@ struct Pipeline {
         let translator: Task<Void, Never>? = willTranslate ? Task {
             guard let targetLang else { return }
             let session = TranslationSession(installedSource: sourceLang, target: targetLang)
-            // The pair is already confirmed installed in run(); warm the model now so
-            // the first chunk's translation isn't delayed by lazy on-demand loading.
+            // run() already verified the pair via ensureTranslationModel (it throws
+            // otherwise), so warm the model now to keep the first chunk's translation
+            // off the lazy on-demand loading path.
             try? await session.prepareTranslation()
             for await (seq, text) in chunkSeq {
                 do {
@@ -261,18 +262,18 @@ struct Pipeline {
         let isInstalled = installed.contains { $0.identifier(.bcp47) == locale.identifier(.bcp47) }
         guard !isInstalled else { return }
 
-        // Unlike the Translation framework, the speech asset downloads headlessly.
-        // Announce it so the first run's blocking wait doesn't look like a hang.
-        emitProgress("Downloading speech model for \(locale.identifier(.bcp47))… (first run only)")
         let transcriber = SpeechTranscriber(
             locale: locale,
             transcriptionOptions: [],
             reportingOptions: [.volatileResults, .fastResults],
             attributeOptions: [.audioTimeRange]
         )
-        if let req = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
-            try await req.downloadAndInstall()
-        }
+        guard let req = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) else { return }
+        // Unlike the Translation framework, the speech asset downloads headlessly.
+        // Announce it only once a real request exists, so the first run's blocking
+        // wait doesn't look like a hang without claiming a download that isn't happening.
+        emitProgress("Downloading speech model for \(locale.identifier(.bcp47))… (first run only)")
+        try await req.downloadAndInstall()
     }
 
     /// Verify the translation model for this pair is installed. The Translation
@@ -289,7 +290,9 @@ struct Pipeline {
         case .unsupported:
             throw VoError.unsupportedTranslationPair(source: source, target: target)
         @unknown default:
-            return
+            // A status we don't recognize is not a confirmed install, so fail fast
+            // rather than letting an unverified pair reach the per-chunk translate path.
+            throw VoError.translationModelNotInstalled(source: source, target: target)
         }
     }
 }
@@ -343,7 +346,7 @@ enum VoError: Error, CustomStringConvertible {
             Translation model for \(s.identifier(.bcp47)) → \(t.identifier(.bcp47)) is supported but not downloaded.
             macOS does not allow downloading it from a CLI, so install it once via
             System Settings > General > Language & Region > Translation Languages, then re-run.
-            (Run `vo --doctor` to list installed translation languages.)
+            (Run `vo --doctor` to see translation languages available on this device.)
             """
 
         case .unsupportedTranslationPair(let s, let t):
