@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build vo in release mode, ad-hoc codesign with entitlements + Info.plist embed.
+# Build vo in release mode, codesign with entitlements + Info.plist embed.
+# Signs ad-hoc by default; set VO_CODESIGN_IDENTITY for a stable signature.
 # Requires: macOS 26, Xcode 26 toolchain, Apple Silicon.
 set -euo pipefail
 
@@ -16,14 +17,24 @@ swift build -c release --arch arm64 \
 
 BIN_PATH="$(swift build -c release --arch arm64 --show-bin-path)/vo"
 
-# 2. Ad-hoc sign with entitlements + hardened runtime.
-echo ">> ad-hoc codesign"
+# 2. Sign with entitlements + hardened runtime. Defaults to ad-hoc; set
+# VO_CODESIGN_IDENTITY to a stable identity (Developer ID, or a self-signed
+# code-signing cert) so the signature, hence TCC attribution, survives rebuilds.
+SIGN_IDENTITY="${VO_CODESIGN_IDENTITY:--}"
+echo ">> codesign (identity: $SIGN_IDENTITY)"
 /usr/bin/codesign \
     --force \
-    --sign - \
+    --sign "$SIGN_IDENTITY" \
     --entitlements "$ENTITLEMENTS" \
     --options runtime \
     "$BIN_PATH"
 
 echo ">> built: $BIN_PATH"
 echo ">> verify with: codesign -dv --entitlements - $BIN_PATH"
+
+if [ "$SIGN_IDENTITY" = "-" ]; then
+    echo ">> NOTE: ad-hoc signed. The cdhash changes every rebuild, so macOS"
+    echo ">>       re-prompts for TCC after each build and '--own-tcc' grants do"
+    echo ">>       not persist. Set VO_CODESIGN_IDENTITY to a stable identity for"
+    echo ">>       persistent permissions."
+fi
