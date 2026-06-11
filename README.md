@@ -101,6 +101,18 @@ Translation lines are shown in dim text under the source. Pairs are emitted in s
 - Apple Silicon (Neural Engine)
 - TCC permissions: Microphone, Speech Recognition, and Audio Recording (speaker capture is on by default; disable it with `--no-speaker`)
 
+## Models
+
+`vo` runs entirely on-device, so the speech and translation models for your languages must be present locally.
+
+- **Speech model** (`--src`): downloaded automatically on first run. `vo` prints `Downloading speech model for <locale>…` to stderr and blocks until it finishes, so the first launch takes a few extra seconds.
+- **Translation model** (`--src` → `--dst`): cannot be downloaded by `vo`. macOS only installs translation languages through a system UI, so install the pair yourself via **System Settings > General > Language & Region > Translation Languages**, then re-run. If the pair is missing, `vo` exits at startup with instructions instead of failing on every line.
+
+Run `vo --doctor` to see which speech models are installed and which translation languages are available on this device.
+
+> [!NOTE]
+> Downloading a translation language in System Settings does **not** auto-download the matching speech model, and vice versa. They are separate assets.
+
 ## Build
 
 ```console

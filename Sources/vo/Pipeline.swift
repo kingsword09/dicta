@@ -72,6 +72,16 @@ struct Pipeline {
     func run() async throws {
         let counter = SeqCounter()
 
+        // Resolve models once, before any channel starts. Both channels share the
+        // source locale, so doing this here (instead of per-channel) avoids a double
+        // download and lets us emit a single progress line. The speech asset can be
+        // fetched headlessly; the translation model cannot, so we fail fast with
+        // install instructions rather than letting every chunk surface a failure.
+        try await ensureSpeechAsset(locale: sourceLocale)
+        if let targetLocale {
+            try await ensureTranslationModel(source: sourceLocale, target: targetLocale)
+        }
+
         try await withThrowingTaskGroup(of: Void.self) { group in
             if enableMic {
                 group.addTask {
@@ -118,7 +128,6 @@ struct Pipeline {
             attributeOptions: [.audioTimeRange]
         )
         let analyzer = SpeechAnalyzer(modules: [transcriber])
-        try await ensureSpeechAsset(for: transcriber, locale: sourceLocale)
 
         guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
             throw VoError.noCompatibleAudioFormat
@@ -187,6 +196,16 @@ struct Pipeline {
         let translator: Task<Void, Never>? = willTranslate ? Task {
             guard let targetLang else { return }
             let session = TranslationSession(installedSource: sourceLang, target: targetLang)
+            // run() already verified the pair via ensureTranslationModel (it throws
+            // otherwise), so warm the model now to keep the first chunk's translation
+            // off the lazy on-demand loading path. A warm-up failure is non-fatal (the
+            // per-chunk translate path still surfaces real errors), but a cancellation
+            // means shutdown started, so bail instead of entering the chunk loop.
+            do {
+                try await session.prepareTranslation()
+            } catch is CancellationError {
+                return
+            } catch {}
             for await (seq, text) in chunkSeq {
                 do {
                     let response = try await session.translate(text)
@@ -238,7 +257,7 @@ struct Pipeline {
 
     // MARK: - Helpers
 
-    private func ensureSpeechAsset(for transcriber: SpeechTranscriber, locale: Locale) async throws {
+    private func ensureSpeechAsset(locale: Locale) async throws {
         let supportedIDs = (await SpeechTranscriber.supportedLocales).map { $0.identifier(.bcp47) }
         let isSupported = supportedIDs.contains(locale.identifier(.bcp47))
         guard isSupported else {
@@ -247,12 +266,47 @@ struct Pipeline {
 
         let installed = await SpeechTranscriber.installedLocales
         let isInstalled = installed.contains { $0.identifier(.bcp47) == locale.identifier(.bcp47) }
-        if !isInstalled {
-            if let req = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
-                try await req.downloadAndInstall()
-            }
+        guard !isInstalled else { return }
+
+        let transcriber = SpeechTranscriber(
+            locale: locale,
+            transcriptionOptions: [],
+            reportingOptions: [.volatileResults, .fastResults],
+            attributeOptions: [.audioTimeRange]
+        )
+        guard let req = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) else { return }
+        // Unlike the Translation framework, the speech asset downloads headlessly.
+        // Announce it only once a real request exists, so the first run's blocking
+        // wait doesn't look like a hang without claiming a download that isn't happening.
+        emitProgress("Downloading speech model for \(locale.identifier(.bcp47))… (first run only)")
+        try await req.downloadAndInstall()
+    }
+
+    /// Verify the translation model for this pair is installed. The Translation
+    /// framework only downloads via a UI confirmation sheet, which a CLI cannot
+    /// present, so an uninstalled pair would otherwise fail silently on every
+    /// chunk. Fail fast with install instructions instead.
+    private func ensureTranslationModel(source: Locale, target: Locale) async throws {
+        let status = await LanguageAvailability().status(from: source.language, to: target.language)
+        switch status {
+        case .installed:
+            return
+        case .supported:
+            throw VoError.translationModelNotInstalled(source: source, target: target)
+        case .unsupported:
+            throw VoError.unsupportedTranslationPair(source: source, target: target)
+        @unknown default:
+            // A status we don't recognize is not a confirmed install, so fail fast
+            // rather than letting an unverified pair reach the per-chunk translate path.
+            throw VoError.translationModelNotInstalled(source: source, target: target)
         }
     }
+}
+
+/// Write a one-line status to stderr. Stays off stdout so it never corrupts the
+/// JSONL stream a downstream reader may be consuming.
+private func emitProgress(_ message: String) {
+    FileHandle.standardError.write(Data((message + "\n").utf8))
 }
 
 /// Convert one PCM buffer to the analyzer's preferred format. Handles sample-rate conversion.
@@ -285,11 +339,27 @@ private func convertBuffer(_ source: AVAudioPCMBuffer, to dstFormat: AVAudioForm
 enum VoError: Error, CustomStringConvertible {
     case noCompatibleAudioFormat
     case unsupportedSpeechLocale(Locale, supported: [String])
+    case translationModelNotInstalled(source: Locale, target: Locale)
+    case unsupportedTranslationPair(source: Locale, target: Locale)
 
     var description: String {
         switch self {
         case .noCompatibleAudioFormat:
             return "No audio format compatible with SpeechTranscriber is available on this device."
+
+        case .translationModelNotInstalled(let s, let t):
+            return """
+            Translation model for \(s.identifier(.bcp47)) → \(t.identifier(.bcp47)) is not installed.
+            macOS does not allow downloading it from a CLI, so install it once via
+            System Settings > General > Language & Region > Translation Languages, then re-run.
+            (Run `vo --doctor` to see translation languages available on this device.)
+            """
+
+        case .unsupportedTranslationPair(let s, let t):
+            return """
+            Translation from \(s.identifier(.bcp47)) to \(t.identifier(.bcp47)) is not supported on this device.
+            Run `vo --doctor` to see available translation languages.
+            """
 
         case .unsupportedSpeechLocale(let l, let supported):
             let id = l.identifier(.bcp47)

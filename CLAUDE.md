@@ -37,6 +37,7 @@ injects the needed `-F` / `-rpath` flags only when that layout is detected. Unde
 - macOS 26+ (uses `SpeechTranscriber`, `SpeechAnalyzer`, `TranslationSession`, all macOS 26 only)
 - Apple Silicon (Neural Engine)
 - TCC permissions granted on first run: Microphone, Speech Recognition, and (unless `--no-speaker` is passed) Audio Recording. The speaker channel uses a Core Audio process tap, **not** ScreenCaptureKit, so it needs only the Audio Recording grant, never Screen Recording. When launched from Terminal.app, the grants attach to Terminal.app rather than `vo` itself unless `vo` is properly bundled and signed.
+- On-device models. `Pipeline.run()` resolves both before any channel starts (once, since both channels share `--src`). The speech model for `--src` downloads headlessly via `AssetInventory.downloadAndInstall()` on first run, with a one-line `Downloading speech model…` notice on **stderr** (so JSONL on stdout stays clean). The translation model for `--src → --dst` **cannot** be downloaded headlessly (the Translation framework only downloads via a UI sheet a CLI can't present), so `ensureTranslationModel` checks `LanguageAvailability.status` up front and fails fast with `VoError.translationModelNotInstalled` (install via System Settings) or `.unsupportedTranslationPair`, rather than letting every chunk surface `[translation failed]`.
 
 ## CLI surface
 

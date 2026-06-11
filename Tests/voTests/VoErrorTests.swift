@@ -30,4 +30,31 @@ struct VoErrorTests {
         #expect(msg.contains("--doctor"))
         #expect(!msg.contains("regional variants"))
     }
+
+    /// A supported-but-not-downloaded translation pair names both locales and the
+    /// System Settings path the user must follow, since a CLI can't trigger the download.
+    @Test func translationModelNotInstalledNamesPairAndInstallPath() {
+        let err = VoError.translationModelNotInstalled(
+            source: Locale(identifier: "en-US"),
+            target: Locale(identifier: "ja-JP")
+        )
+        let msg = err.description
+
+        #expect(msg.contains("en-US"))
+        #expect(msg.contains("ja-JP"))
+        #expect(msg.contains("System Settings"))
+    }
+
+    /// An unsupported translation pair names both locales and points at `--doctor`.
+    @Test func unsupportedTranslationPairPointsToDoctor() {
+        let err = VoError.unsupportedTranslationPair(
+            source: Locale(identifier: "en-US"),
+            target: Locale(identifier: "xx")
+        )
+        let msg = err.description
+
+        #expect(msg.contains("en-US"))
+        #expect(msg.contains("not supported"))
+        #expect(msg.contains("--doctor"))
+    }
 }
