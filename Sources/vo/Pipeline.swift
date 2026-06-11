@@ -349,7 +349,7 @@ enum VoError: Error, CustomStringConvertible {
 
         case .translationModelNotInstalled(let s, let t):
             return """
-            Translation model for \(s.identifier(.bcp47)) → \(t.identifier(.bcp47)) is supported but not downloaded.
+            Translation model for \(s.identifier(.bcp47)) → \(t.identifier(.bcp47)) is not installed.
             macOS does not allow downloading it from a CLI, so install it once via
             System Settings > General > Language & Region > Translation Languages, then re-run.
             (Run `vo --doctor` to see translation languages available on this device.)
