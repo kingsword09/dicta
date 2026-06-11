@@ -21,17 +21,20 @@ func collectSpeechLocales() async -> [SpeechLocaleInfo] {
         .sorted { $0.identifier < $1.identifier }
 }
 
-/// Full identifiers of all Translation languages available on this device.
+/// BCP-47 identifiers of all Translation languages available on this device,
+/// e.g. "ja-JP". A language code is the minimum BCP-47 unit, so entries
+/// without one are dropped rather than emitted as a placeholder.
 func collectTranslationLanguages() async -> [String] {
     let availability = LanguageAvailability()
     let supported = await availability.supportedLanguages
-    return Set(supported.map { fullLanguageIdentifier($0) }).sorted()
+    return Set(supported.compactMap { languageRegionIdentifier($0) }).sorted()
 }
 
-private func fullLanguageIdentifier(_ lang: Locale.Language) -> String {
-    var parts: [String] = []
-    if let code = lang.languageCode?.identifier { parts.append(code) }
-    if let script = lang.script?.identifier { parts.append(script) }
-    if let region = lang.region?.identifier { parts.append(region) }
-    return parts.isEmpty ? "?" : parts.joined(separator: "-")
+// Script subtag is dropped so the output matches the `--src` / `--dst` option
+// format and the Speech locale list. Returns nil without a language code, since
+// a region alone is not a usable identifier.
+private func languageRegionIdentifier(_ lang: Locale.Language) -> String? {
+    guard let code = lang.languageCode?.identifier else { return nil }
+    if let region = lang.region?.identifier { return "\(code)-\(region)" }
+    return code
 }
