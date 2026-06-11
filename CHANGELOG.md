@@ -1,5 +1,14 @@
 # Changelog
 
+## [v0.3.0](https://github.com/k1LoW/vo/compare/v0.2.1...v0.3.0) - 2026-06-11
+
+### New Features 🎉
+- feat: use a Core Audio tap for speaker capture to drop Screen Recording by @k1LoW in https://github.com/k1LoW/vo/pull/14
+- feat: resolve speech and translation models up front at startup by @k1LoW in https://github.com/k1LoW/vo/pull/15
+### Other Changes
+- test: add Swift Testing suite and CI by @k1LoW in https://github.com/k1LoW/vo/pull/11
+- fix: drop script subtag from --doctor translation list by @k1LoW in https://github.com/k1LoW/vo/pull/13
+
 ## [v0.2.1](https://github.com/k1LoW/vo/compare/v0.2.0...v0.2.1) - 2026-06-10
 
 ### Other Changes
