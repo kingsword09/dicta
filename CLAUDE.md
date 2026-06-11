@@ -36,7 +36,7 @@ injects the needed `-F` / `-rpath` flags only when that layout is detected. Unde
 
 - macOS 26+ (uses `SpeechTranscriber`, `SpeechAnalyzer`, `TranslationSession`, all macOS 26 only)
 - Apple Silicon (Neural Engine)
-- TCC permissions granted on first run: Microphone, Speech Recognition, and (if `--speaker` is enabled) Audio Recording. The speaker channel uses a Core Audio process tap, **not** ScreenCaptureKit, so it needs only the Audio Recording grant, never Screen Recording. When launched from Terminal.app, the grants attach to Terminal.app rather than `vo` itself unless `vo` is properly bundled and signed.
+- TCC permissions granted on first run: Microphone, Speech Recognition, and (unless `--no-speaker` is passed) Audio Recording. The speaker channel uses a Core Audio process tap, **not** ScreenCaptureKit, so it needs only the Audio Recording grant, never Screen Recording. When launched from Terminal.app, the grants attach to Terminal.app rather than `vo` itself unless `vo` is properly bundled and signed.
 
 ## CLI surface
 

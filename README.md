@@ -99,7 +99,7 @@ Translation lines are shown in dim text under the source. Pairs are emitted in s
 
 - macOS 26+
 - Apple Silicon (Neural Engine)
-- TCC permissions: Microphone, Speech Recognition, and Audio Recording (only when `--speaker` is enabled)
+- TCC permissions: Microphone, Speech Recognition, and Audio Recording (speaker capture is on by default; disable it with `--no-speaker`)
 
 ## Build
 
