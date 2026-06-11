@@ -34,7 +34,7 @@ echo ">> verify with: codesign -dv --entitlements - $BIN_PATH"
 
 if [ "$SIGN_IDENTITY" = "-" ]; then
     echo ">> NOTE: ad-hoc signed. The cdhash changes every rebuild, so macOS"
-    echo ">>       re-prompts for TCC after each build and '--own-tcc' grants do"
-    echo ">>       not persist. Set VO_CODESIGN_IDENTITY to a stable identity for"
-    echo ">>       persistent permissions."
+    echo ">>       re-prompts for TCC after each build and grants do not persist."
+    echo ">>       Set VO_CODESIGN_IDENTITY to a stable identity for persistent"
+    echo ">>       permissions."
 fi

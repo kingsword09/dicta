@@ -2,8 +2,8 @@ import Darwin
 import Foundation
 import MachO
 
-// Private libSystem call: when set on the spawn attributes, the spawned child
-// becomes its own TCC "responsible process" instead of inheriting the launching
+// Private libSystem call. When set on the spawn attributes, the spawned child
+// becomes its own TCC responsible process instead of inheriting the launching
 // terminal's. There is no exec-based equivalent, which is why claiming vo's own
 // identity requires spawning a child rather than re-imaging the current process.
 @_silgen_name("responsibility_spawnattrs_setdisclaim")
@@ -12,11 +12,24 @@ private func responsibility_spawnattrs_setdisclaim(
     _ disclaim: Int32
 ) -> Int32
 
+// Holds the disclaimed child's pid so the async-signal-safe forwarder can reach
+// it. Written once before the handlers are installed, then only read, so the
+// unchecked access is safe.
+nonisolated(unsafe) private var disclaimedChildPID: pid_t = 0
+
+// Forward a terminating signal from the launcher to the child that owns the
+// capture. `kill` is async-signal-safe, so this is safe to call from a handler.
+private func forwardSignalToChild(_ sig: Int32) {
+    if disclaimedChildPID > 0 {
+        kill(disclaimedChildPID, sig)
+    }
+}
+
 enum Responsibility {
-    // Set on the re-execed child so it does not spawn yet another copy.
+    // Set on the spawned child so it does not spawn yet another copy.
     private static let guardKey = "VO_DISCLAIMED"
 
-    /// Re-exec vo as its own responsible process so the Microphone / Speech /
+    /// Re-launch vo as its own responsible process so the Microphone / Speech /
     /// Audio Recording prompts attach to vo rather than the host terminal.
     ///
     /// On success this never returns: the launcher waits on the child and exits
@@ -28,16 +41,26 @@ enum Responsibility {
         guard getenv(guardKey) == nil else { return }
         // A disclaimed process is its own responsible process, so it must carry the
         // usage descriptions itself. Only the release build embeds them (see
-        // build.sh); re-execing a plain `swift build` binary would hit the mic with
-        // no usage string and get killed, so leave such builds on the terminal's
-        // identity instead.
+        // build.sh); re-launching a plain `swift build` binary would hit the mic
+        // with no usage string and get killed, so leave such builds on the
+        // terminal's identity instead. This guard is the expected path for dev
+        // builds, so it stays silent.
         guard hasEmbeddedInfoPlist() else { return }
-        guard let exePath = executablePath() else { return }
+        guard let exePath = executablePath() else {
+            warn("could not resolve its own path; continuing under the terminal's identity")
+            return
+        }
 
         var attr: posix_spawnattr_t?
-        guard posix_spawnattr_init(&attr) == 0 else { return }
+        guard posix_spawnattr_init(&attr) == 0 else {
+            warn("could not initialize spawn attributes; continuing under the terminal's identity")
+            return
+        }
         defer { posix_spawnattr_destroy(&attr) }
-        guard responsibility_spawnattrs_setdisclaim(&attr, 1) == 0 else { return }
+        guard responsibility_spawnattrs_setdisclaim(&attr, 1) == 0 else {
+            warn("could not disclaim responsibility; continuing under the terminal's identity")
+            return
+        }
 
         let argv: [UnsafeMutablePointer<CChar>?] =
             CommandLine.arguments.map { strdup($0) } + [nil]
@@ -45,17 +68,24 @@ enum Responsibility {
 
         var pid: pid_t = 0
         let rc = posix_spawn(&pid, exePath, nil, &attr, argv, envp)
+        // posix_spawn copies argv/envp into the child, so the parent's duplicates
+        // are dead after the call on either outcome.
+        freeCStringArray(argv)
+        freeCStringArray(envp)
         guard rc == 0 else {
             warn("could not claim its own permissions (\(String(cString: strerror(rc)))); continuing under the terminal's identity")
             return
         }
 
-        // The child installs its own SIGINT handling; the launcher must outlive it
-        // so it doesn't orphan the child mid-session, so ignore the job-control
-        // signals (the child shares this process group and receives them directly).
-        signal(SIGINT, SIG_IGN)
-        signal(SIGTERM, SIG_IGN)
-        signal(SIGQUIT, SIG_IGN)
+        // Forward terminating signals to the child so the launcher stays a
+        // transparent proxy: a SIGTERM/SIGINT/SIGQUIT aimed at this pid (kill, a
+        // process manager) reaches the child that owns the capture instead of being
+        // dropped while the child keeps recording. The launcher keeps running so it
+        // can reap the child and report its exit status.
+        disclaimedChildPID = pid
+        signal(SIGINT, forwardSignalToChild)
+        signal(SIGTERM, forwardSignalToChild)
+        signal(SIGQUIT, forwardSignalToChild)
 
         var wstatus: Int32 = 0
         while waitpid(pid, &wstatus, 0) == -1 && errno == EINTR {}
@@ -99,6 +129,10 @@ enum Responsibility {
         env.append(strdup("\(guardKey)=1"))
         env.append(nil)
         return env
+    }
+
+    private static func freeCStringArray(_ array: [UnsafeMutablePointer<CChar>?]) {
+        for entry in array where entry != nil { free(entry) }
     }
 
     private static func warn(_ message: String) {
