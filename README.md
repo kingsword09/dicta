@@ -101,8 +101,14 @@ Translation lines are shown in dim text under the source. Pairs are emitted in s
 - Apple Silicon (Neural Engine)
 - TCC permissions: Microphone, Speech Recognition, and Audio Recording (speaker capture is on by default; disable it with `--no-speaker`)
 
+### Permissions attach to vo, not your terminal
+
+A bare CLI normally hands its TCC prompts to the **terminal emulator** that launched it, which means every other command you run in that terminal would then share the Microphone / Audio Recording grants. `vo` avoids that: on startup it re-execs itself as its own TCC responsible process, so the prompts and the grants attach to **`vo`** (shown as `vo` under System Settings > Privacy & Security), not to Terminal.app / iTerm2.
+
 > [!IMPORTANT]
-> These TCC permissions are granted to the **terminal emulator** that launches `vo` (Terminal.app, iTerm2, etc.), not to `vo` itself. `vo` ships as a bare binary, so macOS attributes the Microphone / Speech Recognition / Audio Recording prompts to the host terminal app. Manage or reset them against that terminal app under System Settings > Privacy & Security, not under a `vo` entry.
+> Because the released binary is ad-hoc signed, its signature changes with every release, so macOS re-prompts for permissions after each `vo` update. Granting again attaches to the same `vo` entry (it does not pile up duplicates). A stable code signature removes the re-prompt entirely; build with `VO_CODESIGN_IDENTITY` set (see Build) if you want grants to persist across rebuilds.
+
+This relies on a private macOS API and only applies to the released / `scripts/build.sh` binary (which embeds the required usage descriptions). A plain `swift build` binary has no embedded `Info.plist`, so it falls back to the terminal's identity. If the re-exec fails for any reason, `vo` logs a notice to stderr and continues rather than refusing to start.
 
 ## Models
 
@@ -122,6 +128,14 @@ Run `vo --doctor` to see which speech models are installed and which translation
 $ swift build                 # debug build
 $ ./scripts/build.sh          # release + embed Info.plist + ad-hoc codesign
 ```
+
+For a signature stable across rebuilds (so permission grants persist across `vo` updates instead of re-prompting), pass a signing identity:
+
+```console
+$ VO_CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" ./scripts/build.sh
+```
+
+A self-signed code-signing certificate created in Keychain Access works too; any identity with a stable designated requirement keeps the cdhash steady so macOS stops re-prompting after each build.
 
 ## License
 

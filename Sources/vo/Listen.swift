@@ -15,6 +15,14 @@ func runListen(
         throw ValidationError("Cannot disable both mic and speaker. Drop one of --no-mic / --no-speaker.")
     }
 
+    // Claim vo's own TCC identity before touching audio, so the Microphone / Speech
+    // / Audio Recording grants attach to vo rather than the launching terminal. Done
+    // after the flag combination is known valid so an invalid run errors without
+    // spawning. On a release build this re-execs and never returns here; the
+    // disclaimed child resumes below. On a plain `swift build` (no embedded
+    // Info.plist) it is a no-op and vo keeps the terminal's identity.
+    Responsibility.reexecAsResponsibleProcess()
+
     let sourceLocale = Locale(identifier: src)
     let targetLocale = dst.map { Locale(identifier: $0) }
 
