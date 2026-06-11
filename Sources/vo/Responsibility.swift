@@ -6,11 +6,11 @@ import MachO
 // becomes its own TCC responsible process instead of inheriting the launching
 // terminal's. There is no exec-based equivalent, which is why claiming vo's own
 // identity requires spawning a child rather than re-imaging the current process.
-@_silgen_name("responsibility_spawnattrs_setdisclaim")
-private func responsibility_spawnattrs_setdisclaim(
-    _ attr: UnsafeMutablePointer<posix_spawnattr_t?>,
-    _ disclaim: Int32
-) -> Int32
+// Resolved with dlsym at runtime rather than linked directly: if a future macOS
+// drops or renames the symbol, that turns into a graceful fallback instead of a
+// dyld abort at launch that would defeat the best-effort design.
+private typealias SetDisclaimFn =
+    @convention(c) (UnsafeMutablePointer<posix_spawnattr_t?>, Int32) -> Int32
 
 // Holds the disclaimed child's pid so the async-signal-safe forwarder can reach
 // it. Written once before the handlers are installed, then only read, so the
@@ -51,13 +51,21 @@ enum Responsibility {
             return
         }
 
+        // RTLD_DEFAULT searches every loaded image, including the always-present
+        // libSystem; a nil result means this macOS lacks the symbol.
+        guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "responsibility_spawnattrs_setdisclaim") else {
+            warn("the responsibility API is unavailable on this macOS; continuing under the terminal's identity")
+            return
+        }
+        let setDisclaim = unsafeBitCast(symbol, to: SetDisclaimFn.self)
+
         var attr: posix_spawnattr_t?
         guard posix_spawnattr_init(&attr) == 0 else {
             warn("could not initialize spawn attributes; continuing under the terminal's identity")
             return
         }
         defer { posix_spawnattr_destroy(&attr) }
-        guard responsibility_spawnattrs_setdisclaim(&attr, 1) == 0 else {
+        guard setDisclaim(&attr, 1) == 0 else {
             warn("could not disclaim responsibility; continuing under the terminal's identity")
             return
         }
@@ -77,18 +85,29 @@ enum Responsibility {
             return
         }
 
-        // Forward terminating signals to the child so the launcher stays a
-        // transparent proxy: a SIGTERM/SIGINT/SIGQUIT aimed at this pid (kill, a
-        // process manager) reaches the child that owns the capture instead of being
-        // dropped while the child keeps recording. The launcher keeps running so it
-        // can reap the child and report its exit status.
+        // Keep the launcher alive to reap the child and report its status, but make
+        // a kill aimed at this pid still reach the capturing child. SIGTERM/SIGQUIT
+        // are not delivered to the process group by a terminal, so forward those so
+        // `kill <pid>` / a process manager stops the child. SIGINT is left ignored,
+        // not forwarded: a terminal Ctrl-C already reaches the child directly via
+        // the shared process group, and a forwarded second SIGINT would trip the
+        // child's repeat-Ctrl-C hard abort and skip its save prompt.
         disclaimedChildPID = pid
-        signal(SIGINT, forwardSignalToChild)
+        signal(SIGINT, SIG_IGN)
         signal(SIGTERM, forwardSignalToChild)
         signal(SIGQUIT, forwardSignalToChild)
 
         var wstatus: Int32 = 0
-        while waitpid(pid, &wstatus, 0) == -1 && errno == EINTR {}
+        var reaped: pid_t = 0
+        repeat {
+            reaped = waitpid(pid, &wstatus, 0)
+        } while reaped == -1 && errno == EINTR
+        guard reaped != -1 else {
+            // Couldn't reap the child, so its real status is unknown; don't claim
+            // success.
+            warn("lost track of its helper process (\(String(cString: strerror(errno)))); exit status unknown")
+            exit(1)
+        }
 
         if (wstatus & 0x7f) == 0 {
             exit((wstatus >> 8) & 0xff)
