@@ -85,7 +85,7 @@ private func printDoctorText(_ r: DoctorReport) {
     info("vo cannot directly query TCC. On first run it will prompt for:")
     info("  - Microphone")
     info("  - Speech Recognition")
-    info("  - Screen Recording (used by ScreenCaptureKit for speaker channel)")
+    info("  - Audio Recording (Core Audio process tap for the speaker channel)")
     info("If launched from Terminal, those grants attach to Terminal.app.")
 
     section("Summary")

@@ -36,7 +36,7 @@ injects the needed `-F` / `-rpath` flags only when that layout is detected. Unde
 
 - macOS 26+ (uses `SpeechTranscriber`, `SpeechAnalyzer`, `TranslationSession`, all macOS 26 only)
 - Apple Silicon (Neural Engine)
-- TCC permissions granted on first run: Microphone, Speech Recognition, and (if `--speaker` is enabled) Screen Recording. When launched from Terminal.app, the grants attach to Terminal.app rather than `vo` itself unless `vo` is properly bundled and signed.
+- TCC permissions granted on first run: Microphone, Speech Recognition, and (if `--speaker` is enabled) Audio Recording. The speaker channel uses a Core Audio process tap, **not** ScreenCaptureKit, so it needs only the Audio Recording grant, never Screen Recording. When launched from Terminal.app, the grants attach to Terminal.app rather than `vo` itself unless `vo` is properly bundled and signed.
 
 ## CLI surface
 
@@ -94,7 +94,7 @@ The whole pipeline is one TaskGroup orchestrating two parallel channels (mic + s
 | `Vo.swift` | `@main` `AsyncParsableCommand`. Pure flag-parse and dispatch to either `runListen` or `runDoctor`. |
 | `Listen.swift` | Entry point for the main capture loop. Sets up `StreamRenderer`, `Pipeline`, SIGINT handler, banner, exit summary. |
 | `Pipeline.swift` | The TaskGroup orchestration. Spawns `runChannel(.mic, …)` and `runChannel(.speaker, …)` concurrently. Each channel constructs its own `SpeechTranscriber`, `SpeechAnalyzer`, and (if translating) `TranslationSession`. **Important: `TranslationSession` is a non-Sendable class; it is constructed inside the Task closure to avoid Sendable warnings — do not hoist it.** Also contains `convertBuffer` and `VoError`. |
-| `AudioSource.swift` | `MicCapture` (AVAudioEngine input node) and `SpeakerCapture` (ScreenCaptureKit `SCStream` with `capturesAudio = true`). Both expose `AsyncStream<AVAudioPCMBuffer>`. Includes `CMSampleBuffer.asPCMBuffer()` and `AVAudioPCMBuffer.copy()` extensions. |
+| `AudioSource.swift` | `MicCapture` (AVAudioEngine input node) and `SpeakerCapture` (Core Audio process tap: `CATapDescription` + `AudioHardwareCreateProcessTap`, mounted on a private aggregate device with an IOProc). Both expose `AsyncStream<AVAudioPCMBuffer>`. Includes the `AVAudioPCMBuffer.copy()` extension and `CoreAudioError`. |
 | `Renderer.swift` | `StreamRenderer` actor + `RenderEvent` + `ChunkTiming`. Owns the strict-order commit queue, the volatile live region, the TTY rendering, the JSONL emission, the wall-clock timestamp formatting, and the wrap-aware screen-row accounting. |
 | `Doctor.swift` | `runDoctor(json:)`. Gathers OS info, speech model status, translation language list, input device list via the helpers below, then renders human text or JSON. |
 | `Locales.swift` | `collectSpeechLocales()` and `collectTranslationLanguages()`. Pure data collection, no I/O. |

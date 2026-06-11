@@ -285,7 +285,6 @@ private func convertBuffer(_ source: AVAudioPCMBuffer, to dstFormat: AVAudioForm
 enum VoError: Error, CustomStringConvertible {
     case noCompatibleAudioFormat
     case unsupportedSpeechLocale(Locale, supported: [String])
-    case noDisplayForScreenCapture
 
     var description: String {
         switch self {
@@ -307,9 +306,6 @@ enum VoError: Error, CustomStringConvertible {
             return """
             SpeechTranscriber does not support locale \(id). Run `vo --doctor` to see all supported locales.
             """
-
-        case .noDisplayForScreenCapture:
-            return "No display available for ScreenCaptureKit. Speaker capture requires at least one display."
         }
     }
 }

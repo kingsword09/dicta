@@ -128,9 +128,3 @@ private func queryStringProperty(_ deviceID: AudioDeviceID, selector: AudioObjec
     }
     return cf.takeRetainedValue() as String
 }
-
-private struct CoreAudioError: Error, CustomStringConvertible {
-    let code: OSStatus
-    let op: String
-    var description: String { "CoreAudio error (\(op)): \(code)" }
-}

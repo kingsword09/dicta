@@ -20,7 +20,7 @@ struct Vo: AsyncParsableCommand {
     @Flag(name: .long, help: "Disable microphone capture")
     var noMic: Bool = false
 
-    @Flag(name: .long, help: "Disable system audio (speaker) capture via ScreenCaptureKit")
+    @Flag(name: .long, help: "Disable system audio (speaker) capture via Core Audio process tap")
     var noSpeaker: Bool = false
 
     @Flag(name: .long, help: "Apply system voice processing (echo cancellation + noise reduction) on mic input. Note: this lowers system speaker volume while active.")
