@@ -73,6 +73,9 @@ final class SpeakerCapture: @unchecked Sendable {
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
     private var ioProcID: AudioDeviceIOProcID?
+    // Runs the IOProc off Core Audio's real-time IO thread: the block deep-copies
+    // and yields into an AsyncStream, neither of which is safe on the RT thread.
+    private let ioQueue = DispatchQueue(label: "vo.spk.audio")
 
     init() {
         let (s, b) = AsyncStream<AVAudioPCMBuffer>.makeStream()
@@ -81,6 +84,18 @@ final class SpeakerCapture: @unchecked Sendable {
     }
 
     func start() async throws {
+        // Any step past the first allocation can throw, and Pipeline.runChannel only
+        // registers stop() once start() returns. So clean up partial allocations here
+        // before rethrowing, otherwise the tap / aggregate would dangle.
+        do {
+            try await startUnchecked()
+        } catch {
+            await stop()
+            throw error
+        }
+    }
+
+    private func startUnchecked() async throws {
         // Global system-output tap. vo never plays audio, so there is nothing of
         // our own to exclude from the mix.
         let tapDescription = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
@@ -127,7 +142,7 @@ final class SpeakerCapture: @unchecked Sendable {
 
         let builder = self.builder
         var procID: AudioDeviceIOProcID?
-        status = AudioDeviceCreateIOProcIDWithBlock(&procID, aggregate, nil) { _, inInputData, _, _, _ in
+        status = AudioDeviceCreateIOProcIDWithBlock(&procID, aggregate, ioQueue) { _, inInputData, _, _, _ in
             // The no-copy buffer aliases Core Audio's IO memory; downstream consumers
             // run async and must own their data, so deep-copy before yielding.
             guard let aliased = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: inInputData),
