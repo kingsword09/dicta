@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.5.1](https://github.com/k1LoW/vo/compare/v0.5.0...v0.5.1) - 2026-06-12
+
+### Other Changes
+- fix: drop float artifacts from JSONL confidence and audio offsets by @k1LoW in https://github.com/k1LoW/vo/pull/21
+
 ## [v0.5.0](https://github.com/k1LoW/vo/compare/v0.4.0...v0.5.0) - 2026-06-12
 
 ### New Features 🎉
