@@ -12,6 +12,7 @@ https://github.com/user-attachments/assets/4d8878c2-7365-4e63-b8c4-244e96f97c96
 - Strict source-order output, even when translations arrive out of order
 - TTY and JSONL output modes (auto-detected)
 - Wall-clock timestamps and audio time range per chunk
+- Transcription confidence per chunk (mean + min) in JSONL output
 - Optional voice processing (echo cancellation + noise reduction)
 - Environment diagnostics via `--doctor`
 
@@ -73,10 +74,12 @@ Translation lines are shown in dim text under the source. Pairs are emitted in s
 `--json` forces JSONL. When STDOUT is not a TTY, JSONL is selected automatically.
 
 ```jsonl
-{"seq":0,"channel":"mic","timestamp":"2026-06-10T08:34:56.234+09:00","audio":{"start":0.124,"end":1.582},"src":{"lang":"en-US","text":"Hey, Tim."},"dst":{"lang":"ja-JP","text":"ねえ、ティム。"}}
+{"seq":0,"channel":"mic","timestamp":"2026-06-10T08:34:56.234+09:00","audio":{"start":0.124,"end":1.582},"src":{"lang":"en-US","text":"Hey, Tim.","confidence":{"mean":0.83,"min":0.62}},"dst":{"lang":"ja-JP","text":"ねえ、ティム。"}}
 ```
 
 `dst` is present only when `--dst` is given. `seq` is monotonic across both channels. `audio.start` / `audio.end` come from `SpeechTranscriber.Result.range`.
+
+`src.confidence` reports the transcription's per-chunk confidence, with `mean` weighted across the chunk and `min` taken from its least-confident run. This is acoustic confidence rather than a correctness guarantee, so a low `min` is a useful cue that a chunk is worth re-listening to. There is no counterpart for `dst`, because the translation framework exposes no quality score. The object is omitted only when no confidence value is available.
 
 ### Voice processing
 
