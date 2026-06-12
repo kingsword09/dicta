@@ -1,5 +1,11 @@
 # Changelog
 
+## [v0.5.0](https://github.com/k1LoW/vo/compare/v0.4.0...v0.5.0) - 2026-06-12
+
+### New Features 🎉
+- feat: emit per-chunk transcription confidence under src.confidence by @k1LoW in https://github.com/k1LoW/vo/pull/19
+- feat: stop gracefully when the audio device changes mid-session by @k1LoW in https://github.com/k1LoW/vo/pull/20
+
 ## [v0.4.0](https://github.com/k1LoW/vo/compare/v0.3.0...v0.4.0) - 2026-06-11
 
 ### New Features 🎉
