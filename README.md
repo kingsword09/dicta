@@ -2,7 +2,7 @@
 
 `vo` is an on-device live transcription and translation CLI for macOS 26+.
 
-https://github.com/user-attachments/assets/71c2d8e2-a6c0-4f91-bafa-21dd42a31b8a
+https://github.com/user-attachments/assets/4d8878c2-7365-4e63-b8c4-244e96f97c96
 
 ## Features
 
