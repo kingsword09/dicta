@@ -18,9 +18,12 @@ enum AudioChannel: String, Sendable, CaseIterable {
 /// Microphone capture using AVAudioEngine.
 final class MicCapture: @unchecked Sendable {
     let stream: AsyncStream<AVAudioPCMBuffer>
+    /// Invoked once if the default input device changes out from under the engine.
+    var onDeviceLost: (@Sendable () -> Void)?
     private let builder: AsyncStream<AVAudioPCMBuffer>.Continuation
     private let engine = AVAudioEngine()
     private let voiceProcessing: Bool
+    private var deviceListener: DefaultDeviceChangeListener?
 
     init(voiceProcessing: Bool = false) {
         self.voiceProcessing = voiceProcessing
@@ -54,9 +57,20 @@ final class MicCapture: @unchecked Sendable {
             builder.yield(copy)
         }
         try engine.start()
+
+        // The engine stays bound to the input device it started on. If the default
+        // input changes (new default selected, current one unplugged), the tap goes
+        // quiet with no error, so watch for the change and let the channel stop.
+        let listener = DefaultDeviceChangeListener(selector: kAudioHardwarePropertyDefaultInputDevice) { [weak self] in
+            self?.onDeviceLost?()
+        }
+        listener.start()
+        self.deviceListener = listener
     }
 
     func stop() {
+        deviceListener?.cancel()
+        deviceListener = nil
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         builder.finish()
@@ -68,11 +82,14 @@ final class MicCapture: @unchecked Sendable {
 /// would force a screen-capture grant even though vo only ever wanted the audio.
 final class SpeakerCapture: @unchecked Sendable {
     let stream: AsyncStream<AVAudioPCMBuffer>
+    /// Invoked once if the default output device changes out from under the aggregate.
+    var onDeviceLost: (@Sendable () -> Void)?
     private let builder: AsyncStream<AVAudioPCMBuffer>.Continuation
 
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
     private var ioProcID: AudioDeviceIOProcID?
+    private var deviceListener: DefaultDeviceChangeListener?
     // Runs the IOProc off Core Audio's real-time IO thread: the block deep-copies
     // and yields into an AsyncStream, neither of which is safe on the RT thread.
     private let ioQueue = DispatchQueue(label: "vo.spk.audio")
@@ -156,9 +173,20 @@ final class SpeakerCapture: @unchecked Sendable {
 
         status = AudioDeviceStart(aggregate, procID)
         guard status == noErr else { throw CoreAudioError(code: status, op: "DeviceStart") }
+
+        // The aggregate stays anchored to the output device it was built on. If the
+        // default output changes, the tap keeps reading a stale (or vanished) device
+        // with no error, so watch for the change and let the channel stop.
+        let listener = DefaultDeviceChangeListener(selector: kAudioHardwarePropertyDefaultOutputDevice) { [weak self] in
+            self?.onDeviceLost?()
+        }
+        listener.start()
+        self.deviceListener = listener
     }
 
     func stop() async {
+        deviceListener?.cancel()
+        deviceListener = nil
         if let procID = ioProcID, aggregateID != AudioObjectID(kAudioObjectUnknown) {
             AudioDeviceStop(aggregateID, procID)
             AudioDeviceDestroyIOProcID(aggregateID, procID)
@@ -213,6 +241,53 @@ final class SpeakerCapture: @unchecked Sendable {
         let status = AudioObjectGetPropertyData(tap, &address, 0, nil, &size, &asbd)
         guard status == noErr else { throw CoreAudioError(code: status, op: "TapFormat") }
         return asbd
+    }
+}
+
+/// Fires `onChange` once when the system default input or output device changes, so a
+/// capture bound to the old device can stop instead of going silently dead. The OS
+/// listener block is installed on the main queue and removed on `cancel()`.
+final class DefaultDeviceChangeListener: @unchecked Sendable {
+    private let selector: AudioObjectPropertySelector
+    private let onChange: @Sendable () -> Void
+    private var block: AudioObjectPropertyListenerBlock?
+    private var fired = false
+
+    init(selector: AudioObjectPropertySelector, onChange: @escaping @Sendable () -> Void) {
+        self.selector = selector
+        self.onChange = onChange
+    }
+
+    private var address: AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+    }
+
+    func start() {
+        var addr = address
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            // Coalesce to a single shutdown: the default-device property can fire more
+            // than once for one switch, and downstream stopAll is idempotent anyway.
+            guard let self, !self.fired else { return }
+            self.fired = true
+            self.onChange()
+        }
+        self.block = block
+        AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &addr, DispatchQueue.main, block
+        )
+    }
+
+    func cancel() {
+        guard let block else { return }
+        var addr = address
+        AudioObjectRemovePropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &addr, DispatchQueue.main, block
+        )
+        self.block = nil
     }
 }
 

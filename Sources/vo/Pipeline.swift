@@ -106,6 +106,20 @@ struct Pipeline {
         await stops.stopAll()
     }
 
+    /// Build the callback a capture runs when its audio device changes mid-session.
+    /// vo does not follow the new device; it announces why on stderr and then runs the
+    /// same graceful shutdown as Ctrl-C. stopAll finishes every channel's stream, so
+    /// run() returns and the natural completion path saves the transcript and prints
+    /// the summary. The user restarts vo to pick up the new device.
+    private func deviceLostHandler(for channel: AudioChannel) -> @Sendable () -> Void {
+        let stops = self.stops
+        let what = channel == .mic ? "microphone input device" : "system audio output device"
+        return {
+            emitProgress("vo: the \(what) changed or disconnected. Stopping. Restart vo to use the new device.")
+            Task { await stops.stopAll() }
+        }
+    }
+
     // MARK: - Per-channel
 
     private func runChannel(
@@ -147,11 +161,13 @@ struct Pipeline {
         switch channel {
         case .mic:
             let cap = MicCapture(voiceProcessing: voiceProcessing)
+            cap.onDeviceLost = deviceLostHandler(for: .mic)
             try cap.start()
             audioStream = cap.stream
             stopper = { cap.stop() }
         case .speaker:
             let cap = SpeakerCapture()
+            cap.onDeviceLost = deviceLostHandler(for: .speaker)
             try await cap.start()
             audioStream = cap.stream
             stopper = { await cap.stop() }
