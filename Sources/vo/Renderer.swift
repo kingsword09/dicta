@@ -283,8 +283,9 @@ actor StreamRenderer: Renderer {
 
     // JSONSerialization renders a Double at full binary precision, so a value meant to
     // be 0.948 or 21.54 leaks as 0.94799999999999995 / 21.539999999999999. Re-encode it
-    // as a base-10 Decimal rounded to three places, which serializes cleanly. Int is
-    // exact for any realistic confidence (0..1) or audio offset (seconds).
+    // as a base-10 Decimal rounded to three places, which serializes cleanly. Callers
+    // must pass a finite value: confidence is 0..1, and audio offsets are
+    // finiteness-guarded at the source (Pipeline), so Int(_:) here never traps.
     private static func decimal3(_ x: Double) -> Decimal {
         Decimal(Int((x * 1000).rounded())) / 1000
     }
