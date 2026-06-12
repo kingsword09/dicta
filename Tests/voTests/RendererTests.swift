@@ -50,8 +50,8 @@ struct RendererTests {
     /// later chunk must not jump ahead of an untranslated earlier chunk.
     @Test func commitsInSourceOrderDespiteOutOfOrderTranslations() async {
         let objs = await renderJSONL(translationEnabled: true) { r in
-            await r.handle(.finalized(channel: .mic, seq: 0, source: "Hello", timing: timing))
-            await r.handle(.finalized(channel: .speaker, seq: 1, source: "World", timing: timing))
+            await r.handle(.finalized(channel: .mic, seq: 0, source: "Hello", timing: timing, confidence: nil))
+            await r.handle(.finalized(channel: .speaker, seq: 1, source: "World", timing: timing, confidence: nil))
             // seq 1 finishes translating first, but seq 0 is still pending.
             await r.handle(.translated(seq: 1, target: "世界"))
             await r.handle(.translated(seq: 0, target: "こんにちは"))
@@ -69,7 +69,7 @@ struct RendererTests {
     @Test func volatileUpdatesAreNotEmitted() async {
         let objs = await renderJSONL(translationEnabled: true) { r in
             await r.handle(.volatile(channel: .mic, text: "in prog"))
-            await r.handle(.finalized(channel: .mic, seq: 0, source: "final", timing: timing))
+            await r.handle(.finalized(channel: .mic, seq: 0, source: "final", timing: timing, confidence: nil))
             await r.handle(.translated(seq: 0, target: "確定"))
         }
 
@@ -81,7 +81,7 @@ struct RendererTests {
     /// chunk commits immediately (no translation gate).
     @Test func transcribeOnlyOmitsDst() async {
         let objs = await renderJSONL(translationEnabled: false, showChannelLabel: false) { r in
-            await r.handle(.finalized(channel: .mic, seq: 0, source: "no translation", timing: timing))
+            await r.handle(.finalized(channel: .mic, seq: 0, source: "no translation", timing: timing, confidence: nil))
         }
 
         #expect(objs.count == 1)
@@ -93,7 +93,7 @@ struct RendererTests {
     /// explicit JSON null `dst.text`.
     @Test func eofForceCommitsUntranslatedWithNullTarget() async {
         let objs = await renderJSONL(translationEnabled: true) { r in
-            await r.handle(.finalized(channel: .mic, seq: 0, source: "lonely", timing: timing))
+            await r.handle(.finalized(channel: .mic, seq: 0, source: "lonely", timing: timing, confidence: nil))
         }
 
         #expect(objs.count == 1)
@@ -104,12 +104,32 @@ struct RendererTests {
     /// Audio range from the transcriber is echoed into the JSONL `audio` object.
     @Test func audioRangeIsEmitted() async {
         let objs = await renderJSONL(translationEnabled: false) { r in
-            await r.handle(.finalized(channel: .speaker, seq: 0, source: "x", timing: timing))
+            await r.handle(.finalized(channel: .speaker, seq: 0, source: "x", timing: timing, confidence: nil))
         }
 
         let audio = objs[0]["audio"] as? [String: Any]
         #expect(audio?["start"] as? Double == 0.124)
         #expect(audio?["end"] as? Double == 1.582)
         #expect(objs[0]["channel"] as? String == "speaker")
+    }
+
+    /// Confidence, when present, is emitted as a nested `{mean, min}` object under `src`.
+    @Test func confidenceEmittedUnderSrc() async {
+        let objs = await renderJSONL(translationEnabled: false) { r in
+            await r.handle(.finalized(channel: .mic, seq: 0, source: "x", timing: timing, confidence: ChunkConfidence(mean: 0.73, min: 0.28)))
+        }
+
+        let conf = src(objs[0])?["confidence"] as? [String: Any]
+        #expect(conf?["mean"] as? Double == 0.73)
+        #expect(conf?["min"] as? Double == 0.28)
+    }
+
+    /// A chunk with no per-run confidence omits the `confidence` key entirely.
+    @Test func confidenceOmittedWhenNil() async {
+        let objs = await renderJSONL(translationEnabled: false) { r in
+            await r.handle(.finalized(channel: .mic, seq: 0, source: "x", timing: timing, confidence: nil))
+        }
+
+        #expect(src(objs[0])?["confidence"] == nil)
     }
 }
