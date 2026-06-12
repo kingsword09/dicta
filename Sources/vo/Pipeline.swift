@@ -247,10 +247,18 @@ struct Pipeline {
                     // don't burn a seq or emit blank lines.
                     guard !text.isEmpty else { continue }
                     let seq = await counter.next()
+                    // A CMTime can be valid yet infinite/indefinite (open-ended
+                    // ranges); its `.seconds` is then non-finite, which would trap the
+                    // downstream Int conversion in the renderer. Treat those as "no offset".
+                    func finiteSeconds(_ t: CMTime) -> Double? {
+                        guard t.isValid else { return nil }
+                        let s = t.seconds
+                        return s.isFinite ? s : nil
+                    }
                     let timing = ChunkTiming(
                         timestamp: Date(),
-                        audioStart: result.range.start.isValid ? result.range.start.seconds : nil,
-                        audioEnd:   result.range.end.isValid   ? result.range.end.seconds   : nil
+                        audioStart: finiteSeconds(result.range.start),
+                        audioEnd:   finiteSeconds(result.range.end)
                     )
                     let confidence = aggregateConfidence(result.text)
                     await renderer.handle(.finalized(channel: channel, seq: seq, source: text, timing: timing, confidence: confidence))

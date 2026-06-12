@@ -26,6 +26,7 @@ private func renderJSONL(
 
     try? pipe.fileHandleForWriting.close()
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    try? pipe.fileHandleForReading.close()
     let text = String(decoding: data, as: UTF8.self)
     return text
         .split(separator: "\n")
@@ -33,6 +34,34 @@ private func renderJSONL(
             guard let d = $0.data(using: .utf8) else { return nil }
             return (try? JSONSerialization.jsonObject(with: d)) as? [String: Any]
         }
+}
+
+/// Same driver as `renderJSONL` but returns the raw emitted lines, so tests can assert
+/// on the exact wire text (e.g. that a number is not leaking binary-float artifacts).
+private func renderJSONLLines(
+    translationEnabled: Bool,
+    _ body: (StreamRenderer) async -> Void
+) async -> [String] {
+    let pipe = Pipe()
+    let renderer = StreamRenderer(
+        mode: .jsonl,
+        sourceLang: "en-US",
+        targetLang: translationEnabled ? "ja-JP" : "",
+        translationEnabled: translationEnabled,
+        showChannelLabel: true,
+        out: pipe.fileHandleForWriting
+    )
+
+    await body(renderer)
+    await renderer.handle(.eof)
+    await renderer.flush()
+
+    try? pipe.fileHandleForWriting.close()
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    try? pipe.fileHandleForReading.close()
+    return String(decoding: data, as: UTF8.self)
+        .split(separator: "\n")
+        .map(String.init)
 }
 
 private let timing = ChunkTiming(
@@ -113,6 +142,20 @@ struct RendererTests {
         #expect(objs[0]["channel"] as? String == "speaker")
     }
 
+    /// Audio offsets are serialized as a base-10 Decimal at three places, so a CMTime
+    /// like 21.54s does not leak as 21.539999999999999 onto the wire.
+    @Test func audioRangeSerializesWithoutFloatArtifacts() async {
+        let t = ChunkTiming(timestamp: Date(timeIntervalSince1970: 1_700_000_000), audioStart: 19.32, audioEnd: 21.54)
+        let lines = await renderJSONLLines(translationEnabled: false) { r in
+            await r.handle(.finalized(channel: .speaker, seq: 0, source: "x", timing: t, confidence: nil))
+        }
+
+        #expect(lines.count == 1)
+        #expect(lines[0].contains("\"start\":19.32"))
+        #expect(lines[0].contains("\"end\":21.54"))
+        #expect(!lines[0].contains("21.539999999999999"))
+    }
+
     /// Confidence, when present, is emitted as a nested `{mean, min}` object under `src`.
     @Test func confidenceEmittedUnderSrc() async {
         let objs = await renderJSONL(translationEnabled: false) { r in
@@ -122,6 +165,19 @@ struct RendererTests {
         let conf = src(objs[0])?["confidence"] as? [String: Any]
         #expect(conf?["mean"] as? Double == 0.73)
         #expect(conf?["min"] as? Double == 0.28)
+    }
+
+    /// Confidence is serialized as a base-10 Decimal at three places, not a raw Double,
+    /// so values like 0.948 do not leak as 0.94799999999999995 onto the wire.
+    @Test func confidenceSerializesWithoutFloatArtifacts() async {
+        let lines = await renderJSONLLines(translationEnabled: false) { r in
+            await r.handle(.finalized(channel: .mic, seq: 0, source: "x", timing: timing, confidence: ChunkConfidence(mean: 0.948, min: 0.511)))
+        }
+
+        #expect(lines.count == 1)
+        #expect(lines[0].contains("\"mean\":0.948"))
+        #expect(lines[0].contains("\"min\":0.511"))
+        #expect(!lines[0].contains("0.94799999999999995"))
     }
 
     /// A chunk with no per-run confidence omits the `confidence` key entirely.
