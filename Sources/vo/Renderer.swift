@@ -13,10 +13,18 @@ struct ChunkTiming: Sendable {
     let audioEnd: Double?
 }
 
+/// Aggregated transcription confidence for a finalized chunk. `mean` is weighted by
+/// run length, `min` is the worst run. A chunk with no per-run confidence is carried
+/// as a nil `ChunkConfidence`, never as zeros.
+struct ChunkConfidence: Sendable {
+    let mean: Double
+    let min: Double
+}
+
 /// Events fed into Renderer from the pipeline.
 enum RenderEvent: Sendable {
     case volatile(channel: AudioChannel, text: String)
-    case finalized(channel: AudioChannel, seq: Int, source: String, timing: ChunkTiming)
+    case finalized(channel: AudioChannel, seq: Int, source: String, timing: ChunkTiming, confidence: ChunkConfidence?)
     case translated(seq: Int, target: String)
     case eof
 }
@@ -43,6 +51,7 @@ actor StreamRenderer: Renderer {
         let channel: AudioChannel
         let source: String
         let timing: ChunkTiming
+        let confidence: ChunkConfidence?
         var target: String?
     }
 
@@ -97,11 +106,11 @@ actor StreamRenderer: Renderer {
             volatileTexts[channel] = text
             if mode == .tty { redrawLiveRegion() }
 
-        case .finalized(let channel, let seq, let source, let timing):
+        case .finalized(let channel, let seq, let source, let timing, let confidence):
             volatileTexts[channel] = ""
             finalizedCount += 1
             if translationEnabled {
-                commitQueue.append(Pair(seq: seq, channel: channel, source: source, timing: timing, target: nil))
+                commitQueue.append(Pair(seq: seq, channel: channel, source: source, timing: timing, confidence: confidence, target: nil))
                 // Drain before redrawing. drainCommitQueue clears the live region
                 // as a side effect, so the reverse order would blank the pending
                 // "(translating…)" lines until the next event arrives.
@@ -110,7 +119,7 @@ actor StreamRenderer: Renderer {
             } else {
                 // No translation: commit immediately, source-only.
                 if mode == .tty { clearLiveRegion() }
-                emitSourceOnly(channel: channel, seq: seq, source: source, timing: timing)
+                emitSourceOnly(channel: channel, seq: seq, source: source, timing: timing, confidence: confidence)
                 if mode == .tty { redrawLiveRegion() }
             }
 
@@ -155,13 +164,13 @@ actor StreamRenderer: Renderer {
         }
     }
 
-    private func emitSourceOnly(channel: AudioChannel, seq: Int, source: String, timing: ChunkTiming) {
+    private func emitSourceOnly(channel: AudioChannel, seq: Int, source: String, timing: ChunkTiming, confidence: ChunkConfidence?) {
         // Skip the JSONSerialization unless someone is going to consume it. In TTY
         // mode with no transcript sink (e.g. `vo < /dev/null` where stdout is a TTY
         // but stdin isn't, so SessionLog is never opened) the serialized bytes
         // would just be thrown away.
         let jsonl: String? = (mode == .jsonl || logSink != nil)
-            ? buildJSONL(seq: seq, channel: channel, source: source, target: nil, timing: timing, includeTarget: false)
+            ? buildJSONL(seq: seq, channel: channel, source: source, target: nil, timing: timing, confidence: confidence, includeTarget: false)
             : nil
 
         if let jsonl { logSink?.append(jsonl) }
@@ -176,7 +185,7 @@ actor StreamRenderer: Renderer {
 
     private func emitCommittedPair(pair: Pair, target: String?) {
         let jsonl: String? = (mode == .jsonl || logSink != nil)
-            ? buildJSONL(seq: pair.seq, channel: pair.channel, source: pair.source, target: target, timing: pair.timing, includeTarget: translationEnabled)
+            ? buildJSONL(seq: pair.seq, channel: pair.channel, source: pair.source, target: target, timing: pair.timing, confidence: pair.confidence, includeTarget: translationEnabled)
             : nil
 
         if let jsonl { logSink?.append(jsonl) }
@@ -200,10 +209,15 @@ actor StreamRenderer: Renderer {
         source: String,
         target: String?,
         timing: ChunkTiming,
+        confidence: ChunkConfidence?,
         includeTarget: Bool
     ) -> String? {
         var obj: [String: Any] = jsonlBase(seq: seq, channel: channel, timing: timing)
-        obj["src"] = ["lang": sourceLang, "text": source]
+        var srcObj: [String: Any] = ["lang": sourceLang, "text": source]
+        if let confidence {
+            srcObj["confidence"] = ["mean": confidence.mean, "min": confidence.min]
+        }
+        obj["src"] = srcObj
         if includeTarget {
             obj["dst"] = target.map { ["lang": targetLang, "text": $0] }
                 ?? ["lang": targetLang, "text": NSNull()]

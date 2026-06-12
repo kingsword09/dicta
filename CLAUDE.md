@@ -156,10 +156,12 @@ Colors (256-color palette, Terminal.app safe). Both the timestamp and the channe
 One JSON object per finalized chunk. `dst` is present only when `--dst` was supplied.
 
 ```jsonl
-{"seq":0,"channel":"mic","timestamp":"2026-06-10T08:34:56.234+09:00","audio":{"start":0.124,"end":1.582},"src":{"lang":"en-US","text":"Hey, Tim."},"dst":{"lang":"ja-JP","text":"ねえ、ティム。"}}
+{"seq":0,"channel":"mic","timestamp":"2026-06-10T08:34:56.234+09:00","audio":{"start":0.124,"end":1.582},"src":{"lang":"en-US","text":"Hey, Tim.","confidence":{"mean":0.83,"min":0.62}},"dst":{"lang":"ja-JP","text":"ねえ、ティム。"}}
 ```
 
 `audio.start` / `audio.end` come from `SpeechTranscriber.Result.range` (CMTimeRange) when valid. `seq` is monotonic across channels. `src.lang` echoes the BCP-47 form of `--src` (so `--src en` would give `"lang":"en"`, not `"en-US"`).
+
+`src.confidence` carries the chunk's transcription confidence, aggregated from the per-run `transcriptionConfidence` attribute (requested unconditionally via `attributeOptions`). `mean` is weighted by run length and `min` is the worst run, both rounded to three decimals. It is **acoustic per-character confidence, not word correctness** (a fully wrong transcription can still score a high mean while its `min` dips), so `min` is the more actionable "re-listen here" signal. The whole `confidence` object is omitted only when no run carried a value. There is no confidence for `dst`: the Translation framework exposes no quality score, so `src.confidence` is the pipeline's only quality signal. Confidence never appears in TTY output, only JSONL/transcript.
 
 ## Distribution plan (not yet implemented)
 

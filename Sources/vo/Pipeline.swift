@@ -121,11 +121,14 @@ struct Pipeline {
         // options (volatileResults + fastResults) is what
         // `SpeechTranscriber.Preset.timeIndexedProgressiveTranscription` would
         // give us; we spell it out explicitly to keep the trade-off readable.
+        // Request per-run transcription confidence alongside the time range. It is
+        // aggregated per chunk (mean + min) and emitted under `src.confidence`. Note
+        // the value is acoustic per-character confidence, not word correctness.
         let transcriber = SpeechTranscriber(
             locale: sourceLocale,
             transcriptionOptions: [],
             reportingOptions: [.volatileResults, .fastResults],
-            attributeOptions: [.audioTimeRange]
+            attributeOptions: [.audioTimeRange, .transcriptionConfidence]
         )
         let analyzer = SpeechAnalyzer(modules: [transcriber])
 
@@ -233,7 +236,8 @@ struct Pipeline {
                         audioStart: result.range.start.isValid ? result.range.start.seconds : nil,
                         audioEnd:   result.range.end.isValid   ? result.range.end.seconds   : nil
                     )
-                    await renderer.handle(.finalized(channel: channel, seq: seq, source: text, timing: timing))
+                    let confidence = aggregateConfidence(result.text)
+                    await renderer.handle(.finalized(channel: channel, seq: seq, source: text, timing: timing, confidence: confidence))
                     if willTranslate {
                         chunkBuilder.yield((seq, text))
                     }
@@ -307,6 +311,27 @@ struct Pipeline {
 /// JSONL stream a downstream reader may be consuming.
 private func emitProgress(_ message: String) {
     FileHandle.standardError.write(Data((message + "\n").utf8))
+}
+
+/// Aggregate a finalized chunk's per-run `transcriptionConfidence` into a
+/// length-weighted mean and the minimum run value, rounded to three decimals.
+/// Returns nil when no run carried a confidence value. Runs split per character for
+/// CJK text, so weighting by run length keeps multi-character (e.g. English word)
+/// runs from being under-counted relative to single-character ones.
+private func aggregateConfidence(_ text: AttributedString) -> ChunkConfidence? {
+    var weightedSum = 0.0
+    var weight = 0
+    var lowest = Double.greatestFiniteMagnitude
+    for run in text.runs {
+        guard let c = run.transcriptionConfidence else { continue }
+        let n = text[run.range].characters.count
+        weightedSum += c * Double(n)
+        weight += n
+        lowest = Swift.min(lowest, c)
+    }
+    guard weight > 0 else { return nil }
+    let round3 = { (x: Double) in (x * 1000).rounded() / 1000 }
+    return ChunkConfidence(mean: round3(weightedSum / Double(weight)), min: round3(lowest))
 }
 
 /// Convert one PCM buffer to the analyzer's preferred format. Handles sample-rate conversion.
