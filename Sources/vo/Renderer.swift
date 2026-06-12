@@ -215,7 +215,10 @@ actor StreamRenderer: Renderer {
         var obj: [String: Any] = jsonlBase(seq: seq, channel: channel, timing: timing)
         var srcObj: [String: Any] = ["lang": sourceLang, "text": source]
         if let confidence {
-            srcObj["confidence"] = ["mean": confidence.mean, "min": confidence.min]
+            srcObj["confidence"] = [
+                "mean": StreamRenderer.decimal3(confidence.mean),
+                "min": StreamRenderer.decimal3(confidence.min),
+            ]
         }
         obj["src"] = srcObj
         if includeTarget {
@@ -265,7 +268,10 @@ actor StreamRenderer: Renderer {
             "timestamp": StreamRenderer.iso8601.string(from: timing.timestamp)
         ]
         if let start = timing.audioStart, let end = timing.audioEnd {
-            obj["audio"] = ["start": start, "end": end]
+            obj["audio"] = [
+                "start": StreamRenderer.decimal3(start),
+                "end": StreamRenderer.decimal3(end),
+            ]
         }
         return obj
     }
@@ -273,6 +279,14 @@ actor StreamRenderer: Renderer {
     private func jsonString(_ obj: [String: Any]) -> String? {
         guard let data = try? JSONSerialization.data(withJSONObject: obj) else { return nil }
         return String(data: data, encoding: .utf8)
+    }
+
+    // JSONSerialization renders a Double at full binary precision, so a value meant to
+    // be 0.948 or 21.54 leaks as 0.94799999999999995 / 21.539999999999999. Re-encode it
+    // as a base-10 Decimal rounded to three places, which serializes cleanly. Int is
+    // exact for any realistic confidence (0..1) or audio offset (seconds).
+    private static func decimal3(_ x: Double) -> Decimal {
+        Decimal(Int((x * 1000).rounded())) / 1000
     }
 
     // ISO8601DateFormatter's `string(from:)` is documented as thread-safe.
