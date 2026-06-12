@@ -26,6 +26,7 @@ private func renderJSONL(
 
     try? pipe.fileHandleForWriting.close()
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    try? pipe.fileHandleForReading.close()
     let text = String(decoding: data, as: UTF8.self)
     return text
         .split(separator: "\n")
@@ -57,6 +58,7 @@ private func renderJSONLLines(
 
     try? pipe.fileHandleForWriting.close()
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    try? pipe.fileHandleForReading.close()
     return String(decoding: data, as: UTF8.self)
         .split(separator: "\n")
         .map(String.init)
