@@ -84,7 +84,7 @@ final class MicCapture: @unchecked Sendable {
         // The engine stays bound to the input device it started on. If the default
         // input changes (new default selected, current one unplugged), the tap goes
         // quiet with no error, so watch for the change and let the channel stop.
-        // Skip this when pinned to an explicit device: the user asked for that device,
+        // Skip this when pinned to an explicit device. The user asked for that device,
         // so a default-input change is theirs to make and should not stop the session.
         if deviceID == nil {
             let listener = DefaultDeviceChangeListener(selector: kAudioHardwarePropertyDefaultInputDevice) { [weak self] in
@@ -174,7 +174,7 @@ final class SpeakerCapture: @unchecked Sendable {
         self.tapID = tap
 
         // A process tap carries no clock of its own, so it has to ride an aggregate
-        // device anchored to an output device: the pinned one if given, else the
+        // device anchored to an output device, the pinned one if given, else the
         // current default output.
         let outputUID = try outputDeviceUID ?? defaultOutputDeviceUID()
         let aggregateUID = UUID().uuidString
@@ -226,7 +226,7 @@ final class SpeakerCapture: @unchecked Sendable {
         // The aggregate stays anchored to the output device it was built on. If the
         // default output changes, the tap keeps reading a stale (or vanished) device
         // with no error, so watch for the change and let the channel stop.
-        // Skip this when pinned to an explicit device: the user asked for that device,
+        // Skip this when pinned to an explicit device. The user asked for that device,
         // so a default-output change is theirs to make and should not stop the session.
         if outputDeviceUID == nil {
             let listener = DefaultDeviceChangeListener(selector: kAudioHardwarePropertyDefaultOutputDevice) { [weak self] in

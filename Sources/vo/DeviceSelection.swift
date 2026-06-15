@@ -11,8 +11,8 @@ struct SelectedDevices {
     var speakerDeviceUID: String?
 }
 
-/// `true` when the picker can run: stdin is a terminal (a human can answer) and
-/// stderr is a terminal (the menu is visible). stdout is intentionally not checked
+/// `true` when the picker can run. It needs stdin to be a terminal (a human can answer)
+/// and stderr to be a terminal (the menu is visible). stdout is intentionally not checked
 /// because the picker writes only to stderr, so piping/redirecting stdout (e.g.
 /// `vo --select-device --json | jq`) still allows interactive selection.
 func canSelectDevicesInteractively() -> Bool {
@@ -36,9 +36,10 @@ func selectDevicesInteractively(mic: Bool, speaker: Bool) throws -> SelectedDevi
     return result
 }
 
-/// Present a numbered list and read a selection. Empty input picks the system
-/// default. Returns nil only when there is nothing to pick, in which case the
-/// caller falls back to the default device.
+/// Present a numbered list and read a selection. Empty input picks the
+/// default-marked device, or the first listed device when none is marked.
+/// Returns nil only when there is nothing to pick, in which case the caller
+/// falls back to the system default device.
 ///
 /// The prompt is written to stderr, never stdout, so a `--json --select-device`
 /// run in a terminal keeps stdout pure JSONL. Input is read from stdin.
