@@ -237,10 +237,7 @@ actor StreamRenderer: Renderer {
     /// 256-color palette code for the given channel. Shared by the timestamp and
     /// the [mic]/[spk] label so the eye reads both as the same channel.
     private func channelColor(_ channel: AudioChannel) -> Int {
-        switch channel {
-        case .mic:     return 130
-        case .speaker: return 24
-        }
+        channel.tint256
     }
 
     private func ttyTimestamp(_ date: Date, channel: AudioChannel) -> String {
