@@ -201,13 +201,16 @@ struct Pipeline {
             switch channel {
             case .mic:
                 let cap = MicCapture(voiceProcessing: voiceProcessing, deviceID: micDeviceID)
-                cap.onDeviceLost = { rebind.request(); cap.stop() }
+                // [weak cap]: onDeviceLost is stored on cap, so a strong capture would
+                // retain-cycle the capture and leak one per rebind. rebind holds the
+                // only strong reference (its stopper), so cap is alive when this fires.
+                cap.onDeviceLost = { [weak cap] in rebind.request(); cap?.stop() }
                 try cap.start()
                 rebind.setCurrent { cap.stop() }
                 return cap.stream
             case .speaker:
                 let cap = SpeakerCapture(outputDeviceUID: speakerDeviceUID)
-                cap.onDeviceLost = { rebind.request(); Task { await cap.stop() } }
+                cap.onDeviceLost = { [weak cap] in rebind.request(); Task { [weak cap] in await cap?.stop() } }
                 try await cap.start()
                 rebind.setCurrent { await cap.stop() }
                 return cap.stream
