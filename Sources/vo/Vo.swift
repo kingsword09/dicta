@@ -26,6 +26,9 @@ struct Vo: AsyncParsableCommand {
     @Flag(name: .long, help: "Apply system voice processing (echo cancellation + noise reduction) on mic input. Note: this lowers system speaker volume while active.")
     var voiceProcessing: Bool = false
 
+    @Flag(name: .long, help: "Interactively pick the mic / speaker device at startup. The picked device is pinned, so later system-default changes are ignored. Needs an interactive terminal.")
+    var selectDevice: Bool = false
+
     // MARK: - Diagnostic
 
     @Flag(name: .long, help: "Print full environment diagnostics (system, models, devices) and exit.")
@@ -54,6 +57,7 @@ struct Vo: AsyncParsableCommand {
             mic: !noMic,
             speaker: !noSpeaker,
             voiceProcessing: voiceProcessing,
+            selectDevice: selectDevice,
             transcript: transcript
         )
     }

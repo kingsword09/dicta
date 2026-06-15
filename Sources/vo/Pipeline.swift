@@ -1,5 +1,6 @@
 import Foundation
 @preconcurrency import AVFoundation
+import CoreAudio
 import Speech
 import Translation
 
@@ -65,6 +66,8 @@ struct Pipeline {
     let enableMic: Bool
     let enableSpeaker: Bool
     let voiceProcessing: Bool  // apply AEC + NR + AGC on mic input
+    let micDeviceID: AudioDeviceID?  // nil = follow system default input
+    let speakerDeviceUID: String?    // nil = follow system default output
     /// Lets callers (notably the SIGINT handler in Listen.swift) stop every active
     /// audio source without having to wait for `run()` to unwind on its own.
     let stops: StopRegistry = StopRegistry()
@@ -160,13 +163,13 @@ struct Pipeline {
 
         switch channel {
         case .mic:
-            let cap = MicCapture(voiceProcessing: voiceProcessing)
+            let cap = MicCapture(voiceProcessing: voiceProcessing, deviceID: micDeviceID)
             cap.onDeviceLost = deviceLostHandler(for: .mic)
             try cap.start()
             audioStream = cap.stream
             stopper = { cap.stop() }
         case .speaker:
-            let cap = SpeakerCapture()
+            let cap = SpeakerCapture(outputDeviceUID: speakerDeviceUID)
             cap.onDeviceLost = deviceLostHandler(for: .speaker)
             try await cap.start()
             audioStream = cap.stream
