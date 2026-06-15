@@ -37,6 +37,17 @@ final class MicCapture: @unchecked Sendable {
     }
 
     func start() throws {
+        // Pipeline.runChannel registers stop() only once start() returns, so unwind any
+        // partial setup here before rethrowing, mirroring SpeakerCapture.start().
+        do {
+            try startUnchecked()
+        } catch {
+            stop()
+            throw error
+        }
+    }
+
+    private func startUnchecked() throws {
         let inputNode = engine.inputNode
 
         // Optionally enable system voice processing (echo cancellation + noise reduction + AGC).
