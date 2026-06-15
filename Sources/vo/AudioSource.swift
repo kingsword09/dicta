@@ -39,12 +39,6 @@ final class MicCapture: @unchecked Sendable {
     func start() throws {
         let inputNode = engine.inputNode
 
-        // Pin the HAL input unit to a specific device before anything reads its format
-        // or reconfigures it (voice processing below). Must precede engine.start().
-        if let deviceID {
-            try Self.setInputDevice(deviceID, on: inputNode)
-        }
-
         // Optionally enable system voice processing (echo cancellation + noise reduction + AGC).
         // Trade-off: stops the mic from re-capturing audio from the speaker, but switches the
         // OS audio session to a "communication" mode that attenuates system output volume.
@@ -57,6 +51,14 @@ final class MicCapture: @unchecked Sendable {
                     "vo: warning: voice processing unavailable on mic input, continuing without echo cancellation (\(error.localizedDescription))\n".utf8
                 ))
             }
+        }
+
+        // Pin the input unit to the chosen device after the voice-processing toggle.
+        // Enabling voice processing swaps in a fresh audio unit that would not carry a
+        // device set on the previous one, so pinning earlier would be silently dropped.
+        // Must still precede reading the input format and engine.start().
+        if let deviceID {
+            try Self.setInputDevice(deviceID, on: inputNode)
         }
 
         let inputFormat = inputNode.outputFormat(forBus: 0)
