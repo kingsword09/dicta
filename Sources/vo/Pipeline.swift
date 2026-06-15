@@ -51,7 +51,8 @@ actor StopRegistry {
 }
 
 /// Coordinates a channel's device-follow rebind between the device-change callback
-/// (which fires on the listener's queue) and the feeder task that pulls audio buffers.
+/// (which fires on the main queue, where DefaultDeviceChangeListener installs it) and
+/// the feeder task that pulls audio buffers.
 /// The lock is the only shared state; the capture objects stay owned by their channel.
 final class RebindBox: @unchecked Sendable {
     private let lock = NSLock()
