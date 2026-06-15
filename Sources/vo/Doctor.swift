@@ -7,7 +7,7 @@ struct DoctorReport: Sendable {
     let hostname: String
     let speechLocales: [SpeechLocaleInfo]
     let translationLanguages: [String]
-    let inputDevices: [InputDeviceInfo]
+    let inputDevices: [AudioDeviceInfo]
 }
 
 /// Print a full environment report: OS, speech models, translation languages, audio devices.

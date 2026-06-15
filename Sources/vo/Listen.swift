@@ -9,6 +9,7 @@ func runListen(
     mic: Bool,
     speaker: Bool,
     voiceProcessing: Bool,
+    selectDevice: Bool,
     transcript: String?
 ) async throws {
     guard mic || speaker else {
@@ -25,6 +26,19 @@ func runListen(
 
     let sourceLocale = Locale(identifier: src)
     let targetLocale = dst.map { Locale(identifier: $0) }
+
+    // Resolve pinned devices before any capture starts. Done after the re-exec so the
+    // prompt runs once in the disclaimed child (which owns stdin), and before the
+    // banner so the picker output is not mixed into the live region.
+    var selectedDevices = SelectedDevices()
+    if selectDevice {
+        // stdout may be piped/redirected freely (the picker writes to stderr); we only
+        // need stdin to answer on and stderr to show the menu.
+        guard canSelectDevicesInteractively() else {
+            throw ValidationError("--select-device needs a terminal for stdin (your answer) and stderr (the menu). stdout may be piped.")
+        }
+        selectedDevices = try selectDevicesInteractively(mic: mic, speaker: speaker)
+    }
 
     let mode = detectRenderMode(jsonForced: json)
     let isTTY = (mode == .tty)
@@ -69,7 +83,9 @@ func runListen(
         renderer: renderer,
         enableMic: mic,
         enableSpeaker: speaker,
-        voiceProcessing: voiceProcessing
+        voiceProcessing: voiceProcessing,
+        micDeviceID: selectedDevices.micDeviceID,
+        speakerDeviceUID: selectedDevices.speakerDeviceUID
     )
 
     let startedAt = Date()

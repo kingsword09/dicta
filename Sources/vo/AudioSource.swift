@@ -23,16 +23,31 @@ final class MicCapture: @unchecked Sendable {
     private let builder: AsyncStream<AVAudioPCMBuffer>.Continuation
     private let engine = AVAudioEngine()
     private let voiceProcessing: Bool
+    // When set, capture is pinned to this device instead of following the system
+    // default input. Pinning also suppresses the default-change listener below.
+    private let deviceID: AudioDeviceID?
     private var deviceListener: DefaultDeviceChangeListener?
 
-    init(voiceProcessing: Bool = false) {
+    init(voiceProcessing: Bool = false, deviceID: AudioDeviceID? = nil) {
         self.voiceProcessing = voiceProcessing
+        self.deviceID = deviceID
         let (s, b) = AsyncStream<AVAudioPCMBuffer>.makeStream()
         self.stream = s
         self.builder = b
     }
 
     func start() throws {
+        // Pipeline.runChannel registers stop() only once start() returns, so unwind any
+        // partial setup here before rethrowing, mirroring SpeakerCapture.start().
+        do {
+            try startUnchecked()
+        } catch {
+            stop()
+            throw error
+        }
+    }
+
+    private func startUnchecked() throws {
         let inputNode = engine.inputNode
 
         // Optionally enable system voice processing (echo cancellation + noise reduction + AGC).
@@ -49,6 +64,14 @@ final class MicCapture: @unchecked Sendable {
             }
         }
 
+        // Pin the input unit to the chosen device after the voice-processing toggle.
+        // Enabling voice processing swaps in a fresh audio unit that would not carry a
+        // device set on the previous one, so pinning earlier would be silently dropped.
+        // Must still precede reading the input format and engine.start().
+        if let deviceID {
+            try Self.setInputDevice(deviceID, on: inputNode)
+        }
+
         let inputFormat = inputNode.outputFormat(forBus: 0)
         let builder = self.builder
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { buffer, _ in
@@ -61,11 +84,32 @@ final class MicCapture: @unchecked Sendable {
         // The engine stays bound to the input device it started on. If the default
         // input changes (new default selected, current one unplugged), the tap goes
         // quiet with no error, so watch for the change and let the channel stop.
-        let listener = DefaultDeviceChangeListener(selector: kAudioHardwarePropertyDefaultInputDevice) { [weak self] in
-            self?.onDeviceLost?()
+        // Skip this when pinned to an explicit device. The user asked for that device,
+        // so a default-input change is theirs to make and should not stop the session.
+        if deviceID == nil {
+            let listener = DefaultDeviceChangeListener(selector: kAudioHardwarePropertyDefaultInputDevice) { [weak self] in
+                self?.onDeviceLost?()
+            }
+            listener.start()
+            self.deviceListener = listener
         }
-        listener.start()
-        self.deviceListener = listener
+    }
+
+    /// Pin the AVAudioEngine input node's underlying HAL audio unit to a specific device.
+    private static func setInputDevice(_ deviceID: AudioDeviceID, on node: AVAudioInputNode) throws {
+        guard let unit = node.audioUnit else {
+            throw CoreAudioError(code: kAudioUnitErr_Uninitialized, op: "InputAudioUnit")
+        }
+        var dev = deviceID
+        let status = AudioUnitSetProperty(
+            unit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            0,
+            &dev,
+            UInt32(MemoryLayout<AudioDeviceID>.size)
+        )
+        guard status == noErr else { throw CoreAudioError(code: status, op: "SetInputDevice") }
     }
 
     func stop() {
@@ -90,11 +134,15 @@ final class SpeakerCapture: @unchecked Sendable {
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
     private var ioProcID: AudioDeviceIOProcID?
     private var deviceListener: DefaultDeviceChangeListener?
+    // When set, the aggregate anchors to this output device instead of the system
+    // default. Pinning also suppresses the default-change listener below.
+    private let outputDeviceUID: String?
     // Runs the IOProc off Core Audio's real-time IO thread: the block deep-copies
     // and yields into an AsyncStream, neither of which is safe on the RT thread.
     private let ioQueue = DispatchQueue(label: "vo.spk.audio")
 
-    init() {
+    init(outputDeviceUID: String? = nil) {
+        self.outputDeviceUID = outputDeviceUID
         let (s, b) = AsyncStream<AVAudioPCMBuffer>.makeStream()
         self.stream = s
         self.builder = b
@@ -126,8 +174,9 @@ final class SpeakerCapture: @unchecked Sendable {
         self.tapID = tap
 
         // A process tap carries no clock of its own, so it has to ride an aggregate
-        // device anchored to the current default output device.
-        let outputUID = try defaultOutputDeviceUID()
+        // device anchored to an output device, the pinned one if given, else the
+        // current default output.
+        let outputUID = try outputDeviceUID ?? defaultOutputDeviceUID()
         let aggregateUID = UUID().uuidString
         let description: [String: Any] = [
             kAudioAggregateDeviceNameKey: "vo-system-tap",
@@ -177,11 +226,15 @@ final class SpeakerCapture: @unchecked Sendable {
         // The aggregate stays anchored to the output device it was built on. If the
         // default output changes, the tap keeps reading a stale (or vanished) device
         // with no error, so watch for the change and let the channel stop.
-        let listener = DefaultDeviceChangeListener(selector: kAudioHardwarePropertyDefaultOutputDevice) { [weak self] in
-            self?.onDeviceLost?()
+        // Skip this when pinned to an explicit device. The user asked for that device,
+        // so a default-output change is theirs to make and should not stop the session.
+        if outputDeviceUID == nil {
+            let listener = DefaultDeviceChangeListener(selector: kAudioHardwarePropertyDefaultOutputDevice) { [weak self] in
+                self?.onDeviceLost?()
+            }
+            listener.start()
+            self.deviceListener = listener
         }
-        listener.start()
-        self.deviceListener = listener
     }
 
     func stop() async {

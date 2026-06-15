@@ -2,7 +2,7 @@ import Foundation
 import CoreAudio
 @preconcurrency import AVFoundation
 
-struct InputDeviceInfo: Sendable {
+struct AudioDeviceInfo: Sendable {
     let id: UInt32
     let uid: String
     let name: String
@@ -10,20 +10,43 @@ struct InputDeviceInfo: Sendable {
     let isDefault: Bool
 }
 
+/// Direction used to read a device's channel count and resolve the system default.
+enum AudioDirection {
+    case input
+    case output
+
+    var scope: AudioObjectPropertyScope {
+        self == .input ? kAudioDevicePropertyScopeInput : kAudioDevicePropertyScopeOutput
+    }
+
+    var defaultSelector: AudioObjectPropertySelector {
+        self == .input ? kAudioHardwarePropertyDefaultInputDevice : kAudioHardwarePropertyDefaultOutputDevice
+    }
+}
+
 /// Enumerate all input-capable audio devices via Core Audio.
-func collectInputDevices() throws -> [InputDeviceInfo] {
-    let defaultID = try queryDefaultInputDevice()
+func collectInputDevices() throws -> [AudioDeviceInfo] {
+    try collectDevices(.input)
+}
+
+/// Enumerate all output-capable audio devices via Core Audio.
+func collectOutputDevices() throws -> [AudioDeviceInfo] {
+    try collectDevices(.output)
+}
+
+private func collectDevices(_ direction: AudioDirection) throws -> [AudioDeviceInfo] {
+    let defaultID = try queryDefaultDevice(selector: direction.defaultSelector)
     let allIDs = try queryAllDeviceIDs()
-    var result: [InputDeviceInfo] = []
+    var result: [AudioDeviceInfo] = []
     for id in allIDs {
-        guard let inputChannels = try? queryInputChannelCount(id), inputChannels > 0 else { continue }
+        guard let channels = try? queryChannelCount(id, scope: direction.scope), channels > 0 else { continue }
         let name = (try? queryStringProperty(id, selector: kAudioObjectPropertyName)) ?? "(unknown)"
         let uid = (try? queryStringProperty(id, selector: kAudioDevicePropertyDeviceUID)) ?? ""
-        result.append(InputDeviceInfo(
+        result.append(AudioDeviceInfo(
             id: UInt32(id),
             uid: uid,
             name: name,
-            channels: inputChannels,
+            channels: channels,
             isDefault: id == defaultID
         ))
     }
@@ -32,9 +55,9 @@ func collectInputDevices() throws -> [InputDeviceInfo] {
 
 // MARK: - Core Audio enumeration helpers
 
-private func queryDefaultInputDevice() throws -> AudioDeviceID {
+private func queryDefaultDevice(selector: AudioObjectPropertySelector) throws -> AudioDeviceID {
     var address = AudioObjectPropertyAddress(
-        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mSelector: selector,
         mScope: kAudioObjectPropertyScopeGlobal,
         mElement: kAudioObjectPropertyElementMain
     )
@@ -48,7 +71,7 @@ private func queryDefaultInputDevice() throws -> AudioDeviceID {
         &size,
         &deviceID
     )
-    guard status == noErr else { throw CoreAudioError(code: status, op: "DefaultInputDevice") }
+    guard status == noErr else { throw CoreAudioError(code: status, op: "DefaultDevice") }
     return deviceID
 }
 
@@ -82,10 +105,10 @@ private func queryAllDeviceIDs() throws -> [AudioDeviceID] {
     return ids
 }
 
-private func queryInputChannelCount(_ deviceID: AudioDeviceID) throws -> Int {
+private func queryChannelCount(_ deviceID: AudioDeviceID, scope: AudioObjectPropertyScope) throws -> Int {
     var address = AudioObjectPropertyAddress(
         mSelector: kAudioDevicePropertyStreamConfiguration,
-        mScope: kAudioDevicePropertyScopeInput,
+        mScope: scope,
         mElement: kAudioObjectPropertyElementMain
     )
     var size: UInt32 = 0
