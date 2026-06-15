@@ -72,10 +72,19 @@ final class RebindBox: @unchecked Sendable {
         return true
     }
 
-    /// Called from the device-change callback to ask the feeder to rebind. Ignored once
-    /// the channel is shutting down so a late event cannot resurrect a stopped channel.
-    func request() {
-        lock.lock(); if !stopped { rebindRequested = true }; lock.unlock()
+    /// Device-change callback entry. Atomically marks a rebind wanted and takes the
+    /// active capture's stopper so the caller stops it exactly once. Returns nil when the
+    /// channel is already shutting down (stopCurrent took the stopper), so the
+    /// device-change path (main queue) and the shutdown path (stop registry) never stop
+    /// the same capture concurrently. The capture classes have no internal locking, so a
+    /// concurrent double stop would be a data race.
+    func requestRebindAndTakeStopper() -> (() async -> Void)? {
+        lock.lock(); defer { lock.unlock() }
+        guard !stopped else { return nil }
+        rebindRequested = true
+        let stop = current
+        current = nil
+        return stop
     }
 
     /// Feeder check after a capture's stream ends: true if it ended because the device
@@ -206,13 +215,18 @@ struct Pipeline {
         let rebind = RebindBox()
 
         @Sendable func makeCapture() async throws -> AsyncStream<AVAudioPCMBuffer> {
+            // Route device-loss stopping through the box so stop runs exactly once even
+            // when a device-change event (main queue) races shutdown (stop registry): the
+            // box hands the stopper to whichever path takes it first, the other gets nil.
+            // This also avoids capturing cap, so onDeviceLost cannot retain-cycle it.
+            let onLost: @Sendable () -> Void = { [weak rebind] in
+                guard let stop = rebind?.requestRebindAndTakeStopper() else { return }
+                Task { await stop() }
+            }
             switch channel {
             case .mic:
                 let cap = MicCapture(voiceProcessing: voiceProcessing, deviceID: micDeviceID)
-                // [weak cap]: onDeviceLost is stored on cap, so a strong capture would
-                // retain-cycle the capture and leak one per rebind. rebind holds the
-                // only strong reference (its stopper), so cap is alive when this fires.
-                cap.onDeviceLost = { [weak cap] in rebind.request(); cap?.stop() }
+                cap.onDeviceLost = onLost
                 try cap.start()
                 // If shutdown already started, stop the capture we just built rather
                 // than registering it (the box would otherwise hold a running capture).
@@ -220,7 +234,7 @@ struct Pipeline {
                 return cap.stream
             case .speaker:
                 let cap = SpeakerCapture(outputDeviceUID: speakerDeviceUID)
-                cap.onDeviceLost = { [weak cap] in rebind.request(); Task { [weak cap] in await cap?.stop() } }
+                cap.onDeviceLost = onLost
                 try await cap.start()
                 if !rebind.setCurrent({ await cap.stop() }) { await cap.stop() }
                 return cap.stream

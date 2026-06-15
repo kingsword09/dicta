@@ -3,10 +3,11 @@ import Testing
 
 @Suite("RebindBox")
 struct RebindBoxTests {
-    @Test func requestThenShouldRebindIsConsumedOnce() {
+    @Test func requestRebindThenShouldRebindIsConsumedOnce() {
         let box = RebindBox()
         #expect(box.shouldRebind() == false)
-        box.request()
+        // No current stopper registered, so it returns nil but still records the request.
+        #expect(box.requestRebindAndTakeStopper() == nil)
         #expect(box.shouldRebind() == true)
         // Consumed: a second check without a new request must not rebind again.
         #expect(box.shouldRebind() == false)
@@ -21,7 +22,7 @@ struct RebindBoxTests {
         #expect(await stopped.value == true)
 
         // After shutdown a late device-change event must not resurrect the channel.
-        box.request()
+        #expect(box.requestRebindAndTakeStopper() == nil)
         #expect(box.shouldRebind() == false)
     }
 
@@ -51,10 +52,32 @@ struct RebindBoxTests {
         await box.stopCurrent()
         #expect(await late.value == false)
     }
+
+    @Test func deviceLossTakesStopperSoShutdownDoesNotDoubleStop() async {
+        let box = RebindBox()
+        let runs = Counter()
+        #expect(box.setCurrent { await runs.bump() } == true)
+
+        // Device-change takes the stopper and runs it...
+        let stop = box.requestRebindAndTakeStopper()
+        #expect(stop != nil)
+        await stop?()
+
+        // ...so a racing shutdown finds nothing to stop. The capture is stopped once,
+        // which matters because the capture classes have no internal locking.
+        await box.stopCurrent()
+        #expect(await runs.value == 1)
+    }
 }
 
 /// Minimal async-safe boolean used to observe that a stopper closure ran.
 private actor Flag {
     private(set) var value = false
     func set() { value = true }
+}
+
+/// Minimal async-safe counter to assert a stopper runs exactly once.
+private actor Counter {
+    private(set) var value = 0
+    func bump() { value += 1 }
 }
