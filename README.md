@@ -57,13 +57,17 @@ $ vo --doctor                         # Environment diagnostics
 ### TTY output
 
 ```
-vo 0.1.0 — listening on mic + speaker (en-US → ja-JP)
+vo 0.6.0 — listening on mic + speaker (en-US → ja-JP)
+  mic      MacBook Pro Microphone  (default)
+  speaker  External Headphones     [pinned]
 
 08:34:56 [mic]  How are you doing?
                 元気ですか？
 08:34:58 [spk]  I'm fine, thanks.
                 元気だよ、ありがとう。
 ```
+
+Under the header, one line per active channel shows the device it is capturing from. A dim note reads `(default)` when the channel follows the system default device (and rebinds automatically if that default changes), or `[pinned]` when `--select-device` locked the channel to a specific device.
 
 The `[mic]` / `[spk]` label is shown only when both channels are active; with `--no-mic` or `--no-speaker` it is omitted and the timestamp alone marks each line. The timestamp shares the channel's tint (amber for mic, teal for speaker), so a single glance tells you which side just spoke.
 
