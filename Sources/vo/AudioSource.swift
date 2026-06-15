@@ -13,6 +13,14 @@ enum AudioChannel: String, Sendable, CaseIterable {
         case .speaker: return "SPK"
         }
     }
+
+    /// Human description used in device-follow notices on stderr.
+    var deviceDescription: String {
+        switch self {
+        case .mic:     return "microphone input device"
+        case .speaker: return "system audio output device"
+        }
+    }
 }
 
 /// Microphone capture using AVAudioEngine.

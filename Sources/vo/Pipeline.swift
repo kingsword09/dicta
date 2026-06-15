@@ -50,6 +50,51 @@ actor StopRegistry {
     }
 }
 
+/// Coordinates a channel's device-follow rebind between the device-change callback
+/// (which fires on the listener's queue) and the feeder task that pulls audio buffers.
+/// The lock is the only shared state; the capture objects stay owned by their channel.
+final class RebindBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var rebindRequested = false
+    private var stopped = false
+    private var current: (() async -> Void)?
+
+    /// Record the active capture's stopper, replacing the previous one across rebinds.
+    func setCurrent(_ stop: @escaping () async -> Void) {
+        lock.lock(); current = stop; lock.unlock()
+    }
+
+    /// Called from the device-change callback to ask the feeder to rebind. Ignored once
+    /// the channel is shutting down so a late event cannot resurrect a stopped channel.
+    func request() {
+        lock.lock(); if !stopped { rebindRequested = true }; lock.unlock()
+    }
+
+    /// Feeder check after a capture's stream ends: true if it ended because the device
+    /// changed (rebuild on the new default), false if the channel is shutting down.
+    func shouldRebind() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard rebindRequested, !stopped else { return false }
+        rebindRequested = false
+        return true
+    }
+
+    /// Stop the active capture and mark the channel stopped so no rebind races shutdown.
+    func stopCurrent() async {
+        await takeForShutdown()?()
+    }
+
+    /// Synchronous locked section, kept out of the async caller so the lock is never
+    /// held across a suspension point.
+    private func takeForShutdown() -> (() async -> Void)? {
+        lock.lock(); defer { lock.unlock() }
+        stopped = true
+        let stop = current
+        current = nil
+        return stop
+    }
+}
+
 /// End-to-end pipeline that orchestrates one or more audio channels.
 ///
 /// For each enabled channel:
@@ -109,20 +154,6 @@ struct Pipeline {
         await stops.stopAll()
     }
 
-    /// Build the callback a capture runs when its audio device changes mid-session.
-    /// vo does not follow the new device; it announces why on stderr and then runs the
-    /// same graceful shutdown as Ctrl-C. stopAll finishes every channel's stream, so
-    /// run() returns and the natural completion path saves the transcript and prints
-    /// the summary. The user restarts vo to pick up the new device.
-    private func deviceLostHandler(for channel: AudioChannel) -> @Sendable () -> Void {
-        let stops = self.stops
-        let what = channel == .mic ? "microphone input device" : "system audio output device"
-        return {
-            emitProgress("vo: the \(what) changed or disconnected. Stopping. Restart vo to use the new device.")
-            Task { await stops.stopAll() }
-        }
-    }
-
     // MARK: - Per-channel
 
     private func runChannel(
@@ -158,38 +189,63 @@ struct Pipeline {
         // the inputBuilder buffer instead of being lost. Without this ordering
         // the ~1.5 s `prepareToAnalyze` would silently drop the first words of
         // a session.
-        let audioStream: AsyncStream<AVAudioPCMBuffer>
-        let stopper: () async -> Void
+        //
+        // An unpinned channel follows the system default device: if the default
+        // changes mid-session, the capture is rebuilt on the new default and keeps
+        // feeding the same analyzer, so the session continues instead of stopping.
+        // A pinned (--select-device) channel installs no device-change listener, so
+        // makeCapture below runs exactly once.
+        let rebind = RebindBox()
 
-        switch channel {
-        case .mic:
-            let cap = MicCapture(voiceProcessing: voiceProcessing, deviceID: micDeviceID)
-            cap.onDeviceLost = deviceLostHandler(for: .mic)
-            try cap.start()
-            audioStream = cap.stream
-            stopper = { cap.stop() }
-        case .speaker:
-            let cap = SpeakerCapture(outputDeviceUID: speakerDeviceUID)
-            cap.onDeviceLost = deviceLostHandler(for: .speaker)
-            try await cap.start()
-            audioStream = cap.stream
-            stopper = { await cap.stop() }
+        @Sendable func makeCapture() async throws -> AsyncStream<AVAudioPCMBuffer> {
+            switch channel {
+            case .mic:
+                let cap = MicCapture(voiceProcessing: voiceProcessing, deviceID: micDeviceID)
+                cap.onDeviceLost = { rebind.request(); cap.stop() }
+                try cap.start()
+                rebind.setCurrent { cap.stop() }
+                return cap.stream
+            case .speaker:
+                let cap = SpeakerCapture(outputDeviceUID: speakerDeviceUID)
+                cap.onDeviceLost = { rebind.request(); Task { await cap.stop() } }
+                try await cap.start()
+                rebind.setCurrent { await cap.stop() }
+                return cap.stream
+            }
         }
 
+        // The box always stops whichever capture is currently active, across rebinds.
+        let stopper: () async -> Void = { await rebind.stopCurrent() }
+
+        // First capture; a failure here propagates as a normal start error.
+        let firstStream = try await makeCapture()
+
         // Register the per-channel stopper so a SIGINT-triggered cancel() halts
-        // mic and speaker capture before any save prompt blocks the main task.
+        // capture before any save prompt blocks the main task.
         await stops.register(AsyncStopper(action: stopper))
 
         let (inputSeq, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
 
-        // Audio resampling task: pull from the source, convert to analyzer format,
-        // and push into the SpeechAnalyzer input stream. Starting it now means
-        // buffers accumulate in `inputBuilder` while the analyzer warms up; the
-        // analyzer drains them once `start(inputSequence:)` connects below.
+        // Resample + device-follow task: pull from the active capture, convert to the
+        // analyzer format, and push into the SpeechAnalyzer input. When the capture's
+        // stream ends because the default device changed, rebuild on the new default
+        // and keep feeding the same input. Buffers accumulate in `inputBuilder` while
+        // the analyzer warms up; it drains them once `start(inputSequence:)` connects.
         let resampler = Task.detached {
-            for await buffer in audioStream {
-                if let converted = convertBuffer(buffer, to: analyzerFormat) {
-                    inputBuilder.yield(AnalyzerInput(buffer: converted))
+            var stream = firstStream
+            while true {
+                for await buffer in stream {
+                    if let converted = convertBuffer(buffer, to: analyzerFormat) {
+                        inputBuilder.yield(AnalyzerInput(buffer: converted))
+                    }
+                }
+                guard rebind.shouldRebind() else { break }
+                do {
+                    stream = try await makeCapture()
+                    emitProgress("vo: the \(channel.deviceDescription) changed. Following the new default.")
+                } catch {
+                    emitProgress("vo: the \(channel.deviceDescription) changed but the new default could not be opened. Stopping this channel.")
+                    break
                 }
             }
             inputBuilder.finish()
