@@ -28,30 +28,35 @@ struct CaptureDeviceLabel {
 
 /// Resolve the devices the enabled channels will capture from at startup, for the
 /// banner. A pinned channel resolves to the chosen device; otherwise the system default.
-/// A label is nil when the channel is disabled, enumeration fails, or the device is no
-/// longer present.
+/// An enabled channel always yields a label so the banner shows one line per active
+/// channel: when resolution fails (enumeration error, or a pinned device that vanished)
+/// the name falls back to a placeholder, which is more honest than omitting the line.
+/// A label is nil only for a disabled channel.
 func resolvedCaptureDeviceLabels(mic: Bool, speaker: Bool, selected: SelectedDevices) -> (mic: CaptureDeviceLabel?, speaker: CaptureDeviceLabel?) {
+    let unavailable = "(device unavailable)"
     var micLabel: CaptureDeviceLabel?
     var speakerLabel: CaptureDeviceLabel?
     if mic {
         let inputs = (try? collectInputDevices()) ?? []
+        let pinned = selected.micDeviceID != nil
+        let name: String?
         if let id = selected.micDeviceID {
-            if let name = inputs.first(where: { $0.id == UInt32(id) })?.name {
-                micLabel = CaptureDeviceLabel(name: name, pinned: true)
-            }
-        } else if let name = inputs.first(where: { $0.isDefault })?.name {
-            micLabel = CaptureDeviceLabel(name: name, pinned: false)
+            name = inputs.first(where: { $0.id == UInt32(id) })?.name
+        } else {
+            name = inputs.first(where: { $0.isDefault })?.name
         }
+        micLabel = CaptureDeviceLabel(name: name ?? unavailable, pinned: pinned)
     }
     if speaker {
         let outputs = (try? collectOutputDevices()) ?? []
+        let pinned = selected.speakerDeviceUID != nil
+        let name: String?
         if let uid = selected.speakerDeviceUID {
-            if let name = outputs.first(where: { $0.uid == uid })?.name {
-                speakerLabel = CaptureDeviceLabel(name: name, pinned: true)
-            }
-        } else if let name = outputs.first(where: { $0.isDefault })?.name {
-            speakerLabel = CaptureDeviceLabel(name: name, pinned: false)
+            name = outputs.first(where: { $0.uid == uid })?.name
+        } else {
+            name = outputs.first(where: { $0.isDefault })?.name
         }
+        speakerLabel = CaptureDeviceLabel(name: name ?? unavailable, pinned: pinned)
     }
     return (micLabel, speakerLabel)
 }
