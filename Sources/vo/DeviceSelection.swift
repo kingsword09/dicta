@@ -19,6 +19,43 @@ func canSelectDevicesInteractively() -> Bool {
     return isatty(fileno(stdin)) != 0 && isatty(fileno(stderr)) != 0
 }
 
+/// A capture device shown in the startup banner: its name and whether it is pinned
+/// (`--select-device`) or the system default the channel follows.
+struct CaptureDeviceLabel {
+    let name: String
+    let pinned: Bool
+}
+
+/// Resolve the devices the enabled channels will capture from at startup, for the
+/// banner. A pinned channel resolves to the chosen device; otherwise the system default.
+/// A label is nil when the channel is disabled, enumeration fails, or the device is no
+/// longer present.
+func resolvedCaptureDeviceLabels(mic: Bool, speaker: Bool, selected: SelectedDevices) -> (mic: CaptureDeviceLabel?, speaker: CaptureDeviceLabel?) {
+    var micLabel: CaptureDeviceLabel?
+    var speakerLabel: CaptureDeviceLabel?
+    if mic {
+        let inputs = (try? collectInputDevices()) ?? []
+        if let id = selected.micDeviceID {
+            if let name = inputs.first(where: { $0.id == UInt32(id) })?.name {
+                micLabel = CaptureDeviceLabel(name: name, pinned: true)
+            }
+        } else if let name = inputs.first(where: { $0.isDefault })?.name {
+            micLabel = CaptureDeviceLabel(name: name, pinned: false)
+        }
+    }
+    if speaker {
+        let outputs = (try? collectOutputDevices()) ?? []
+        if let uid = selected.speakerDeviceUID {
+            if let name = outputs.first(where: { $0.uid == uid })?.name {
+                speakerLabel = CaptureDeviceLabel(name: name, pinned: true)
+            }
+        } else if let name = outputs.first(where: { $0.isDefault })?.name {
+            speakerLabel = CaptureDeviceLabel(name: name, pinned: false)
+        }
+    }
+    return (micLabel, speakerLabel)
+}
+
 /// Prompt the user to pick the mic / speaker device for the enabled channels.
 /// Caller must ensure `canSelectDevicesInteractively()`. A picked device is pinned,
 /// so subsequent system-default changes are ignored for that channel.
