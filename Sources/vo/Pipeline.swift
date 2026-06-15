@@ -60,8 +60,15 @@ final class RebindBox: @unchecked Sendable {
     private var current: (() async -> Void)?
 
     /// Record the active capture's stopper, replacing the previous one across rebinds.
-    func setCurrent(_ stop: @escaping () async -> Void) {
-        lock.lock(); current = stop; lock.unlock()
+    /// Returns false when the channel is already shutting down, in which case the caller
+    /// must stop the just-started capture itself: `stopCurrent` has already run and will
+    /// not see a capture registered after it, so without this a rebind racing SIGINT
+    /// could resume capture while the save prompt blocks.
+    func setCurrent(_ stop: @escaping () async -> Void) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !stopped else { return false }
+        current = stop
+        return true
     }
 
     /// Called from the device-change callback to ask the feeder to rebind. Ignored once
@@ -206,13 +213,15 @@ struct Pipeline {
                 // only strong reference (its stopper), so cap is alive when this fires.
                 cap.onDeviceLost = { [weak cap] in rebind.request(); cap?.stop() }
                 try cap.start()
-                rebind.setCurrent { cap.stop() }
+                // If shutdown already started, stop the capture we just built rather
+                // than registering it (the box would otherwise hold a running capture).
+                if !rebind.setCurrent({ cap.stop() }) { cap.stop() }
                 return cap.stream
             case .speaker:
                 let cap = SpeakerCapture(outputDeviceUID: speakerDeviceUID)
                 cap.onDeviceLost = { [weak cap] in rebind.request(); Task { [weak cap] in await cap?.stop() } }
                 try await cap.start()
-                rebind.setCurrent { await cap.stop() }
+                if !rebind.setCurrent({ await cap.stop() }) { await cap.stop() }
                 return cap.stream
             }
         }

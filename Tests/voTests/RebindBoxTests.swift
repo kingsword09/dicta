@@ -15,7 +15,7 @@ struct RebindBoxTests {
     @Test func stopCurrentRunsTheActiveStopperAndBlocksFurtherRebinds() async {
         let box = RebindBox()
         let stopped = Flag()
-        box.setCurrent { await stopped.set() }
+        #expect(box.setCurrent { await stopped.set() } == true)
 
         await box.stopCurrent()
         #expect(await stopped.value == true)
@@ -29,12 +29,27 @@ struct RebindBoxTests {
         let box = RebindBox()
         let first = Flag()
         let second = Flag()
-        box.setCurrent { await first.set() }
-        box.setCurrent { await second.set() }
+        #expect(box.setCurrent { await first.set() } == true)
+        #expect(box.setCurrent { await second.set() } == true)
 
         await box.stopCurrent()
         #expect(await first.value == false)
         #expect(await second.value == true)
+    }
+
+    @Test func setCurrentIsRejectedAfterStopCurrent() async {
+        let box = RebindBox()
+        await box.stopCurrent()
+
+        // A rebind that finishes starting a capture after shutdown must be told no,
+        // so the caller stops that capture instead of leaving it running.
+        let late = Flag()
+        #expect(box.setCurrent { await late.set() } == false)
+
+        // The rejected stopper is never owned by the box, so a second stopCurrent
+        // does not run it.
+        await box.stopCurrent()
+        #expect(await late.value == false)
     }
 }
 
