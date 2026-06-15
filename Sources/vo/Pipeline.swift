@@ -251,10 +251,16 @@ struct Pipeline {
                         inputBuilder.yield(AnalyzerInput(buffer: converted))
                     }
                 }
-                guard rebind.shouldRebind() else { break }
+                // A cancelled task is shutting down, so do not start a new capture even
+                // if a device-change request raced in. shouldRebind alone is not enough:
+                // the catch-path cleanup calls resampler.cancel() before the box is
+                // marked stopped, leaving a window where shouldRebind would still be true.
+                guard !Task.isCancelled, rebind.shouldRebind() else { break }
                 do {
                     stream = try await makeCapture()
                     emitProgress("vo: the \(channel.deviceDescription) changed. Following the new default.")
+                } catch is CancellationError {
+                    break
                 } catch {
                     emitProgress("vo: the \(channel.deviceDescription) changed but the new default could not be opened. Stopping this channel.")
                     break
