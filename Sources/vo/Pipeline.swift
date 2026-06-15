@@ -61,13 +61,17 @@ final class RebindBox: @unchecked Sendable {
     private var current: (() async -> Void)?
 
     /// Record the active capture's stopper, replacing the previous one across rebinds.
-    /// Returns false when the channel is already shutting down, in which case the caller
-    /// must stop the just-started capture itself: `stopCurrent` has already run and will
-    /// not see a capture registered after it, so without this a rebind racing SIGINT
-    /// could resume capture while the save prompt blocks.
+    /// Returns false, leaving the caller to stop the just-started capture itself, when:
+    ///   - the channel is shutting down (`stopCurrent` already ran and would not see a
+    ///     capture registered after it, which would resume capture during the save prompt), or
+    ///   - a rebind was already requested before this capture registered. A device-change
+    ///     can fire in the window between `cap.start()` and `setCurrent`, when there is no
+    ///     stopper to take yet; `requestRebindAndTakeStopper` then returns nil and only
+    ///     sets `rebindRequested`. Rejecting here makes the caller stop the capture so the
+    ///     feeder sees the ended stream and rebuilds, instead of the request being lost.
     func setCurrent(_ stop: @escaping () async -> Void) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        guard !stopped else { return false }
+        guard !stopped, !rebindRequested else { return false }
         current = stop
         return true
     }

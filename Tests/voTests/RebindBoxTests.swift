@@ -53,6 +53,18 @@ struct RebindBoxTests {
         #expect(await late.value == false)
     }
 
+    @Test func setCurrentRejectedWhenRebindRequestedDuringStartup() {
+        let box = RebindBox()
+        // Device-change fires before the capture registered: nothing to stop yet, so it
+        // returns nil but records the request.
+        #expect(box.requestRebindAndTakeStopper() == nil)
+        // setCurrent must reject so the caller stops the just-started capture; otherwise
+        // the capture would keep running on the old device and the request would be lost.
+        #expect(box.setCurrent { } == false)
+        // The request is still pending for the feeder to consume and rebuild.
+        #expect(box.shouldRebind() == true)
+    }
+
     @Test func deviceLossTakesStopperSoShutdownDoesNotDoubleStop() async {
         let box = RebindBox()
         let runs = Counter()
