@@ -112,7 +112,7 @@ A pinned device that is unplugged mid-session goes quiet rather than rebuilding,
 | `--transcript <path>` | (none; prompts at exit in TTY) | Stream finalized chunks as JSONL to `<path>` incrementally. Skips the interactive save prompt |
 | `--doctor` | | Print full environment diagnostics and exit |
 
-`vo --doctor` lists supported locales, installed speech models, available translation language pairs, and audio input devices. Run it first if something behaves unexpectedly.
+`vo --doctor` lists supported locales, installed speech models, available translation languages, and audio input devices. Run it first if something behaves unexpectedly.
 
 ## Requirements
 
@@ -140,6 +140,22 @@ Run `vo --doctor` to see which speech models are installed and which translation
 
 > [!NOTE]
 > Downloading a translation language in System Settings does **not** auto-download the matching speech model, and vice versa. They are separate assets.
+
+## Troubleshooting
+
+Run `vo --doctor` first. It reports the macOS version, which speech models are installed, the available translation languages, and the audio input devices, and most setup problems surface there.
+
+**Nothing is transcribed.** Check the TCC permissions. `vo` needs Microphone, Speech Recognition, and (unless `--no-speaker`) Audio Recording. If you denied any, enable them under System Settings > Privacy & Security, then restart `vo`. Also confirm the grants reached `vo` itself. The signed `scripts/build.sh` and Homebrew binaries claim `vo`'s own TCC identity, so the grants attach to the `vo` entry; a plain `swift build` binary has no embedded usage descriptions and runs under the launching terminal's identity instead, so its grants attach to your terminal app, which is easy to overlook. Prefer the signed binary. Finally, make sure `--src` matches the spoken language; on the first run for a locale `vo` blocks while it downloads the speech model (a `Downloading speech model…` line on stderr).
+
+**The speaker side transcribes nothing while the mic works.** Look at the startup banner. The `speaker` line names the output device `vo` is capturing from, and `vo` only hears audio that actually plays through that device. If an app (a meeting client, for instance) is set to output to a different device than the one shown, its audio never reaches `vo`. Point the app's output at the same device, or pin the right one with `--select-device`. Restarting `vo` alone does not help when the system default never changed, because `vo` re-reads that same default on each launch.
+
+**A device disappears mid-session and that channel goes quiet.** An unpinned channel follows the system default and rebuilds on the new one automatically. A channel pinned with `--select-device` does not follow, so an unplugged pinned device stays silent. Re-run `vo` to pick another.
+
+**The mic keeps re-transcribing what the speakers play.** That is acoustic feedback between the speaker and the mic. Use headphones, drop one side with `--no-mic` / `--no-speaker`, or enable `--voice-processing` (echo cancellation, at the cost of lower system volume).
+
+**Output is JSONL when you expected the live view, or the reverse.** `vo` prints the ANSI live view only when STDOUT is a TTY and emits JSONL otherwise, so piping or redirecting switches it to JSONL. Pass `--json` to force JSONL explicitly. The startup banner and the per-channel device lines appear only in the TTY view.
+
+**Translation is missing or shows `[translation failed]`.** A missing or unsupported `--src → --dst` model is caught at startup, where `vo` exits with install instructions rather than running. Install the pair via System Settings > General > Language & Region > Translation Languages (see Models), then re-run. A `[translation failed: <error>]` line is a different case. It is a runtime failure of that one chunk's translation, with the cause in the message, while the rest of the session keeps going. Transcription itself works without `--dst`.
 
 ## Build
 
