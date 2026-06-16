@@ -141,6 +141,22 @@ Run `vo --doctor` to see which speech models are installed and which translation
 > [!NOTE]
 > Downloading a translation language in System Settings does **not** auto-download the matching speech model, and vice versa. They are separate assets.
 
+## Troubleshooting
+
+Run `vo --doctor` first. It reports the macOS version, which speech models are installed, the available translation pairs, and the audio input devices, and most setup problems surface there.
+
+**Nothing is transcribed.** Check the TCC permissions. `vo` needs Microphone, Speech Recognition, and (unless `--no-speaker`) Audio Recording. If you denied any, enable them for the `vo` entry under System Settings > Privacy & Security, then restart `vo`. Confirm you are running the signed binary too: a plain `swift build` binary has no embedded usage descriptions, so macOS kills it the moment it touches the mic. Install via Homebrew or build with `scripts/build.sh`. Finally, make sure `--src` matches the spoken language; on the first run for a locale `vo` blocks while it downloads the speech model (a `Downloading speech model…` line on stderr).
+
+**The speaker side transcribes nothing while the mic works.** Look at the startup banner. The `speaker` line names the output device `vo` is capturing from, and `vo` only hears audio that actually plays through that device. If an app (a meeting client, for instance) is set to output to a different device than the one shown, its audio never reaches `vo`. Point the app's output at the same device, or pin the right one with `--select-device`. Restarting `vo` alone does not help when the system default never changed, because `vo` re-reads that same default on each launch.
+
+**A device disappears mid-session and that channel goes quiet.** An unpinned channel follows the system default and rebuilds on the new one automatically. A channel pinned with `--select-device` does not follow, so an unplugged pinned device stays silent. Re-run `vo` to pick another.
+
+**The mic keeps re-transcribing what the speakers play.** That is acoustic feedback between the speaker and the mic. Use headphones, drop one side with `--no-mic` / `--no-speaker`, or enable `--voice-processing` (echo cancellation, at the cost of lower system volume).
+
+**Output is JSONL when you expected the live view, or the reverse.** `vo` prints the ANSI live view only when STDOUT is a TTY and emits JSONL otherwise, so piping or redirecting switches it to JSONL. Pass `--json` to force JSONL explicitly. The startup banner and the per-channel device lines appear only in the TTY view.
+
+**Translation shows `[translation failed]` or never appears.** The translation model for the pair is not installed. Install it via System Settings > General > Language & Region > Translation Languages (see Models), then re-run. Transcription itself works without `--dst`.
+
 ## Build
 
 ```console
