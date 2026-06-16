@@ -1,5 +1,14 @@
 # Changelog
 
+## [v0.6.0](https://github.com/k1LoW/vo/compare/v0.5.1...v0.6.0) - 2026-06-16
+
+### New Features 🎉
+- feat: select mic / speaker device interactively at startup by @k1LoW in https://github.com/k1LoW/vo/pull/23
+- feat: follow the system default device instead of stopping on change by @k1LoW in https://github.com/k1LoW/vo/pull/24
+- feat: show the capture device for each channel in the startup banner by @k1LoW in https://github.com/k1LoW/vo/pull/26
+### Other Changes
+- docs: add a Troubleshooting section to the README by @k1LoW in https://github.com/k1LoW/vo/pull/27
+
 ## [v0.5.1](https://github.com/k1LoW/vo/compare/v0.5.0...v0.5.1) - 2026-06-12
 
 ### Other Changes
