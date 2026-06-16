@@ -112,7 +112,7 @@ A pinned device that is unplugged mid-session goes quiet rather than rebuilding,
 | `--transcript <path>` | (none; prompts at exit in TTY) | Stream finalized chunks as JSONL to `<path>` incrementally. Skips the interactive save prompt |
 | `--doctor` | | Print full environment diagnostics and exit |
 
-`vo --doctor` lists supported locales, installed speech models, available translation language pairs, and audio input devices. Run it first if something behaves unexpectedly.
+`vo --doctor` lists supported locales, installed speech models, available translation languages, and audio input devices. Run it first if something behaves unexpectedly.
 
 ## Requirements
 
@@ -143,7 +143,7 @@ Run `vo --doctor` to see which speech models are installed and which translation
 
 ## Troubleshooting
 
-Run `vo --doctor` first. It reports the macOS version, which speech models are installed, the available translation pairs, and the audio input devices, and most setup problems surface there.
+Run `vo --doctor` first. It reports the macOS version, which speech models are installed, the available translation languages, and the audio input devices, and most setup problems surface there.
 
 **Nothing is transcribed.** Check the TCC permissions. `vo` needs Microphone, Speech Recognition, and (unless `--no-speaker`) Audio Recording. If you denied any, enable them under System Settings > Privacy & Security, then restart `vo`. Also confirm the grants reached `vo` itself. The signed `scripts/build.sh` and Homebrew binaries claim `vo`'s own TCC identity, so the grants attach to the `vo` entry; a plain `swift build` binary has no embedded usage descriptions and runs under the launching terminal's identity instead, so its grants attach to your terminal app, which is easy to overlook. Prefer the signed binary. Finally, make sure `--src` matches the spoken language; on the first run for a locale `vo` blocks while it downloads the speech model (a `Downloading speech model…` line on stderr).
 
