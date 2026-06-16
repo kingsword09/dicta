@@ -21,6 +21,15 @@ enum AudioChannel: String, Sendable, CaseIterable {
         case .speaker: return "system audio output device"
         }
     }
+
+    /// 256-color palette tint for this channel's TTY output (Terminal.app safe).
+    /// mic = amber, speaker = teal. Shared by the live renderer and the startup banner.
+    var tint256: Int {
+        switch self {
+        case .mic:     return 130
+        case .speaker: return 24
+        }
+    }
 }
 
 /// Microphone capture using AVAudioEngine.

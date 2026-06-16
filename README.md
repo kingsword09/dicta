@@ -48,6 +48,7 @@ $ vo                                  # Listen to mic + speaker, transcribe only
 $ vo --src en-US --dst ja-JP          # Transcribe and translate
 $ vo --no-speaker                     # Mic only
 $ vo --no-mic --src en-US --dst ja-JP # Speaker only, with translation
+$ vo --select-device                  # Pick & pin the mic / speaker at startup
 $ vo --json | jq                      # JSONL output for piping
 $ vo --doctor                         # Environment diagnostics
 ```
@@ -57,13 +58,17 @@ $ vo --doctor                         # Environment diagnostics
 ### TTY output
 
 ```
-vo 0.1.0 — listening on mic + speaker (en-US → ja-JP)
+vo 0.6.0 — listening on mic + speaker (en-US → ja-JP)
+  mic      MacBook Pro Microphone  (default)
+  speaker  External Headphones     [pinned]
 
 08:34:56 [mic]  How are you doing?
                 元気ですか？
 08:34:58 [spk]  I'm fine, thanks.
                 元気だよ、ありがとう。
 ```
+
+Under the header, one line per active channel shows the device it is capturing from. A dim note reads `(default)` when the channel follows the system default device (and rebinds automatically if that default changes), or `[pinned]` when `--select-device` locked the channel to a specific device.
 
 The `[mic]` / `[spk]` label is shown only when both channels are active; with `--no-mic` or `--no-speaker` it is omitted and the timestamp alone marks each line. The timestamp shares the channel's tint (amber for mic, teal for speaker), so a single glance tells you which side just spoke.
 
@@ -81,6 +86,14 @@ Translation lines are shown in dim text under the source. Pairs are emitted in s
 
 `src.confidence` reports the transcription's per-chunk confidence, with `mean` weighted across the chunk and `min` taken from its least-confident run. This is acoustic confidence rather than a correctness guarantee, so a low `min` is a useful cue that a chunk is worth re-listening to. There is no counterpart for `dst`, because the translation framework exposes no quality score. The object is omitted only when no confidence value is available.
 
+### Device selection
+
+By default `vo` captures from the system default microphone and output device and follows them. If the default input or output changes mid-session (you switch output, or plug in headphones), `vo` rebuilds that channel on the new default and keeps going instead of stopping.
+
+`--select-device` instead prompts you to pick the mic and speaker device at startup and pins the choice, so a later system-default change is ignored and the chosen device stays in use. The picker writes its menu to stderr and reads your choice from stdin, so `vo --select-device --json > out.jsonl` keeps stdout pure JSONL while you select. It needs a terminal for stdin and stderr, so it errors out when stdin is piped.
+
+A pinned device that is unplugged mid-session goes quiet rather than rebuilding, so re-run `vo` to pick a new one. The startup banner shows which device each channel is using, with a `(default)` or `[pinned]` note.
+
 ### Voice processing
 
 `--voice-processing` turns on Apple's voice IO (echo cancellation + noise reduction + AGC). Useful when running mic + speaker on the same physical device without headphones. The trade-off is that the macOS audio session enters communication mode, which lowers system speaker volume while `vo` is running. Off by default.
@@ -93,6 +106,7 @@ Translation lines are shown in dim text under the source. Pairs are emitted in s
 | `--dst` | (none) | Target locale. Omit to skip translation |
 | `--no-mic` | (off, mic on) | Disable microphone capture |
 | `--no-speaker` | (off, speaker on) | Disable system audio capture |
+| `--select-device` | off | Interactively pick (and pin) the mic / speaker device at startup. Needs a terminal |
 | `--voice-processing` | off | Apply echo cancellation on mic input |
 | `--json` | | Force JSONL output |
 | `--transcript <path>` | (none; prompts at exit in TTY) | Stream finalized chunks as JSONL to `<path>` incrementally. Skips the interactive save prompt |

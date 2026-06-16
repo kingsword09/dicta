@@ -19,6 +19,48 @@ func canSelectDevicesInteractively() -> Bool {
     return isatty(fileno(stdin)) != 0 && isatty(fileno(stderr)) != 0
 }
 
+/// A capture device shown in the startup banner: its name and whether it is pinned
+/// (`--select-device`) or the system default the channel follows.
+struct CaptureDeviceLabel {
+    let name: String
+    let pinned: Bool
+}
+
+/// Resolve the devices the enabled channels will capture from at startup, for the
+/// banner. A pinned channel resolves to the chosen device; otherwise the system default.
+/// An enabled channel always yields a label so the banner shows one line per active
+/// channel: when resolution fails (enumeration error, or a pinned device that vanished)
+/// the name falls back to a placeholder, which is more honest than omitting the line.
+/// A label is nil only for a disabled channel.
+func resolvedCaptureDeviceLabels(mic: Bool, speaker: Bool, selected: SelectedDevices) -> (mic: CaptureDeviceLabel?, speaker: CaptureDeviceLabel?) {
+    let unavailable = "(device unavailable)"
+    var micLabel: CaptureDeviceLabel?
+    var speakerLabel: CaptureDeviceLabel?
+    if mic {
+        let inputs = (try? collectInputDevices()) ?? []
+        let pinned = selected.micDeviceID != nil
+        let name: String?
+        if let id = selected.micDeviceID {
+            name = inputs.first(where: { $0.id == UInt32(id) })?.name
+        } else {
+            name = inputs.first(where: { $0.isDefault })?.name
+        }
+        micLabel = CaptureDeviceLabel(name: name ?? unavailable, pinned: pinned)
+    }
+    if speaker {
+        let outputs = (try? collectOutputDevices()) ?? []
+        let pinned = selected.speakerDeviceUID != nil
+        let name: String?
+        if let uid = selected.speakerDeviceUID {
+            name = outputs.first(where: { $0.uid == uid })?.name
+        } else {
+            name = outputs.first(where: { $0.isDefault })?.name
+        }
+        speakerLabel = CaptureDeviceLabel(name: name ?? unavailable, pinned: pinned)
+    }
+    return (micLabel, speakerLabel)
+}
+
 /// Prompt the user to pick the mic / speaker device for the enabled channels.
 /// Caller must ensure `canSelectDevicesInteractively()`. A picked device is pinned,
 /// so subsequent system-default changes are ignored for that channel.

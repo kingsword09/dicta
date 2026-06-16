@@ -90,7 +90,15 @@ func runListen(
 
     let startedAt = Date()
     if isTTY {
-        printBanner(sourceLocale: sourceLocale, targetLocale: targetLocale, mic: mic, speaker: speaker)
+        let deviceLabels = resolvedCaptureDeviceLabels(mic: mic, speaker: speaker, selected: selectedDevices)
+        printBanner(
+            sourceLocale: sourceLocale,
+            targetLocale: targetLocale,
+            mic: mic,
+            speaker: speaker,
+            micDevice: deviceLabels.mic,
+            speakerDevice: deviceLabels.speaker
+        )
     }
 
     // pipeline.cancel() lets pipeline.run() below return, so after SIGINT the natural
@@ -190,7 +198,14 @@ private func finalizeSession(
 
 // MARK: - Banner / Summary
 
-private func printBanner(sourceLocale: Locale, targetLocale: Locale?, mic: Bool, speaker: Bool) {
+private func printBanner(
+    sourceLocale: Locale,
+    targetLocale: Locale?,
+    mic: Bool,
+    speaker: Bool,
+    micDevice: CaptureDeviceLabel?,
+    speakerDevice: CaptureDeviceLabel?
+) {
     let channels = [mic ? "mic" : nil, speaker ? "speaker" : nil]
         .compactMap { $0 }
         .joined(separator: " + ")
@@ -202,7 +217,27 @@ private func printBanner(sourceLocale: Locale, targetLocale: Locale?, mic: Bool,
     }
     let version = Vo.configuration.version
     print("vo \(version) — listening on \(channels) (\(langs))")
+
+    // Show which device each active channel is capturing from at startup. The channel
+    // label uses the channel's tint (matching the live output); the pinned/default note
+    // is dim so it reads as metadata. The label column aligns to "speaker" when both
+    // channels are shown.
+    let labelWidth = (mic && speaker) ? "speaker".count : 0
+    func deviceLine(_ channel: AudioChannel, _ device: CaptureDeviceLabel) {
+        let label = (channel == .mic) ? "mic" : "speaker"
+        let padded = label.padding(toLength: max(labelWidth, label.count), withPad: " ", startingAt: 0)
+        let note = device.pinned ? "[pinned]" : "(default)"
+        print("  \(ansi256(channel.tint256, padded))  \(device.name) \(ansi256(244, note))")
+    }
+    if mic, let micDevice { deviceLine(.mic, micDevice) }
+    if speaker, let speakerDevice { deviceLine(.speaker, speakerDevice) }
+
     print("")
+}
+
+/// Wrap a string in a 256-color foreground SGR escape. Matches the renderer's palette.
+private func ansi256(_ code: Int, _ s: String) -> String {
+    "\u{001B}[38;5;\(code)m\(s)\u{001B}[0m"
 }
 
 private func printSummary(count: Int, duration: TimeInterval) {
