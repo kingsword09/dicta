@@ -33,11 +33,12 @@ enum AudioChannel: String, Sendable, CaseIterable {
 }
 
 /// A captured PCM buffer plus the host time (seconds, mach timebase) of its first sample.
-/// `hostTime` is nil when the source could not supply a valid timestamp. The pipeline uses
-/// it to align each channel's analyzer timeline onto a shared session axis.
+/// The capture layer always supplies it, falling back to `hostTimeNowSeconds()` when the
+/// platform timestamp is invalid, so the pipeline can rely on it to align each channel's
+/// analyzer timeline onto a shared session axis.
 struct TimedBuffer: @unchecked Sendable {
     let buffer: AVAudioPCMBuffer
-    let hostTime: Double?
+    let hostTime: Double
 }
 
 /// Microphone capture using AVAudioEngine.
@@ -103,8 +104,9 @@ final class MicCapture: @unchecked Sendable {
             // Copy the buffer because installTap reuses the underlying storage.
             guard let copy = buffer.copy() else { return }
             // Forward the tap's host time so the pipeline can place this buffer on the
-            // shared session axis; AVAudioTime carries it when isHostTimeValid.
-            let hostTime = when.isHostTimeValid ? AVAudioTime.seconds(forHostTime: when.hostTime) : nil
+            // shared session axis. AVAudioTime carries it when isHostTimeValid; fall back to
+            // the current host time otherwise so the value is always present.
+            let hostTime = when.isHostTimeValid ? AVAudioTime.seconds(forHostTime: when.hostTime) : hostTimeNowSeconds()
             builder.yield(TimedBuffer(buffer: copy, hostTime: hostTime))
         }
         try engine.start()
@@ -241,10 +243,11 @@ final class SpeakerCapture: @unchecked Sendable {
             // run async and must own their data, so deep-copy before yielding.
             guard let aliased = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: inInputData),
                   let owned = aliased.copy() else { return }
-            // Forward the input timestamp's host time so the pipeline can place this
-            // buffer on the shared session axis; valid when the hostTimeValid flag is set.
+            // Forward the input timestamp's host time so the pipeline can place this buffer
+            // on the shared session axis. Valid when the hostTimeValid flag is set; fall
+            // back to the current host time otherwise so the value is always present.
             let ts = inInputTime.pointee
-            let hostTime = ts.mFlags.contains(.hostTimeValid) ? AVAudioTime.seconds(forHostTime: ts.mHostTime) : nil
+            let hostTime = ts.mFlags.contains(.hostTimeValid) ? AVAudioTime.seconds(forHostTime: ts.mHostTime) : hostTimeNowSeconds()
             builder.yield(TimedBuffer(buffer: owned, hostTime: hostTime))
         }
         guard status == noErr, let procID else {

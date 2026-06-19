@@ -273,8 +273,8 @@ struct Pipeline {
         let resampler = Task.detached {
             var stream = firstStream
             // Host time at the end of the last real audio fed so far; nil until the first
-            // timestamped buffer. Sizes the silence that keeps the analyzer's sample
-            // timeline aligned with the shared host-time axis.
+            // buffer of the channel (then sessionStart is the reference). Sizes the silence
+            // that keeps the analyzer's sample timeline aligned with the shared host-time axis.
             var lastEndHostTime: Double? = nil
             // True before the next real buffer needs an alignment span: once at the very
             // start (align analyzer time 0 to sessionStart) and after every rebind (bridge
@@ -282,7 +282,7 @@ struct Pipeline {
             var alignPending = true
             while true {
                 for await timed in stream {
-                    if alignPending, let h = timed.hostTime {
+                    if alignPending {
                         // Pad with silence so the next real sample lands at its true
                         // host-time offset from sessionStart. With both channels anchored
                         // to the same sessionStart their range-based offsets are directly
@@ -290,7 +290,7 @@ struct Pipeline {
                         // offsets earlier (the analyzer's range tracks fed samples, not
                         // wall-clock, so the unfed gap would otherwise be lost).
                         let reference = lastEndHostTime ?? sessionStart
-                        if let silence = makeSilentBuffer(seconds: h - reference, format: analyzerFormat) {
+                        if let silence = makeSilentBuffer(seconds: timed.hostTime - reference, format: analyzerFormat) {
                             inputBuilder.yield(AnalyzerInput(buffer: silence))
                         }
                         alignPending = false
@@ -298,9 +298,7 @@ struct Pipeline {
                     if let converted = convertBuffer(timed.buffer, to: analyzerFormat) {
                         inputBuilder.yield(AnalyzerInput(buffer: converted))
                     }
-                    if let h = timed.hostTime {
-                        lastEndHostTime = h + Double(timed.buffer.frameLength) / timed.buffer.format.sampleRate
-                    }
+                    lastEndHostTime = timed.hostTime + Double(timed.buffer.frameLength) / timed.buffer.format.sampleRate
                 }
                 // A cancelled task is shutting down, so do not start a new capture even
                 // if a device-change request raced in. shouldRebind alone is not enough:
@@ -496,8 +494,9 @@ private func aggregateConfidence(_ text: AttributedString) -> ChunkConfidence? {
 }
 
 /// Current host time in seconds on the mach timebase, matching the `hostTime` that captured
-/// buffers carry. Serves as the shared session origin for both channels' audio offsets.
-private func hostTimeNowSeconds() -> Double {
+/// buffers carry. Serves as the shared session origin for both channels' audio offsets, and
+/// as the capture layer's fallback when a platform buffer timestamp is invalid.
+func hostTimeNowSeconds() -> Double {
     AVAudioTime.seconds(forHostTime: mach_absolute_time())
 }
 
