@@ -1,6 +1,7 @@
 import Foundation
 @preconcurrency import AVFoundation
 import CoreAudio
+import Darwin
 import Speech
 import Translation
 
@@ -151,15 +152,21 @@ struct Pipeline {
             try await ensureTranslationModel(source: sourceLocale, target: targetLocale)
         }
 
+        // Shared origin for both channels' audio offsets, on the same host-time clock the
+        // captured buffers carry. Taken after model resolution (a first-run download must
+        // not push the first subtitle far into the session) and before any capture, so the
+        // resampler can align each channel's analyzer timeline to this one instant.
+        let sessionStart = hostTimeNowSeconds()
+
         try await withThrowingTaskGroup(of: Void.self) { group in
             if enableMic {
                 group.addTask {
-                    try await self.runChannel(channel: .mic, counter: counter)
+                    try await self.runChannel(channel: .mic, counter: counter, sessionStart: sessionStart)
                 }
             }
             if enableSpeaker {
                 group.addTask {
-                    try await self.runChannel(channel: .speaker, counter: counter)
+                    try await self.runChannel(channel: .speaker, counter: counter, sessionStart: sessionStart)
                 }
             }
             for try await _ in group {}
@@ -179,7 +186,8 @@ struct Pipeline {
 
     private func runChannel(
         channel: AudioChannel,
-        counter: SeqCounter
+        counter: SeqCounter,
+        sessionStart: Double
     ) async throws {
         let willTranslate = targetLocale != nil
         // `.fastResults` biases the transcriber toward a shorter context window so
@@ -218,7 +226,7 @@ struct Pipeline {
         // makeCapture below runs exactly once.
         let rebind = RebindBox()
 
-        @Sendable func makeCapture() async throws -> AsyncStream<AVAudioPCMBuffer> {
+        @Sendable func makeCapture() async throws -> AsyncStream<TimedBuffer> {
             // Route device-loss stopping through the box so stop runs exactly once even
             // when a device-change event (main queue) races shutdown (stop registry): the
             // box hands the stopper to whichever path takes it first, the other gets nil.
@@ -264,10 +272,39 @@ struct Pipeline {
         // the analyzer warms up; it drains them once `start(inputSequence:)` connects.
         let resampler = Task.detached {
             var stream = firstStream
+            // Host time up to which audio (real plus bridging silence) has been fed to the
+            // analyzer. nil until the first buffer, when sessionStart is the baseline so
+            // analyzer time 0 maps onto it. Keeps the analyzer's sample timeline aligned
+            // with the shared host-time axis.
+            var fedEndHostTime: Double? = nil
             while true {
-                for await buffer in stream {
-                    if let converted = convertBuffer(buffer, to: analyzerFormat) {
+                for await timed in stream {
+                    let reference = fedEndHostTime ?? sessionStart
+                    // Clamp to the fed marker so it stays monotonic. A buffer that fell back
+                    // to `hostTimeNowSeconds()` (callback time) can report a host time later
+                    // than the next buffer's valid platform timestamp; without the clamp that
+                    // next buffer would push the marker backwards and the iteration after it
+                    // would inject spurious silence and drift the timeline. With all-valid
+                    // timestamps h is already >= reference, so this is a no-op there.
+                    let h = max(timed.hostTime, reference)
+                    // Bridge the span since the last fed audio with silence so the analyzer
+                    // timeline tracks host time. The initial offset from sessionStart, a
+                    // device-rebind reopen gap, and a hole left by a failed convert all
+                    // collapse to "fill [fedEnd, h) with silence". A near-zero span rounds
+                    // to no samples and is skipped, so a contiguous stream injects nothing.
+                    if let silence = makeSilentBuffer(seconds: h - reference, format: analyzerFormat) {
+                        inputBuilder.yield(AnalyzerInput(buffer: silence))
+                    }
+                    // Advance the fed position past h only by audio actually fed. If the
+                    // convert fails, the hole stays open and the next buffer bridges it with
+                    // silence above, rather than silently shifting later offsets. The
+                    // pre-conversion duration in seconds is resampling-invariant, so it is
+                    // the right amount to advance this host-time marker by.
+                    if let converted = convertBuffer(timed.buffer, to: analyzerFormat) {
                         inputBuilder.yield(AnalyzerInput(buffer: converted))
+                        fedEndHostTime = h + Double(timed.buffer.frameLength) / timed.buffer.format.sampleRate
+                    } else {
+                        fedEndHostTime = h
                     }
                 }
                 // A cancelled task is shutting down, so do not start a new capture even
@@ -277,6 +314,8 @@ struct Pipeline {
                 guard !Task.isCancelled, rebind.shouldRebind() else { break }
                 do {
                     stream = try await makeCapture()
+                    // The new stream's first buffer bridges the reopen gap from
+                    // fedEndHostTime automatically, so no extra state is needed here.
                     emitProgress("vo: the \(channel.deviceDescription) changed. Following the new default.")
                 } catch is CancellationError {
                     break
@@ -343,18 +382,24 @@ struct Pipeline {
                     // don't burn a seq or emit blank lines.
                     guard !text.isEmpty else { continue }
                     let seq = await counter.next()
-                    // A CMTime can be valid yet infinite/indefinite (open-ended
-                    // ranges); its `.seconds` is then non-finite, which would trap the
-                    // downstream Int conversion in the renderer. Treat those as "no offset".
-                    func finiteSeconds(_ t: CMTime) -> Double? {
+                    // The resampler has already aligned this channel's analyzer timeline to
+                    // the shared session axis (silence padding at the start and across
+                    // rebinds), so the range is the offset directly. A CMTime can be valid
+                    // yet infinite/indefinite (open-ended ranges); its `.seconds` is then
+                    // non-finite. Leave the offset nil in that case so `audio` is omitted
+                    // rather than backfilled with an approximation, mirroring how a nil
+                    // confidence is dropped rather than zero-filled. A consumer that needs
+                    // a timecode for every chunk (e.g. an SRT writer) reconstructs the
+                    // missing one from `timestamp` and neighbours.
+                    func sessionSeconds(_ t: CMTime) -> Double? {
                         guard t.isValid else { return nil }
                         let s = t.seconds
                         return s.isFinite ? s : nil
                     }
                     let timing = ChunkTiming(
                         timestamp: Date(),
-                        audioStart: finiteSeconds(result.range.start),
-                        audioEnd:   finiteSeconds(result.range.end)
+                        audioStart: sessionSeconds(result.range.start),
+                        audioEnd:   sessionSeconds(result.range.end)
                     )
                     let confidence = aggregateConfidence(result.text)
                     await renderer.handle(.finalized(channel: channel, seq: seq, source: text, timing: timing, confidence: confidence))
@@ -452,6 +497,35 @@ private func aggregateConfidence(_ text: AttributedString) -> ChunkConfidence? {
     guard weight > 0 else { return nil }
     let round3 = { (x: Double) in (x * 1000).rounded() / 1000 }
     return ChunkConfidence(mean: round3(weightedSum / Double(weight)), min: round3(lowest))
+}
+
+/// Current host time in seconds on the mach timebase, matching the `hostTime` that captured
+/// buffers carry. Serves as the shared session origin for both channels' audio offsets, and
+/// as the capture layer's fallback when a platform buffer timestamp is invalid.
+func hostTimeNowSeconds() -> Double {
+    AVAudioTime.seconds(forHostTime: mach_absolute_time())
+}
+
+/// Build `seconds` of silence in `format`, used to bridge a device-rebind reopen gap (and
+/// the initial offset from sessionStart) so the analyzer's sample timeline stays aligned
+/// with host time (the shared session axis).
+/// Returns nil for a non-positive, non-finite, or unrepresentable duration, in which case
+/// the caller skips that span and leaves the timeline unadjusted for it.
+private func makeSilentBuffer(seconds: Double, format: AVAudioFormat) -> AVAudioPCMBuffer? {
+    guard seconds > 0, seconds.isFinite else { return nil }
+    let frameCount = (seconds * format.sampleRate).rounded()
+    guard frameCount >= 1, frameCount <= Double(AVAudioFrameCount.max) else { return nil }
+    let frames = AVAudioFrameCount(frameCount)
+    guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return nil }
+    buffer.frameLength = frames
+    // AVAudioPCMBuffer does not document its allocation as zero-filled, so make the
+    // silence explicit by zeroing every channel's backing store up to frameLength.
+    for channel in UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList) {
+        if let data = channel.mData {
+            memset(data, 0, Int(channel.mDataByteSize))
+        }
+    }
+    return buffer
 }
 
 /// Convert one PCM buffer to the analyzer's preferred format. Handles sample-rate conversion.
