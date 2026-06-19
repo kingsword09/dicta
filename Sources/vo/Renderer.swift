@@ -7,9 +7,10 @@ import Darwin
 struct ChunkTiming: Sendable {
     /// Wall-clock instant when the pipeline received the finalized result.
     let timestamp: Date
-    /// Start offset (seconds) in the audio stream for this chunk, if available.
+    /// Start offset (seconds) on the shared session timeline, whose origin is common to
+    /// mic + speaker. Nil when the transcriber range was invalid/non-finite.
     let audioStart: Double?
-    /// End offset (seconds) in the audio stream for this chunk, if available.
+    /// End offset (seconds) on the shared session timeline. Nil when unavailable.
     let audioEnd: Double?
 }
 

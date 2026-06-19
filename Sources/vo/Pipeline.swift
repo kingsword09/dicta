@@ -138,6 +138,10 @@ struct Pipeline {
     /// audio source without having to wait for `run()` to unwind on its own.
     let stops: StopRegistry = StopRegistry()
 
+    /// Span assigned to a finalized chunk whose audio range is unavailable, so it still
+    /// yields a valid (start < end) timecode. Only the rare range-less chunk uses it.
+    private static let fallbackChunkDuration: Double = 2.0
+
     func run() async throws {
         let counter = SeqCounter()
 
@@ -151,15 +155,20 @@ struct Pipeline {
             try await ensureTranslationModel(source: sourceLocale, target: targetLocale)
         }
 
+        // Shared origin for both channels' audio offsets. Set after model resolution (a
+        // first-run download must not push the first subtitle's start far into the
+        // session) and before any capture, so mic and speaker land on one timeline.
+        let sessionStart = Date()
+
         try await withThrowingTaskGroup(of: Void.self) { group in
             if enableMic {
                 group.addTask {
-                    try await self.runChannel(channel: .mic, counter: counter)
+                    try await self.runChannel(channel: .mic, counter: counter, sessionStart: sessionStart)
                 }
             }
             if enableSpeaker {
                 group.addTask {
-                    try await self.runChannel(channel: .speaker, counter: counter)
+                    try await self.runChannel(channel: .speaker, counter: counter, sessionStart: sessionStart)
                 }
             }
             for try await _ in group {}
@@ -179,7 +188,8 @@ struct Pipeline {
 
     private func runChannel(
         channel: AudioChannel,
-        counter: SeqCounter
+        counter: SeqCounter,
+        sessionStart: Date
     ) async throws {
         let willTranslate = targetLocale != nil
         // `.fastResults` biases the transcriber toward a shorter context window so
@@ -250,6 +260,14 @@ struct Pipeline {
 
         // First capture; a failure here propagates as a normal start error.
         let firstStream = try await makeCapture()
+
+        // Wall-clock origin of this channel's analyzer timeline. The transcriber's result
+        // range is relative to the first sample fed (which starts flowing right after the
+        // capture is built here), so `channelStart - sessionStart` is the offset that
+        // lifts this channel's per-stream range onto the shared session axis. Recorded
+        // once: a device-follow rebind keeps feeding the same analyzer, so the origin
+        // must not move when the capture is rebuilt mid-session.
+        let channelStart = Date()
 
         // Register the per-channel stopper so a SIGINT-triggered cancel() halts
         // capture before any save prompt blocks the main task.
@@ -343,18 +361,29 @@ struct Pipeline {
                     // don't burn a seq or emit blank lines.
                     guard !text.isEmpty else { continue }
                     let seq = await counter.next()
-                    // A CMTime can be valid yet infinite/indefinite (open-ended
-                    // ranges); its `.seconds` is then non-finite, which would trap the
-                    // downstream Int conversion in the renderer. Treat those as "no offset".
-                    func finiteSeconds(_ t: CMTime) -> Double? {
+                    // Lift this chunk's range onto the shared session axis so mic and
+                    // speaker are directly comparable (each analyzer's range starts at its
+                    // own stream, not the session). A CMTime can be valid yet
+                    // infinite/indefinite (open-ended ranges); its `.seconds` is then
+                    // non-finite. When the range is unusable, fall back to the finalize
+                    // wall-clock so every chunk still carries a timecode, since a dropped
+                    // range would otherwise leave a subtitle block with no start/end.
+                    let now = Date()
+                    let channelOffset = channelStart.timeIntervalSince(sessionStart)
+                    func sessionSeconds(_ t: CMTime) -> Double? {
                         guard t.isValid else { return nil }
                         let s = t.seconds
-                        return s.isFinite ? s : nil
+                        return s.isFinite ? channelOffset + s : nil
                     }
+                    let startSec = sessionSeconds(result.range.start) ?? now.timeIntervalSince(sessionStart)
+                    var endSec = sessionSeconds(result.range.end) ?? (startSec + Self.fallbackChunkDuration)
+                    // Guarantee a positive span so the chunk is a valid subtitle interval
+                    // even when only one edge of the range was usable.
+                    if endSec <= startSec { endSec = startSec + Self.fallbackChunkDuration }
                     let timing = ChunkTiming(
-                        timestamp: Date(),
-                        audioStart: finiteSeconds(result.range.start),
-                        audioEnd:   finiteSeconds(result.range.end)
+                        timestamp: now,
+                        audioStart: startSec,
+                        audioEnd: endSec
                     )
                     let confidence = aggregateConfidence(result.text)
                     await renderer.handle(.finalized(channel: channel, seq: seq, source: text, timing: timing, confidence: confidence))
