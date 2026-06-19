@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.7.0](https://github.com/k1LoW/vo/compare/v0.6.0...v0.7.0) - 2026-06-19
+
+### New Features 🎉
+- feat: put audio offsets on a shared session timeline by @k1LoW in https://github.com/k1LoW/vo/pull/28
+
 ## [v0.6.0](https://github.com/k1LoW/vo/compare/v0.5.1...v0.6.0) - 2026-06-16
 
 ### New Features 🎉
