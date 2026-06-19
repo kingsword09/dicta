@@ -279,13 +279,19 @@ struct Pipeline {
             var fedEndHostTime: Double? = nil
             while true {
                 for await timed in stream {
-                    let h = timed.hostTime
+                    let reference = fedEndHostTime ?? sessionStart
+                    // Clamp to the fed marker so it stays monotonic. A buffer that fell back
+                    // to `hostTimeNowSeconds()` (callback time) can report a host time later
+                    // than the next buffer's valid platform timestamp; without the clamp that
+                    // next buffer would push the marker backwards and the iteration after it
+                    // would inject spurious silence and drift the timeline. With all-valid
+                    // timestamps h is already >= reference, so this is a no-op there.
+                    let h = max(timed.hostTime, reference)
                     // Bridge the span since the last fed audio with silence so the analyzer
                     // timeline tracks host time. The initial offset from sessionStart, a
                     // device-rebind reopen gap, and a hole left by a failed convert all
                     // collapse to "fill [fedEnd, h) with silence". A near-zero span rounds
                     // to no samples and is skipped, so a contiguous stream injects nothing.
-                    let reference = fedEndHostTime ?? sessionStart
                     if let silence = makeSilentBuffer(seconds: h - reference, format: analyzerFormat) {
                         inputBuilder.yield(AnalyzerInput(buffer: silence))
                     }
