@@ -272,33 +272,34 @@ struct Pipeline {
         // the analyzer warms up; it drains them once `start(inputSequence:)` connects.
         let resampler = Task.detached {
             var stream = firstStream
-            // Host time at the end of the last real audio fed so far; nil until the first
-            // buffer of the channel (then sessionStart is the reference). Sizes the silence
-            // that keeps the analyzer's sample timeline aligned with the shared host-time axis.
-            var lastEndHostTime: Double? = nil
-            // True before the next real buffer needs an alignment span: once at the very
-            // start (align analyzer time 0 to sessionStart) and after every rebind (bridge
-            // the reopen gap). False within a stream, so no silence is injected there.
-            var alignPending = true
+            // Host time up to which audio (real plus bridging silence) has been fed to the
+            // analyzer. nil until the first buffer, when sessionStart is the baseline so
+            // analyzer time 0 maps onto it. Keeps the analyzer's sample timeline aligned
+            // with the shared host-time axis.
+            var fedEndHostTime: Double? = nil
             while true {
                 for await timed in stream {
-                    if alignPending {
-                        // Pad with silence so the next real sample lands at its true
-                        // host-time offset from sessionStart. With both channels anchored
-                        // to the same sessionStart their range-based offsets are directly
-                        // comparable, and a rebind's reopen gap no longer shifts later
-                        // offsets earlier (the analyzer's range tracks fed samples, not
-                        // wall-clock, so the unfed gap would otherwise be lost).
-                        let reference = lastEndHostTime ?? sessionStart
-                        if let silence = makeSilentBuffer(seconds: timed.hostTime - reference, format: analyzerFormat) {
-                            inputBuilder.yield(AnalyzerInput(buffer: silence))
-                        }
-                        alignPending = false
+                    let h = timed.hostTime
+                    // Bridge the span since the last fed audio with silence so the analyzer
+                    // timeline tracks host time. The initial offset from sessionStart, a
+                    // device-rebind reopen gap, and a hole left by a failed convert all
+                    // collapse to "fill [fedEnd, h) with silence". A near-zero span rounds
+                    // to no samples and is skipped, so a contiguous stream injects nothing.
+                    let reference = fedEndHostTime ?? sessionStart
+                    if let silence = makeSilentBuffer(seconds: h - reference, format: analyzerFormat) {
+                        inputBuilder.yield(AnalyzerInput(buffer: silence))
                     }
+                    // Advance the fed position past h only by audio actually fed. If the
+                    // convert fails, the hole stays open and the next buffer bridges it with
+                    // silence above, rather than silently shifting later offsets. The
+                    // pre-conversion duration in seconds is resampling-invariant, so it is
+                    // the right amount to advance this host-time marker by.
                     if let converted = convertBuffer(timed.buffer, to: analyzerFormat) {
                         inputBuilder.yield(AnalyzerInput(buffer: converted))
+                        fedEndHostTime = h + Double(timed.buffer.frameLength) / timed.buffer.format.sampleRate
+                    } else {
+                        fedEndHostTime = h
                     }
-                    lastEndHostTime = timed.hostTime + Double(timed.buffer.frameLength) / timed.buffer.format.sampleRate
                 }
                 // A cancelled task is shutting down, so do not start a new capture even
                 // if a device-change request raced in. shouldRebind alone is not enough:
@@ -307,9 +308,8 @@ struct Pipeline {
                 guard !Task.isCancelled, rebind.shouldRebind() else { break }
                 do {
                     stream = try await makeCapture()
-                    // Realign the next real buffer onto the shared axis, bridging the
-                    // reopen gap (measured from buffer host times) with silence.
-                    alignPending = true
+                    // The new stream's first buffer bridges the reopen gap from
+                    // fedEndHostTime automatically, so no extra state is needed here.
                     emitProgress("vo: the \(channel.deviceDescription) changed. Following the new default.")
                 } catch is CancellationError {
                     break
