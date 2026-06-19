@@ -1,6 +1,7 @@
 import Foundation
 @preconcurrency import AVFoundation
 import CoreAudio
+import Darwin
 import Speech
 import Translation
 
@@ -151,10 +152,11 @@ struct Pipeline {
             try await ensureTranslationModel(source: sourceLocale, target: targetLocale)
         }
 
-        // Shared origin for both channels' audio offsets. Set after model resolution (a
-        // first-run download must not push the first subtitle's start far into the
-        // session) and before any capture, so mic and speaker land on one timeline.
-        let sessionStart = Date()
+        // Shared origin for both channels' audio offsets, on the same host-time clock the
+        // captured buffers carry. Taken after model resolution (a first-run download must
+        // not push the first subtitle far into the session) and before any capture, so the
+        // resampler can align each channel's analyzer timeline to this one instant.
+        let sessionStart = hostTimeNowSeconds()
 
         try await withThrowingTaskGroup(of: Void.self) { group in
             if enableMic {
@@ -185,7 +187,7 @@ struct Pipeline {
     private func runChannel(
         channel: AudioChannel,
         counter: SeqCounter,
-        sessionStart: Date
+        sessionStart: Double
     ) async throws {
         let willTranslate = targetLocale != nil
         // `.fastResults` biases the transcriber toward a shorter context window so
@@ -224,7 +226,7 @@ struct Pipeline {
         // makeCapture below runs exactly once.
         let rebind = RebindBox()
 
-        @Sendable func makeCapture() async throws -> AsyncStream<AVAudioPCMBuffer> {
+        @Sendable func makeCapture() async throws -> AsyncStream<TimedBuffer> {
             // Route device-loss stopping through the box so stop runs exactly once even
             // when a device-change event (main queue) races shutdown (stop registry): the
             // box hands the stopper to whichever path takes it first, the other gets nil.
@@ -257,14 +259,6 @@ struct Pipeline {
         // First capture; a failure here propagates as a normal start error.
         let firstStream = try await makeCapture()
 
-        // Wall-clock origin of this channel's analyzer timeline. The transcriber's result
-        // range is relative to the first sample fed (which starts flowing right after the
-        // capture is built here), so `channelStart - sessionStart` is the offset that
-        // lifts this channel's per-stream range onto the shared session axis. Recorded
-        // once: a device-follow rebind keeps feeding the same analyzer, so the origin
-        // must not move when the capture is rebuilt mid-session.
-        let channelStart = Date()
-
         // Register the per-channel stopper so a SIGINT-triggered cancel() halts
         // capture before any save prompt blocks the main task.
         await stops.register(AsyncStopper(action: stopper))
@@ -278,10 +272,34 @@ struct Pipeline {
         // the analyzer warms up; it drains them once `start(inputSequence:)` connects.
         let resampler = Task.detached {
             var stream = firstStream
+            // Host time at the end of the last real audio fed so far; nil until the first
+            // timestamped buffer. Sizes the silence that keeps the analyzer's sample
+            // timeline aligned with the shared host-time axis.
+            var lastEndHostTime: Double? = nil
+            // True before the next real buffer needs an alignment span: once at the very
+            // start (align analyzer time 0 to sessionStart) and after every rebind (bridge
+            // the reopen gap). False within a stream, so no silence is injected there.
+            var alignPending = true
             while true {
-                for await buffer in stream {
-                    if let converted = convertBuffer(buffer, to: analyzerFormat) {
+                for await timed in stream {
+                    if alignPending, let h = timed.hostTime {
+                        // Pad with silence so the next real sample lands at its true
+                        // host-time offset from sessionStart. With both channels anchored
+                        // to the same sessionStart their range-based offsets are directly
+                        // comparable, and a rebind's reopen gap no longer shifts later
+                        // offsets earlier (the analyzer's range tracks fed samples, not
+                        // wall-clock, so the unfed gap would otherwise be lost).
+                        let reference = lastEndHostTime ?? sessionStart
+                        if let silence = makeSilentBuffer(seconds: h - reference, format: analyzerFormat) {
+                            inputBuilder.yield(AnalyzerInput(buffer: silence))
+                        }
+                        alignPending = false
+                    }
+                    if let converted = convertBuffer(timed.buffer, to: analyzerFormat) {
                         inputBuilder.yield(AnalyzerInput(buffer: converted))
+                    }
+                    if let h = timed.hostTime {
+                        lastEndHostTime = h + Double(timed.buffer.frameLength) / timed.buffer.format.sampleRate
                     }
                 }
                 // A cancelled task is shutting down, so do not start a new capture even
@@ -291,6 +309,9 @@ struct Pipeline {
                 guard !Task.isCancelled, rebind.shouldRebind() else { break }
                 do {
                     stream = try await makeCapture()
+                    // Realign the next real buffer onto the shared axis, bridging the
+                    // reopen gap (measured from buffer host times) with silence.
+                    alignPending = true
                     emitProgress("vo: the \(channel.deviceDescription) changed. Following the new default.")
                 } catch is CancellationError {
                     break
@@ -357,20 +378,19 @@ struct Pipeline {
                     // don't burn a seq or emit blank lines.
                     guard !text.isEmpty else { continue }
                     let seq = await counter.next()
-                    // Lift this chunk's range onto the shared session axis so mic and
-                    // speaker are directly comparable (each analyzer's range starts at its
-                    // own stream, not the session). A CMTime can be valid yet
-                    // infinite/indefinite (open-ended ranges); its `.seconds` is then
+                    // The resampler has already aligned this channel's analyzer timeline to
+                    // the shared session axis (silence padding at the start and across
+                    // rebinds), so the range is the offset directly. A CMTime can be valid
+                    // yet infinite/indefinite (open-ended ranges); its `.seconds` is then
                     // non-finite. Leave the offset nil in that case so `audio` is omitted
                     // rather than backfilled with an approximation, mirroring how a nil
                     // confidence is dropped rather than zero-filled. A consumer that needs
                     // a timecode for every chunk (e.g. an SRT writer) reconstructs the
                     // missing one from `timestamp` and neighbours.
-                    let channelOffset = channelStart.timeIntervalSince(sessionStart)
                     func sessionSeconds(_ t: CMTime) -> Double? {
                         guard t.isValid else { return nil }
                         let s = t.seconds
-                        return s.isFinite ? channelOffset + s : nil
+                        return s.isFinite ? s : nil
                     }
                     let timing = ChunkTiming(
                         timestamp: Date(),
@@ -473,6 +493,34 @@ private func aggregateConfidence(_ text: AttributedString) -> ChunkConfidence? {
     guard weight > 0 else { return nil }
     let round3 = { (x: Double) in (x * 1000).rounded() / 1000 }
     return ChunkConfidence(mean: round3(weightedSum / Double(weight)), min: round3(lowest))
+}
+
+/// Current host time in seconds on the mach timebase, matching the `hostTime` that captured
+/// buffers carry. Serves as the shared session origin for both channels' audio offsets.
+private func hostTimeNowSeconds() -> Double {
+    AVAudioTime.seconds(forHostTime: mach_absolute_time())
+}
+
+/// Build `seconds` of silence in `format`, used to bridge a device-rebind reopen gap (and
+/// the initial offset from sessionStart) so the analyzer's sample timeline stays aligned
+/// with host time (the shared session axis).
+/// Returns nil for a non-positive, non-finite, or unrepresentable duration, in which case
+/// the caller skips that span and leaves the timeline unadjusted for it.
+private func makeSilentBuffer(seconds: Double, format: AVAudioFormat) -> AVAudioPCMBuffer? {
+    guard seconds > 0, seconds.isFinite else { return nil }
+    let frameCount = (seconds * format.sampleRate).rounded()
+    guard frameCount >= 1, frameCount <= Double(AVAudioFrameCount.max) else { return nil }
+    let frames = AVAudioFrameCount(frameCount)
+    guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return nil }
+    buffer.frameLength = frames
+    // AVAudioPCMBuffer does not document its allocation as zero-filled, so make the
+    // silence explicit by zeroing every channel's backing store up to frameLength.
+    for channel in UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList) {
+        if let data = channel.mData {
+            memset(data, 0, Int(channel.mDataByteSize))
+        }
+    }
+    return buffer
 }
 
 /// Convert one PCM buffer to the analyzer's preferred format. Handles sample-rate conversion.

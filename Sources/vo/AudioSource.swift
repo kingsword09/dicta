@@ -32,12 +32,20 @@ enum AudioChannel: String, Sendable, CaseIterable {
     }
 }
 
+/// A captured PCM buffer plus the host time (seconds, mach timebase) of its first sample.
+/// `hostTime` is nil when the source could not supply a valid timestamp. The pipeline uses
+/// it to align each channel's analyzer timeline onto a shared session axis.
+struct TimedBuffer: @unchecked Sendable {
+    let buffer: AVAudioPCMBuffer
+    let hostTime: Double?
+}
+
 /// Microphone capture using AVAudioEngine.
 final class MicCapture: @unchecked Sendable {
-    let stream: AsyncStream<AVAudioPCMBuffer>
+    let stream: AsyncStream<TimedBuffer>
     /// Invoked once if the default input device changes out from under the engine.
     var onDeviceLost: (@Sendable () -> Void)?
-    private let builder: AsyncStream<AVAudioPCMBuffer>.Continuation
+    private let builder: AsyncStream<TimedBuffer>.Continuation
     private let engine = AVAudioEngine()
     private let voiceProcessing: Bool
     // When set, capture is pinned to this device instead of following the system
@@ -48,7 +56,7 @@ final class MicCapture: @unchecked Sendable {
     init(voiceProcessing: Bool = false, deviceID: AudioDeviceID? = nil) {
         self.voiceProcessing = voiceProcessing
         self.deviceID = deviceID
-        let (s, b) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+        let (s, b) = AsyncStream<TimedBuffer>.makeStream()
         self.stream = s
         self.builder = b
     }
@@ -91,10 +99,13 @@ final class MicCapture: @unchecked Sendable {
 
         let inputFormat = inputNode.outputFormat(forBus: 0)
         let builder = self.builder
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { buffer, _ in
+        inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { buffer, when in
             // Copy the buffer because installTap reuses the underlying storage.
             guard let copy = buffer.copy() else { return }
-            builder.yield(copy)
+            // Forward the tap's host time so the pipeline can place this buffer on the
+            // shared session axis; AVAudioTime carries it when isHostTimeValid.
+            let hostTime = when.isHostTimeValid ? AVAudioTime.seconds(forHostTime: when.hostTime) : nil
+            builder.yield(TimedBuffer(buffer: copy, hostTime: hostTime))
         }
         try engine.start()
 
@@ -142,10 +153,10 @@ final class MicCapture: @unchecked Sendable {
 /// Requires the Audio Recording TCC permission, not Screen Recording: ScreenCaptureKit
 /// would force a screen-capture grant even though vo only ever wanted the audio.
 final class SpeakerCapture: @unchecked Sendable {
-    let stream: AsyncStream<AVAudioPCMBuffer>
+    let stream: AsyncStream<TimedBuffer>
     /// Invoked once if the default output device changes out from under the aggregate.
     var onDeviceLost: (@Sendable () -> Void)?
-    private let builder: AsyncStream<AVAudioPCMBuffer>.Continuation
+    private let builder: AsyncStream<TimedBuffer>.Continuation
 
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
@@ -160,7 +171,7 @@ final class SpeakerCapture: @unchecked Sendable {
 
     init(outputDeviceUID: String? = nil) {
         self.outputDeviceUID = outputDeviceUID
-        let (s, b) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+        let (s, b) = AsyncStream<TimedBuffer>.makeStream()
         self.stream = s
         self.builder = b
     }
@@ -225,12 +236,16 @@ final class SpeakerCapture: @unchecked Sendable {
 
         let builder = self.builder
         var procID: AudioDeviceIOProcID?
-        status = AudioDeviceCreateIOProcIDWithBlock(&procID, aggregate, ioQueue) { _, inInputData, _, _, _ in
+        status = AudioDeviceCreateIOProcIDWithBlock(&procID, aggregate, ioQueue) { _, inInputData, inInputTime, _, _ in
             // The no-copy buffer aliases Core Audio's IO memory; downstream consumers
             // run async and must own their data, so deep-copy before yielding.
             guard let aliased = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: inInputData),
                   let owned = aliased.copy() else { return }
-            builder.yield(owned)
+            // Forward the input timestamp's host time so the pipeline can place this
+            // buffer on the shared session axis; valid when the hostTimeValid flag is set.
+            let ts = inInputTime.pointee
+            let hostTime = ts.mFlags.contains(.hostTimeValid) ? AVAudioTime.seconds(forHostTime: ts.mHostTime) : nil
+            builder.yield(TimedBuffer(buffer: owned, hostTime: hostTime))
         }
         guard status == noErr, let procID else {
             throw CoreAudioError(code: status, op: "CreateIOProc")
