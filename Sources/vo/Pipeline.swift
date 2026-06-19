@@ -138,10 +138,6 @@ struct Pipeline {
     /// audio source without having to wait for `run()` to unwind on its own.
     let stops: StopRegistry = StopRegistry()
 
-    /// Span assigned to a finalized chunk whose audio range is unavailable, so it still
-    /// yields a valid (start < end) timecode. Only the rare range-less chunk uses it.
-    private static let fallbackChunkDuration: Double = 2.0
-
     func run() async throws {
         let counter = SeqCounter()
 
@@ -365,25 +361,21 @@ struct Pipeline {
                     // speaker are directly comparable (each analyzer's range starts at its
                     // own stream, not the session). A CMTime can be valid yet
                     // infinite/indefinite (open-ended ranges); its `.seconds` is then
-                    // non-finite. When the range is unusable, fall back to the finalize
-                    // wall-clock so every chunk still carries a timecode, since a dropped
-                    // range would otherwise leave a subtitle block with no start/end.
-                    let now = Date()
+                    // non-finite. Leave the offset nil in that case so `audio` is omitted
+                    // rather than backfilled with an approximation, mirroring how a nil
+                    // confidence is dropped rather than zero-filled. A consumer that needs
+                    // a timecode for every chunk (e.g. an SRT writer) reconstructs the
+                    // missing one from `timestamp` and neighbours.
                     let channelOffset = channelStart.timeIntervalSince(sessionStart)
                     func sessionSeconds(_ t: CMTime) -> Double? {
                         guard t.isValid else { return nil }
                         let s = t.seconds
                         return s.isFinite ? channelOffset + s : nil
                     }
-                    let startSec = sessionSeconds(result.range.start) ?? now.timeIntervalSince(sessionStart)
-                    var endSec = sessionSeconds(result.range.end) ?? (startSec + Self.fallbackChunkDuration)
-                    // Guarantee a positive span so the chunk is a valid subtitle interval
-                    // even when only one edge of the range was usable.
-                    if endSec <= startSec { endSec = startSec + Self.fallbackChunkDuration }
                     let timing = ChunkTiming(
-                        timestamp: now,
-                        audioStart: startSec,
-                        audioEnd: endSec
+                        timestamp: Date(),
+                        audioStart: sessionSeconds(result.range.start),
+                        audioEnd:   sessionSeconds(result.range.end)
                     )
                     let confidence = aggregateConfidence(result.text)
                     await renderer.handle(.finalized(channel: channel, seq: seq, source: text, timing: timing, confidence: confidence))
