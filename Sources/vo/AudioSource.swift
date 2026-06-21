@@ -293,29 +293,41 @@ final class SpeakerCapture: @unchecked Sendable {
 
     /// UID of the current default output device, used as the aggregate's main sub-device.
     private func defaultOutputDeviceUID() throws -> String {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
         var deviceID = AudioObjectID(kAudioObjectUnknown)
-        try audioObjectProperty(
-            AudioObjectID(kAudioObjectSystemObject),
-            globalPropertyAddress(kAudioHardwarePropertyDefaultOutputDevice),
-            into: &deviceID,
-            op: "DefaultOutputDevice"
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        var status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID
         )
-        return try audioObjectString(
-            deviceID,
-            globalPropertyAddress(kAudioDevicePropertyDeviceUID),
-            op: "OutputDeviceUID"
-        )
+        guard status == noErr else { throw CoreAudioError(code: status, op: "DefaultOutputDevice") }
+
+        address.mSelector = kAudioDevicePropertyDeviceUID
+        var cfStr: Unmanaged<CFString>?
+        size = UInt32(MemoryLayout<Unmanaged<CFString>>.size)
+        status = withUnsafeMutablePointer(to: &cfStr) {
+            AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, $0)
+        }
+        guard status == noErr, let cf = cfStr else {
+            throw CoreAudioError(code: status, op: "OutputDeviceUID")
+        }
+        return cf.takeRetainedValue() as String
     }
 
     /// Stream format the tap delivers, read from the tap object itself.
     private func tapStreamFormat(_ tap: AudioObjectID) throws -> AudioStreamBasicDescription {
-        var asbd = AudioStreamBasicDescription()
-        try audioObjectProperty(
-            tap,
-            globalPropertyAddress(kAudioTapPropertyFormat),
-            into: &asbd,
-            op: "TapFormat"
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioTapPropertyFormat,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
         )
+        var asbd = AudioStreamBasicDescription()
+        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        let status = AudioObjectGetPropertyData(tap, &address, 0, nil, &size, &asbd)
+        guard status == noErr else { throw CoreAudioError(code: status, op: "TapFormat") }
         return asbd
     }
 }

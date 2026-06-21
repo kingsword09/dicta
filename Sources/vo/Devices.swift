@@ -56,13 +56,22 @@ private func collectDevices(_ direction: AudioDirection) throws -> [AudioDeviceI
 // MARK: - Core Audio enumeration helpers
 
 private func queryDefaultDevice(selector: AudioObjectPropertySelector) throws -> AudioDeviceID {
-    var deviceID: AudioDeviceID = 0
-    try audioObjectProperty(
-        AudioObjectID(kAudioObjectSystemObject),
-        globalPropertyAddress(selector),
-        into: &deviceID,
-        op: "DefaultDevice"
+    var address = AudioObjectPropertyAddress(
+        mSelector: selector,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
     )
+    var deviceID: AudioDeviceID = 0
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    let status = AudioObjectGetPropertyData(
+        AudioObjectID(kAudioObjectSystemObject),
+        &address,
+        0,
+        nil,
+        &size,
+        &deviceID
+    )
+    guard status == noErr else { throw CoreAudioError(code: status, op: "DefaultDevice") }
     return deviceID
 }
 
@@ -127,5 +136,18 @@ private func queryChannelCount(_ deviceID: AudioDeviceID, scope: AudioObjectProp
 }
 
 private func queryStringProperty(_ deviceID: AudioDeviceID, selector: AudioObjectPropertySelector) throws -> String {
-    try audioObjectString(deviceID, globalPropertyAddress(selector), op: "StringProperty")
+    var address = AudioObjectPropertyAddress(
+        mSelector: selector,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var cfStr: Unmanaged<CFString>?
+    var size = UInt32(MemoryLayout<Unmanaged<CFString>>.size)
+    let status = withUnsafeMutablePointer(to: &cfStr) { ptr in
+        AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, ptr)
+    }
+    guard status == noErr, let cf = cfStr else {
+        throw CoreAudioError(code: status, op: "StringProperty")
+    }
+    return cf.takeRetainedValue() as String
 }
