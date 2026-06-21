@@ -1,5 +1,13 @@
 # Changelog
 
+## [v0.7.1](https://github.com/k1LoW/vo/compare/v0.7.0...v0.7.1) - 2026-06-21
+
+### Other Changes
+- refactor: unify Core Audio property-read boilerplate into shared helpers by @k1LoW in https://github.com/k1LoW/vo/pull/30
+- Revert "refactor: unify Core Audio property-read boilerplate into shared helpers" by @k1LoW in https://github.com/k1LoW/vo/pull/33
+- refactor: decompose Pipeline.runChannel into resampler/translator/drain helpers by @k1LoW in https://github.com/k1LoW/vo/pull/31
+- Revert "Revert "refactor: unify Core Audio property-read boilerplate into shared helpers"" by @k1LoW in https://github.com/k1LoW/vo/pull/34
+
 ## [v0.7.0](https://github.com/k1LoW/vo/compare/v0.6.0...v0.7.0) - 2026-06-19
 
 ### New Features 🎉
