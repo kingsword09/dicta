@@ -265,12 +265,72 @@ struct Pipeline {
 
         let (inputSeq, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
 
-        // Resample + device-follow task: pull from the active capture, convert to the
-        // analyzer format, and push into the SpeechAnalyzer input. When the capture's
-        // stream ends because the default device changed, rebuild on the new default
-        // and keep feeding the same input. Buffers accumulate in `inputBuilder` while
-        // the analyzer warms up; it drains them once `start(inputSequence:)` connects.
-        let resampler = Task.detached {
+        let resampler = makeResampler(
+            channel: channel,
+            sessionStart: sessionStart,
+            analyzerFormat: analyzerFormat,
+            firstStream: firstStream,
+            rebind: rebind,
+            inputBuilder: inputBuilder,
+            makeCapture: makeCapture
+        )
+
+        // Warm the model / ANE in parallel with the now-flowing capture so the
+        // first finalized chunk comes back in ~1.45 s instead of ~2.2 s. If
+        // either prepare/start throws, the resampler we just spawned would be
+        // orphaned, so cancel it explicitly before propagating.
+        do {
+            try await analyzer.prepareToAnalyze(in: analyzerFormat)
+            try await analyzer.start(inputSequence: inputSeq)
+        } catch {
+            resampler.cancel()
+            inputBuilder.finish()
+            await stopper()
+            throw error
+        }
+
+        // Translation worker for this channel (only when targetLocale is set).
+        let (chunkSeq, chunkBuilder) = AsyncStream<(Int, String)>.makeStream()
+        let translator = makeTranslator(chunkSeq: chunkSeq)
+
+        // Drain transcriber results.
+        do {
+            try await drainTranscriberResults(
+                channel: channel,
+                counter: counter,
+                transcriber: transcriber,
+                willTranslate: willTranslate,
+                chunkBuilder: chunkBuilder
+            )
+        } catch {
+            resampler.cancel()
+            chunkBuilder.finish()
+            translator?.cancel()
+            await stopper()
+            throw error
+        }
+
+        resampler.cancel()
+        await stopper()
+        chunkBuilder.finish()
+        await translator?.value
+    }
+
+    /// Resample + device-follow task: pull from the active capture, convert to the
+    /// analyzer format, and push into the SpeechAnalyzer input. When the capture's
+    /// stream ends because the default device changed, rebuild on the new default
+    /// and keep feeding the same input. Buffers accumulate in `inputBuilder` while
+    /// the analyzer warms up; it drains them once `start(inputSequence:)` connects.
+    private func makeResampler(
+        channel: AudioChannel,
+        sessionStart: Double,
+        analyzerFormat: AVAudioFormat,
+        firstStream: AsyncStream<TimedBuffer>,
+        rebind: RebindBox,
+        inputBuilder: AsyncStream<AnalyzerInput>.Continuation,
+        makeCapture: @escaping @Sendable () async throws -> AsyncStream<TimedBuffer>
+    ) -> Task<Void, Never> {
+        Task.detached {
             var stream = firstStream
             // Host time up to which audio (real plus bridging silence) has been fed to the
             // analyzer. nil until the first buffer, when sessionStart is the baseline so
@@ -326,29 +386,16 @@ struct Pipeline {
             }
             inputBuilder.finish()
         }
+    }
 
-        // Warm the model / ANE in parallel with the now-flowing capture so the
-        // first finalized chunk comes back in ~1.45 s instead of ~2.2 s. If
-        // either prepare/start throws, the resampler we just spawned would be
-        // orphaned, so cancel it explicitly before propagating.
-        do {
-            try await analyzer.prepareToAnalyze(in: analyzerFormat)
-            try await analyzer.start(inputSequence: inputSeq)
-        } catch {
-            resampler.cancel()
-            inputBuilder.finish()
-            await stopper()
-            throw error
-        }
-
-        // Translation worker for this channel (only when targetLocale is set).
-        // TranslationSession is non-Sendable so we create it inside the Task closure.
-        let (chunkSeq, chunkBuilder) = AsyncStream<(Int, String)>.makeStream()
+    /// Translation worker for this channel. Returns nil when no target locale is set
+    /// (transcribe-only), so the caller skips translation teardown.
+    /// TranslationSession is non-Sendable so we create it inside the Task closure.
+    private func makeTranslator(chunkSeq: AsyncStream<(Int, String)>) -> Task<Void, Never>? {
+        guard let targetLang = targetLocale?.language else { return nil }
         let renderer = renderer
         let sourceLang = sourceLocale.language
-        let targetLang = targetLocale?.language
-        let translator: Task<Void, Never>? = willTranslate ? Task {
-            guard let targetLang else { return }
+        return Task {
             let session = TranslationSession(installedSource: sourceLang, target: targetLang)
             // run() already verified the pair via ensureTranslationModel (it throws
             // otherwise), so warm the model now to keep the first chunk's translation
@@ -368,60 +415,56 @@ struct Pipeline {
                     await renderer.handle(.translated(seq: seq, target: "[translation failed: \(error.localizedDescription)]"))
                 }
             }
-        } : nil
-
-        // Drain transcriber results.
-        do {
-            for try await result in transcriber.results {
-                // SpeechTranscriber emits every chunk after the first with a leading
-                // space (stream-concatenation artifact). Trim so TTY columns stay
-                // aligned and the space doesn't leak into JSONL or translation input.
-                let text = String(result.text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
-                if result.isFinal {
-                    // Whitespace-only finals carry no content; skip them so they
-                    // don't burn a seq or emit blank lines.
-                    guard !text.isEmpty else { continue }
-                    let seq = await counter.next()
-                    // The resampler has already aligned this channel's analyzer timeline to
-                    // the shared session axis (silence padding at the start and across
-                    // rebinds), so the range is the offset directly. A CMTime can be valid
-                    // yet infinite/indefinite (open-ended ranges); its `.seconds` is then
-                    // non-finite. Leave the offset nil in that case so `audio` is omitted
-                    // rather than backfilled with an approximation, mirroring how a nil
-                    // confidence is dropped rather than zero-filled. A consumer that needs
-                    // a timecode for every chunk (e.g. an SRT writer) reconstructs the
-                    // missing one from `timestamp` and neighbours.
-                    func sessionSeconds(_ t: CMTime) -> Double? {
-                        guard t.isValid else { return nil }
-                        let s = t.seconds
-                        return s.isFinite ? s : nil
-                    }
-                    let timing = ChunkTiming(
-                        timestamp: Date(),
-                        audioStart: sessionSeconds(result.range.start),
-                        audioEnd:   sessionSeconds(result.range.end)
-                    )
-                    let confidence = aggregateConfidence(result.text)
-                    await renderer.handle(.finalized(channel: channel, seq: seq, source: text, timing: timing, confidence: confidence))
-                    if willTranslate {
-                        chunkBuilder.yield((seq, text))
-                    }
-                } else {
-                    await renderer.handle(.volatile(channel: channel, text: text))
-                }
-            }
-        } catch {
-            resampler.cancel()
-            chunkBuilder.finish()
-            translator?.cancel()
-            await stopper()
-            throw error
         }
+    }
 
-        resampler.cancel()
-        await stopper()
-        chunkBuilder.finish()
-        await translator?.value
+    /// Drain the transcriber's result stream, emitting volatile previews and finalized
+    /// chunks to the renderer (and finalized source text to the translator when enabled).
+    private func drainTranscriberResults(
+        channel: AudioChannel,
+        counter: SeqCounter,
+        transcriber: SpeechTranscriber,
+        willTranslate: Bool,
+        chunkBuilder: AsyncStream<(Int, String)>.Continuation
+    ) async throws {
+        for try await result in transcriber.results {
+            // SpeechTranscriber emits every chunk after the first with a leading
+            // space (stream-concatenation artifact). Trim so TTY columns stay
+            // aligned and the space doesn't leak into JSONL or translation input.
+            let text = String(result.text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
+            if result.isFinal {
+                // Whitespace-only finals carry no content; skip them so they
+                // don't burn a seq or emit blank lines.
+                guard !text.isEmpty else { continue }
+                let seq = await counter.next()
+                // The resampler has already aligned this channel's analyzer timeline to
+                // the shared session axis (silence padding at the start and across
+                // rebinds), so the range is the offset directly. A CMTime can be valid
+                // yet infinite/indefinite (open-ended ranges); its `.seconds` is then
+                // non-finite. Leave the offset nil in that case so `audio` is omitted
+                // rather than backfilled with an approximation, mirroring how a nil
+                // confidence is dropped rather than zero-filled. A consumer that needs
+                // a timecode for every chunk (e.g. an SRT writer) reconstructs the
+                // missing one from `timestamp` and neighbours.
+                func sessionSeconds(_ t: CMTime) -> Double? {
+                    guard t.isValid else { return nil }
+                    let s = t.seconds
+                    return s.isFinite ? s : nil
+                }
+                let timing = ChunkTiming(
+                    timestamp: Date(),
+                    audioStart: sessionSeconds(result.range.start),
+                    audioEnd:   sessionSeconds(result.range.end)
+                )
+                let confidence = aggregateConfidence(result.text)
+                await renderer.handle(.finalized(channel: channel, seq: seq, source: text, timing: timing, confidence: confidence))
+                if willTranslate {
+                    chunkBuilder.yield((seq, text))
+                }
+            } else {
+                await renderer.handle(.volatile(channel: channel, text: text))
+            }
+        }
     }
 
     // MARK: - Helpers
