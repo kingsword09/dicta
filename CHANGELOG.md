@@ -1,5 +1,14 @@
 # Changelog
 
+## [v0.8.0](https://github.com/k1LoW/vo/compare/v0.7.1...v0.8.0) - 2026-06-24
+
+### New Features 🎉
+- feat: transcribe an on-disk audio file via --input by @k1LoW in https://github.com/k1LoW/vo/pull/37
+### Dependency Updates ⬆️
+- chore(deps): bump actions/checkout from 6.0.3 to 7.0.0 in the dependencies group by @dependabot[bot] in https://github.com/k1LoW/vo/pull/35
+### Other Changes
+- docs: show piping vo --json into say as a live interpreter by @k1LoW in https://github.com/k1LoW/vo/pull/38
+
 ## [v0.7.1](https://github.com/k1LoW/vo/compare/v0.7.0...v0.7.1) - 2026-06-21
 
 ### Other Changes
