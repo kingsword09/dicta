@@ -670,6 +670,11 @@ struct Pipeline {
             }
         } catch {
             resampler.cancel()
+            // Close the bounded buffer so a resampler suspended in `send` (buffer
+            // full at the moment the drain threw) is unblocked. Without this, cancel
+            // alone leaves the CheckedContinuation unresumed and the resampler task
+            // strands, leaking its frame and the buffered AVAudioPCMBuffers.
+            await inputBuffer.finish()
             chunkBuilder.finish()
             translator?.cancel()
             await stopper()
