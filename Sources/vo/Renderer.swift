@@ -5,7 +5,11 @@ import Darwin
 
 /// Wall-clock + audio-stream timing metadata attached to a finalized chunk.
 struct ChunkTiming: Sendable {
-    /// Wall-clock instant when the pipeline received the finalized result.
+    /// Wall-clock instant the chunk represents. For live channels (.mic / .spk)
+    /// this is when the pipeline received the finalized result. For .file (vo
+    /// --input) it is anchored to the file's own timeline (local-TZ
+    /// 1970-01-01T00:00:00 + audio.start), so two runs of the same file in the
+    /// same local timezone produce the same value.
     let timestamp: Date
     /// Start offset (seconds) on the shared session timeline, whose origin is common to
     /// mic + speaker. Nil when the transcriber range was invalid/non-finite.

@@ -686,6 +686,16 @@ struct Pipeline {
             }
         } : nil
 
+        // In file mode, anchor timestamp to a "local-TZ epoch" (wall-clock
+        // 1970-01-01T00:00:00 in the renderer's local timezone) plus
+        // audio.start, so timestamp and audio.* are two views of the same
+        // file position rather than two independent axes. ISO8601 with
+        // local TZ then prints "1970-01-01T00:00:0X.XXX±HH:MM". Computed
+        // once outside the loop because tzOffset is constant for the run;
+        // recomputing per chunk would both waste a Date allocation and
+        // drift the file anchor if the system TZ changed mid-run.
+        let tzOffset = Double(TimeZone.current.secondsFromGMT(for: Date(timeIntervalSince1970: 0)))
+
         do {
             for try await result in transcriber.results {
                 let text = String(result.text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -699,14 +709,9 @@ struct Pipeline {
                     }
                     let audioStart = sessionSeconds(result.range.start)
                     let audioEnd   = sessionSeconds(result.range.end)
-                    // In file mode, anchor timestamp to a "local-TZ epoch"
-                    // (wall-clock 1970-01-01T00:00:00 in the renderer's local
-                    // timezone) plus audio.start, so timestamp and audio.* are
-                    // two views of the same file position rather than two
-                    // independent axes. ISO8601 with local TZ then prints
-                    // "1970-01-01T00:00:0X.XXX±HH:MM". A missing audio.start
-                    // (invalid range) falls back to 0 = epoch itself.
-                    let tzOffset = Double(TimeZone.current.secondsFromGMT(for: Date(timeIntervalSince1970: 0)))
+                    // A missing audio.start (invalid range) falls back to
+                    // the same anchor as audio.start = 0 (the local-TZ
+                    // epoch above), not Unix epoch 00:00Z.
                     let timing = ChunkTiming(
                         timestamp: Date(timeIntervalSince1970: (audioStart ?? 0) - tzOffset),
                         audioStart: audioStart,
