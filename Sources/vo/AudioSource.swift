@@ -411,7 +411,7 @@ extension AVAudioPCMBuffer {
 }
 
 /// Audio source backed by an on-disk file. Unlike MicCapture / SpeakerCapture, this is
-/// pull-based: the resampler calls `nextBuffer()` per iteration instead of consuming an
+/// pull-based; the resampler calls `nextBuffer()` per iteration instead of consuming an
 /// AsyncStream. The intent is end-to-end backpressure for file mode. A push stream that
 /// reads ahead would let memory grow proportionally to (disk-speed − analyzer-speed) ×
 /// duration on long files, breaking the "memory stays bounded across long sessions"

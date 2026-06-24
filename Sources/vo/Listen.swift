@@ -2,8 +2,8 @@ import ArgumentParser
 import Foundation
 
 /// Run the live capture loop: mic + speaker -> SpeechTranscriber -> TranslationSession -> Renderer.
-/// When `input` is set, transcribe that file instead — mic and speaker capture are bypassed
-/// and the file is processed as fast as the analyzer allows.
+/// When `input` is set, transcribe that file instead. Mic and speaker capture are
+/// bypassed and the file feeds the same pipeline with end-to-end backpressure.
 func runListen(
     src: String,
     dst: String?,
