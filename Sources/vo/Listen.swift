@@ -23,7 +23,10 @@ func runListen(
         if !speaker { throw ValidationError("--no-speaker has no meaning with --input (speaker capture is already off).") }
         if voiceProcessing { throw ValidationError("--voice-processing only applies to mic capture; drop it when using --input.") }
         if selectDevice { throw ValidationError("--select-device only applies to mic / speaker capture; drop it when using --input.") }
-        inputURL = URL(fileURLWithPath: input)
+        // Expand `~` so a quoted or non-shell-supplied path resolves the same way the
+        // user's shell would, matching SessionLog's handling of `--transcript`.
+        let resolved = (input as NSString).expandingTildeInPath
+        inputURL = URL(fileURLWithPath: resolved)
     } else {
         inputURL = nil
         guard mic || speaker else {
