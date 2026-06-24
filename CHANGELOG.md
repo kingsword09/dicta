@@ -1,5 +1,11 @@
 # Changelog
 
+## [v0.8.1](https://github.com/k1LoW/vo/compare/v0.8.0...v0.8.1) - 2026-06-24
+
+### Other Changes
+- feat: parallelize per-chunk translation with bounded fan-out by @k1LoW in https://github.com/k1LoW/vo/pull/39
+- feat: anchor --input timestamp to the file's audio timeline by @k1LoW in https://github.com/k1LoW/vo/pull/40
+
 ## [v0.8.0](https://github.com/k1LoW/vo/compare/v0.7.1...v0.8.0) - 2026-06-24
 
 ### New Features 🎉
