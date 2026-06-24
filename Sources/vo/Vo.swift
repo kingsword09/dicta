@@ -29,6 +29,9 @@ struct Vo: AsyncParsableCommand {
     @Flag(name: .long, help: "Interactively pick the mic / speaker device at startup. The picked device is pinned, so later system-default changes are ignored. Needs an interactive terminal.")
     var selectDevice: Bool = false
 
+    @Option(name: .long, help: "Transcribe an on-disk audio file instead of live mic / speaker. Any format AVAudioFile can read (wav, m4a, mp3, caf, …). Runs as fast as the analyzer allows. Mutually exclusive with --no-mic / --no-speaker / --voice-processing / --select-device.")
+    var input: String?
+
     // MARK: - Diagnostic
 
     @Flag(name: .long, help: "Print full environment diagnostics (system, models, devices) and exit.")
@@ -58,6 +61,7 @@ struct Vo: AsyncParsableCommand {
             speaker: !noSpeaker,
             voiceProcessing: voiceProcessing,
             selectDevice: selectDevice,
+            input: input,
             transcript: transcript
         )
     }

@@ -51,6 +51,92 @@ actor StopRegistry {
     }
 }
 
+/// Bounded async buffer between the file-mode resampler and SpeechAnalyzer's input
+/// sequence. `send` suspends when the buffer is full so file reads cannot race ahead
+/// of the analyzer's drain rate. Used only in file mode; live capture stays on
+/// AsyncStream because its yield rate is already paced by wall-clock device callbacks
+/// (~50 buffers/sec mic, similar speaker), so unboundedness there is bounded in
+/// practice. A file feeder has no such pacing and would otherwise let memory grow
+/// proportionally to (read-speed − analyze-speed) × duration on long files, violating
+/// the "memory stays bounded across long sessions" invariant CLAUDE.md asserts.
+///
+/// Conforms to AsyncSequence so it can be passed straight to
+/// `SpeechAnalyzer.start(inputSequence:)`.
+actor BoundedAnalyzerInputBuffer {
+    private let capacity: Int
+    private var items: [AnalyzerInput] = []
+    private var takeWaiters: [CheckedContinuation<AnalyzerInput?, Never>] = []
+    private var sendWaiters: [(AnalyzerInput, CheckedContinuation<Void, Never>)] = []
+    private var finished = false
+
+    init(capacity: Int) {
+        precondition(capacity > 0)
+        self.capacity = capacity
+    }
+
+    /// Append an item; suspends until there is room (or finish() is called).
+    func send(_ item: AnalyzerInput) async {
+        if finished { return }
+        if let waiter = takeWaiters.first {
+            takeWaiters.removeFirst()
+            waiter.resume(returning: item)
+            return
+        }
+        if items.count < capacity {
+            items.append(item)
+            return
+        }
+        await withCheckedContinuation { cont in
+            sendWaiters.append((item, cont))
+        }
+    }
+
+    /// Pop the next item; suspends until one is available, or returns nil after finish().
+    func next() async -> AnalyzerInput? {
+        if let item = items.first {
+            items.removeFirst()
+            // Free one capacity slot for the oldest waiting sender.
+            if !sendWaiters.isEmpty {
+                let (queued, cont) = sendWaiters.removeFirst()
+                items.append(queued)
+                cont.resume()
+            }
+            return item
+        }
+        if finished { return nil }
+        return await withCheckedContinuation { cont in
+            takeWaiters.append(cont)
+        }
+    }
+
+    /// Mark the buffer closed. Pending takers wake with nil; pending senders wake
+    /// without their items being delivered (the consumer is gone, so the items
+    /// would be lost regardless). Idempotent.
+    func finish() {
+        if finished { return }
+        finished = true
+        for waiter in takeWaiters { waiter.resume(returning: nil) }
+        takeWaiters.removeAll()
+        for (_, cont) in sendWaiters { cont.resume() }
+        sendWaiters.removeAll()
+    }
+}
+
+extension BoundedAnalyzerInputBuffer: AsyncSequence {
+    typealias Element = AnalyzerInput
+
+    nonisolated func makeAsyncIterator() -> AsyncIterator {
+        AsyncIterator(buffer: self)
+    }
+
+    struct AsyncIterator: AsyncIteratorProtocol {
+        let buffer: BoundedAnalyzerInputBuffer
+        func next() async -> AnalyzerInput? {
+            await buffer.next()
+        }
+    }
+}
+
 /// Coordinates a channel's device-follow rebind between the device-change callback
 /// (which fires on the main queue, where DefaultDeviceChangeListener installs it) and
 /// the feeder task that pulls audio buffers.
@@ -135,6 +221,10 @@ struct Pipeline {
     let voiceProcessing: Bool  // apply AEC + NR + AGC on mic input
     let micDeviceID: AudioDeviceID?  // nil = follow system default input
     let speakerDeviceUID: String?    // nil = follow system default output
+    /// When set, transcribe this file instead of mic / speaker. Mic and speaker flags
+    /// are ignored in this mode (Listen.swift's validation rejects the combination so
+    /// they're never both true here).
+    let inputURL: URL?
     /// Lets callers (notably the SIGINT handler in Listen.swift) stop every active
     /// audio source without having to wait for `run()` to unwind on its own.
     let stops: StopRegistry = StopRegistry()
@@ -150,6 +240,16 @@ struct Pipeline {
         try await ensureSpeechAsset(locale: sourceLocale)
         if let targetLocale {
             try await ensureTranslationModel(source: sourceLocale, target: targetLocale)
+        }
+
+        // File mode runs a single channel with its own timeline origin at 0, so audio
+        // offsets in the JSONL line up with the file's playback position. Live mode
+        // shares one host-time origin between the mic and speaker channels.
+        if let inputURL {
+            try await runFileChannel(inputURL: inputURL, counter: counter, sessionStart: 0)
+            await renderer.handle(.eof)
+            await renderer.flush()
+            return
         }
 
         // Shared origin for both channels' audio offsets, on the same host-time clock the
@@ -250,6 +350,9 @@ struct Pipeline {
                 try await cap.start()
                 if !rebind.setCurrent({ await cap.stop() }) { await cap.stop() }
                 return cap.stream
+            case .file:
+                // runFileChannel is the file-mode entry; runChannel is never called with .file.
+                fatalError("runChannel does not handle .file; use runFileChannel")
             }
         }
 
@@ -467,6 +570,170 @@ struct Pipeline {
         }
     }
 
+    // MARK: - File channel
+
+    /// Drive the same SpeechTranscriber + TranslationSession pipeline from an on-disk
+    /// audio file rather than a live capture. Differences from runChannel:
+    ///   - single source, no device-follow / RebindBox machinery
+    ///   - sessionStart is 0, so audio offsets in JSONL line up with the file's playback
+    ///     position (the first buffer's hostTime is also 0; the resampler injects no
+    ///     leading silence)
+    ///   - end-to-end backpressure via pull-based `FileSource.nextBuffer()` plus a
+    ///     `BoundedAnalyzerInputBuffer`. A push stream would let memory grow with file
+    ///     duration when the disk feeds audio faster than the analyzer drains it.
+    ///   - the analyzer's input naturally finishes when the file hits EOF, which closes
+    ///     transcriber.results and lets this function return without external cancel.
+    ///     A mid-stream read failure surfaces as a thrown VoError.inputFileReadFailed
+    ///     via `try await resampler.value` at the end, instead of the silent truncation
+    ///     a `break`-on-error feeder would produce.
+    private func runFileChannel(
+        inputURL: URL,
+        counter: SeqCounter,
+        sessionStart: Double
+    ) async throws {
+        let willTranslate = targetLocale != nil
+        let transcriber = SpeechTranscriber(
+            locale: sourceLocale,
+            transcriptionOptions: [],
+            reportingOptions: [.volatileResults, .fastResults],
+            attributeOptions: [.audioTimeRange, .transcriptionConfidence]
+        )
+        let analyzer = SpeechAnalyzer(modules: [transcriber])
+
+        guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
+            throw VoError.noCompatibleAudioFormat
+        }
+
+        let source: FileSource
+        do {
+            source = try FileSource(url: inputURL)
+        } catch {
+            throw VoError.inputFileOpenFailed(url: inputURL, underlying: error)
+        }
+
+        // Register the stopper before any read so a SIGINT that races startup still
+        // halts the feeder (StopRegistry invokes stoppers inline once stopAll has run).
+        let stopper: () async -> Void = { source.stop() }
+        await stops.register(AsyncStopper(action: stopper))
+
+        // Capacity 8 is enough to absorb short producer / consumer rate mismatches
+        // without ever holding more than a fraction of a second of PCM in memory:
+        // 4096 frames per chunk × 8 ≈ 32 K frames, ~0.67 s at the typical 48 kHz
+        // analyzer format and well under 1 MB for any mono / stereo float32 input.
+        let inputBuffer = BoundedAnalyzerInputBuffer(capacity: 8)
+
+        // Resampler: pull one buffer at a time from the file, bridge gaps with silence
+        // exactly like runChannel does for live capture, and send into the bounded
+        // input. `send` suspends when the buffer is full, so file reads are paced by
+        // the analyzer's drain rate end-to-end. A read failure rethrows as
+        // VoError.inputFileReadFailed; the success path closes the buffer cleanly so
+        // the analyzer's results stream drains and exits.
+        let resampler: Task<Void, Error> = Task.detached { [inputURL] in
+            var fedEndHostTime: Double? = nil
+            while !Task.isCancelled {
+                let timed: TimedBuffer?
+                do {
+                    timed = try source.nextBuffer()
+                } catch {
+                    await inputBuffer.finish()
+                    throw VoError.inputFileReadFailed(url: inputURL, underlying: error)
+                }
+                guard let timed else { break }
+                let reference = fedEndHostTime ?? sessionStart
+                let h = max(timed.hostTime, reference)
+                if let silence = makeSilentBuffer(seconds: h - reference, format: analyzerFormat) {
+                    await inputBuffer.send(AnalyzerInput(buffer: silence))
+                }
+                if let converted = convertBuffer(timed.buffer, to: analyzerFormat) {
+                    await inputBuffer.send(AnalyzerInput(buffer: converted))
+                    fedEndHostTime = h + Double(timed.buffer.frameLength) / timed.buffer.format.sampleRate
+                } else {
+                    fedEndHostTime = h
+                }
+            }
+            await inputBuffer.finish()
+        }
+
+        do {
+            try await analyzer.prepareToAnalyze(in: analyzerFormat)
+            try await analyzer.start(inputSequence: inputBuffer)
+        } catch {
+            resampler.cancel()
+            await inputBuffer.finish()
+            await stopper()
+            throw error
+        }
+
+        let (chunkSeq, chunkBuilder) = AsyncStream<(Int, String)>.makeStream()
+        let renderer = renderer
+        let sourceLang = sourceLocale.language
+        let targetLang = targetLocale?.language
+        let translator: Task<Void, Never>? = willTranslate ? Task {
+            guard let targetLang else { return }
+            let session = TranslationSession(installedSource: sourceLang, target: targetLang)
+            do {
+                try await session.prepareTranslation()
+            } catch is CancellationError {
+                return
+            } catch {}
+            for await (seq, text) in chunkSeq {
+                do {
+                    let response = try await session.translate(text)
+                    await renderer.handle(.translated(seq: seq, target: response.targetText))
+                } catch {
+                    await renderer.handle(.translated(seq: seq, target: "[translation failed: \(error.localizedDescription)]"))
+                }
+            }
+        } : nil
+
+        do {
+            for try await result in transcriber.results {
+                let text = String(result.text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
+                if result.isFinal {
+                    guard !text.isEmpty else { continue }
+                    let seq = await counter.next()
+                    func sessionSeconds(_ t: CMTime) -> Double? {
+                        guard t.isValid else { return nil }
+                        let s = t.seconds
+                        return s.isFinite ? s : nil
+                    }
+                    let timing = ChunkTiming(
+                        timestamp: Date(),
+                        audioStart: sessionSeconds(result.range.start),
+                        audioEnd:   sessionSeconds(result.range.end)
+                    )
+                    let confidence = aggregateConfidence(result.text)
+                    await renderer.handle(.finalized(channel: .file, seq: seq, source: text, timing: timing, confidence: confidence))
+                    if willTranslate {
+                        chunkBuilder.yield((seq, text))
+                    }
+                } else {
+                    await renderer.handle(.volatile(channel: .file, text: text))
+                }
+            }
+        } catch {
+            resampler.cancel()
+            // Close the bounded buffer so a resampler suspended in `send` (buffer
+            // full at the moment the drain threw) is unblocked. Without this, cancel
+            // alone leaves the CheckedContinuation unresumed and the resampler task
+            // strands, leaking its frame and the buffered AVAudioPCMBuffers.
+            await inputBuffer.finish()
+            chunkBuilder.finish()
+            translator?.cancel()
+            await stopper()
+            throw error
+        }
+
+        await stopper()
+        chunkBuilder.finish()
+        await translator?.value
+        // The analyzer's results finished because the resampler closed the input
+        // buffer. If the close was preceded by a read failure, that failure is still
+        // pending on the resampler's value; rethrow it here so a corrupt / truncated
+        // file does not surface as a clean exit.
+        try await resampler.value
+    }
+
     // MARK: - Helpers
 
     private func ensureSpeechAsset(locale: Locale) async throws {
@@ -603,11 +870,21 @@ enum VoError: Error, CustomStringConvertible {
     case unsupportedSpeechLocale(Locale, supported: [String])
     case translationModelNotInstalled(source: Locale, target: Locale)
     case unsupportedTranslationPair(source: Locale, target: Locale)
+    case inputFileOpenFailed(url: URL, underlying: Error)
+    case inputFileReadFailed(url: URL, underlying: Error)
 
     var description: String {
         switch self {
         case .noCompatibleAudioFormat:
             return "No audio format compatible with SpeechTranscriber is available on this device."
+
+        case .inputFileOpenFailed(let url, let underlying):
+            let path = url.isFileURL ? url.path : url.absoluteString
+            return "Could not open input file \(path): \(underlying.localizedDescription)"
+
+        case .inputFileReadFailed(let url, let underlying):
+            let path = url.isFileURL ? url.path : url.absoluteString
+            return "Read failure on input file \(path) (the file may be corrupt or truncated, or the volume may have disconnected): \(underlying.localizedDescription)"
 
         case .translationModelNotInstalled(let s, let t):
             return """

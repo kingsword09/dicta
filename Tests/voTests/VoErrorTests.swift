@@ -57,4 +57,40 @@ struct VoErrorTests {
         #expect(msg.contains("not supported"))
         #expect(msg.contains("--doctor"))
     }
+
+    /// A failure to open `--input` includes the supplied path and the underlying
+    /// error message, so a user can tell from stderr which file was wrong.
+    @Test func inputFileOpenFailedIncludesPathAndUnderlying() {
+        let url = URL(fileURLWithPath: "/tmp/vo-test-missing.wav")
+        let underlying = NSError(
+            domain: NSCocoaErrorDomain,
+            code: NSFileReadNoSuchFileError,
+            userInfo: [NSLocalizedDescriptionKey: "No such file"]
+        )
+        let err = VoError.inputFileOpenFailed(url: url, underlying: underlying)
+        let msg = err.description
+
+        #expect(msg.contains("Could not open"))
+        #expect(msg.contains("/tmp/vo-test-missing.wav"))
+        #expect(msg.contains("No such file"))
+    }
+
+    /// A mid-stream read failure distinguishes itself from the open-time error and
+    /// hints at the likely causes (corruption, disconnect) so a user does not
+    /// confuse it with a missing-file case.
+    @Test func inputFileReadFailedNamesCorruptionAndPath() {
+        let url = URL(fileURLWithPath: "/tmp/vo-test-truncated.wav")
+        let underlying = NSError(
+            domain: NSOSStatusErrorDomain,
+            code: -50,
+            userInfo: [NSLocalizedDescriptionKey: "I/O error"]
+        )
+        let err = VoError.inputFileReadFailed(url: url, underlying: underlying)
+        let msg = err.description
+
+        #expect(msg.contains("Read failure"))
+        #expect(msg.contains("/tmp/vo-test-truncated.wav"))
+        #expect(msg.contains("corrupt"))
+        #expect(msg.contains("I/O error"))
+    }
 }

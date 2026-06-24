@@ -6,11 +6,13 @@ import AudioToolbox
 enum AudioChannel: String, Sendable, CaseIterable {
     case mic
     case speaker
+    case file
 
     var shortLabel: String {
         switch self {
         case .mic:     return "MIC"
         case .speaker: return "SPK"
+        case .file:    return "FILE"
         }
     }
 
@@ -19,15 +21,20 @@ enum AudioChannel: String, Sendable, CaseIterable {
         switch self {
         case .mic:     return "microphone input device"
         case .speaker: return "system audio output device"
+        case .file:    return "input file"
         }
     }
 
     /// 256-color palette tint for this channel's TTY output (Terminal.app safe).
-    /// mic = amber, speaker = teal. Shared by the live renderer and the startup banner.
+    /// mic = amber, speaker = teal, file = steel blue. Shared by the live renderer and
+    /// the startup banner. The file tint is used only when --input is set; it shows up
+    /// on the timestamp column (the [file] label is suppressed since file mode is
+    /// always a single channel).
     var tint256: Int {
         switch self {
         case .mic:     return 130
         case .speaker: return 24
+        case .file:    return 67
         }
     }
 }
@@ -388,5 +395,67 @@ extension AVAudioPCMBuffer {
             }
         }
         return out
+    }
+}
+
+/// Audio source backed by an on-disk file. Unlike MicCapture / SpeakerCapture, this is
+/// pull-based; the resampler calls `nextBuffer()` per iteration instead of consuming an
+/// AsyncStream. The intent is end-to-end backpressure for file mode. A push stream that
+/// reads ahead would let memory grow proportionally to (disk-speed − analyzer-speed) ×
+/// duration on long files, breaking the "memory stays bounded across long sessions"
+/// invariant CLAUDE.md asserts. Pull keeps exactly one decoded buffer alive at a time
+/// here and the bounded analyzer-input buffer caps the rest.
+///
+/// `TimedBuffer.hostTime` is the cumulative playback position on the file's own
+/// timeline, so pairing this with `sessionStart = 0` makes `audio.start` in the JSONL
+/// the file timecode directly. AVAudioFile accepts anything AudioToolbox can decode
+/// (wav, m4a/aac, mp3, caf, …); `processingFormat` is the natural decoded format and
+/// the pipeline's AVAudioConverter step resamples it into the SpeechAnalyzer-best
+/// format the same way it does for live capture buffers.
+final class FileSource: @unchecked Sendable {
+    let format: AVAudioFormat
+    let durationSeconds: Double
+    private let file: AVAudioFile
+    private let chunkFrames: AVAudioFrameCount
+    private let lock = NSLock()
+    private var cursor: Double = 0
+    private var stopped = false
+
+    init(url: URL, chunkFrames: AVAudioFrameCount = 4096) throws {
+        let f = try AVAudioFile(forReading: url)
+        self.file = f
+        self.format = f.processingFormat
+        self.durationSeconds = f.processingFormat.sampleRate > 0
+            ? Double(f.length) / f.processingFormat.sampleRate
+            : 0
+        self.chunkFrames = chunkFrames
+    }
+
+    /// Read and return the next decoded buffer. Returns nil at EOF or after `stop()`.
+    /// Throws the underlying error if `AVAudioFile.read` fails mid-stream so the
+    /// caller can surface a corrupt / truncated / disconnected-volume failure instead
+    /// of silently treating it as EOF.
+    func nextBuffer() throws -> TimedBuffer? {
+        lock.lock()
+        let isStopped = stopped
+        lock.unlock()
+        if isStopped { return nil }
+        guard let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: chunkFrames) else { return nil }
+        try file.read(into: buf, frameCount: chunkFrames)
+        if buf.frameLength == 0 { return nil }
+        let timed = TimedBuffer(buffer: buf, hostTime: cursor)
+        if format.sampleRate > 0 {
+            cursor += Double(buf.frameLength) / format.sampleRate
+        }
+        return timed
+    }
+
+    /// Stop further reads. Subsequent `nextBuffer()` calls return nil. Idempotent and
+    /// safe to call from any thread (the SIGINT-driven stopper runs on the main queue
+    /// while the resampler task reads on its own executor).
+    func stop() {
+        lock.lock()
+        stopped = true
+        lock.unlock()
     }
 }
