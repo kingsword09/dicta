@@ -22,6 +22,23 @@ struct AsyncStopper: @unchecked Sendable {
     let action: () async -> Void
 }
 
+/// Sendable shim over `TranslationSession` (non-Sendable class) so a single
+/// session can be shared across concurrent translate calls fanned out via
+/// TaskGroup. Apple does not document `TranslationSession.translate(_:)` as
+/// concurrent-safe explicitly, but `translations(batch:)` exists, which implies
+/// the underlying engine accepts overlapping requests. We bound the concurrency
+/// at the call site to limit blast radius if that assumption ever breaks.
+struct SendableTranslationSession: @unchecked Sendable {
+    let inner: TranslationSession
+}
+
+/// Per-channel translation fan-out width. File mode finalizes transcribe chunks
+/// far faster than a single serial `translate(_:)` can drain, so chunks queue
+/// up behind StreamRenderer.commitQueue's head and nothing emits until SIGINT.
+/// Fanning out lets independent chunks translate in parallel; the renderer's
+/// seq-ordered commit still preserves output order.
+private let translateConcurrency = 4
+
 /// Holds per-channel "stop the audio source" closures so the SIGINT handler can
 /// stop capture before blocking on the save prompt. Without this the OS keeps
 /// pulling mic/speaker frames while the user is deciding where to save the log.
@@ -499,23 +516,38 @@ struct Pipeline {
         let renderer = renderer
         let sourceLang = sourceLocale.language
         return Task {
-            let session = TranslationSession(installedSource: sourceLang, target: targetLang)
+            let box = SendableTranslationSession(inner: TranslationSession(installedSource: sourceLang, target: targetLang))
             // run() already verified the pair via ensureTranslationModel (it throws
             // otherwise), so warm the model now to keep the first chunk's translation
             // off the lazy on-demand loading path. A warm-up failure is non-fatal (the
             // per-chunk translate path still surfaces real errors), but a cancellation
             // means shutdown started, so bail instead of entering the chunk loop.
             do {
-                try await session.prepareTranslation()
+                try await box.inner.prepareTranslation()
             } catch is CancellationError {
                 return
             } catch {}
-            for await (seq, text) in chunkSeq {
-                do {
-                    let response = try await session.translate(text)
-                    await renderer.handle(.translated(seq: seq, target: response.targetText))
-                } catch {
-                    await renderer.handle(.translated(seq: seq, target: "[translation failed: \(error.localizedDescription)]"))
+            // Fan out per-chunk translate calls so a slow translate doesn't block
+            // later chunks. Bounded by translateConcurrency: when the in-flight
+            // count hits the cap, we await one child via group.next() before adding
+            // the next. StreamRenderer.commitQueue is seq-ordered, so out-of-order
+            // .translated events still render in order.
+            await withTaskGroup(of: Void.self) { group in
+                var inFlight = 0
+                for await (seq, text) in chunkSeq {
+                    if inFlight >= translateConcurrency {
+                        await group.next()
+                        inFlight -= 1
+                    }
+                    group.addTask {
+                        do {
+                            let response = try await box.inner.translate(text)
+                            await renderer.handle(.translated(seq: seq, target: response.targetText))
+                        } catch {
+                            await renderer.handle(.translated(seq: seq, target: "[translation failed: \(error.localizedDescription)]"))
+                        }
+                    }
+                    inFlight += 1
                 }
             }
         }
@@ -670,18 +702,32 @@ struct Pipeline {
         let targetLang = targetLocale?.language
         let translator: Task<Void, Never>? = willTranslate ? Task {
             guard let targetLang else { return }
-            let session = TranslationSession(installedSource: sourceLang, target: targetLang)
+            let box = SendableTranslationSession(inner: TranslationSession(installedSource: sourceLang, target: targetLang))
             do {
-                try await session.prepareTranslation()
+                try await box.inner.prepareTranslation()
             } catch is CancellationError {
                 return
             } catch {}
-            for await (seq, text) in chunkSeq {
-                do {
-                    let response = try await session.translate(text)
-                    await renderer.handle(.translated(seq: seq, target: response.targetText))
-                } catch {
-                    await renderer.handle(.translated(seq: seq, target: "[translation failed: \(error.localizedDescription)]"))
+            // See makeTranslator(): bounded TaskGroup fan-out. File mode is the
+            // hot path for this -- transcribe finalizes faster than serial translate
+            // can drain, and the commitQueue head stalls until the head's translate
+            // returns. Without this the JSONL stream emits nothing until SIGINT.
+            await withTaskGroup(of: Void.self) { group in
+                var inFlight = 0
+                for await (seq, text) in chunkSeq {
+                    if inFlight >= translateConcurrency {
+                        await group.next()
+                        inFlight -= 1
+                    }
+                    group.addTask {
+                        do {
+                            let response = try await box.inner.translate(text)
+                            await renderer.handle(.translated(seq: seq, target: response.targetText))
+                        } catch {
+                            await renderer.handle(.translated(seq: seq, target: "[translation failed: \(error.localizedDescription)]"))
+                        }
+                    }
+                    inFlight += 1
                 }
             }
         } : nil
