@@ -690,11 +690,21 @@ struct Pipeline {
         // 1970-01-01T00:00:00 in the renderer's local timezone) plus
         // audio.start, so timestamp and audio.* are two views of the same
         // file position rather than two independent axes. ISO8601 with
-        // local TZ then prints "1970-01-01T00:00:0X.XXX±HH:MM". Computed
-        // once outside the loop because tzOffset is constant for the run;
-        // recomputing per chunk would both waste a Date allocation and
-        // drift the file anchor if the system TZ changed mid-run.
-        let tzOffset = Double(TimeZone.current.secondsFromGMT(for: Date(timeIntervalSince1970: 0)))
+        // local TZ then prints "1970-01-01T00:00:0X.XXX±HH:MM". Compute
+        // the anchor by asking Calendar for the UTC instant whose local
+        // clock reads 1970-01-01T00:00:00 in the captured TZ. Reusing
+        // `secondsFromGMT(for: Date(timeIntervalSince1970: 0))` would
+        // mix the offset at the Unix epoch instant with a different
+        // anchor instant, which can disagree under historical/DST rules
+        // and shift the rendered date away from 1970-01-01. The Calendar
+        // round-trip stays consistent against the same TZ database the
+        // formatter uses. Computed once outside the loop so a mid-run TZ
+        // change cannot drift the anchor.
+        let localEpoch: Date = {
+            var cal = Calendar(identifier: .gregorian)
+            cal.timeZone = .current
+            return cal.date(from: DateComponents(year: 1970, month: 1, day: 1)) ?? Date(timeIntervalSince1970: 0)
+        }()
 
         do {
             for try await result in transcriber.results {
@@ -713,7 +723,7 @@ struct Pipeline {
                     // the same anchor as audio.start = 0 (the local-TZ
                     // epoch above), not Unix epoch 00:00Z.
                     let timing = ChunkTiming(
-                        timestamp: Date(timeIntervalSince1970: (audioStart ?? 0) - tzOffset),
+                        timestamp: localEpoch.addingTimeInterval(audioStart ?? 0),
                         audioStart: audioStart,
                         audioEnd:   audioEnd
                     )
