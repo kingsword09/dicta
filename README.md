@@ -86,6 +86,18 @@ Translation lines are shown in dim text under the source. Pairs are emitted in s
 
 `src.confidence` reports the transcription's per-chunk confidence, with `mean` weighted across the chunk and `min` taken from its least-confident run. This is acoustic confidence rather than a correctness guarantee, so a low `min` is a useful cue that a chunk is worth re-listening to. There is no counterpart for `dst`, because the translation framework exposes no quality score. The object is omitted only when no confidence value is available.
 
+### Live interpretation with `say`
+
+`vo --json` emits each finalized translation as soon as it is ready, so piping `dst.text` into `say` turns `vo` into an on-device live interpreter. No network, no API key.
+
+```console
+$ vo --src ja-JP --dst en-US --no-speaker --json \
+    | jq -r --unbuffered '.dst.text // empty' \
+    | while read -r line; do say -v Samantha "$line"; done
+```
+
+`jq --unbuffered` flushes each line as it arrives, so `say` speaks each chunk the moment `vo` finalizes it. `say -v '?'` lists installed voices.
+
 ### Device selection
 
 By default `vo` captures from the system default microphone and output device and follows them. If the default input or output changes mid-session (you switch output, or plug in headphones), `vo` rebuilds that channel on the new default and keeps going instead of stopping.
