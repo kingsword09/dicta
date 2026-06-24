@@ -51,6 +51,92 @@ actor StopRegistry {
     }
 }
 
+/// Bounded async buffer between the file-mode resampler and SpeechAnalyzer's input
+/// sequence. `send` suspends when the buffer is full so file reads cannot race ahead
+/// of the analyzer's drain rate. Used only in file mode; live capture stays on
+/// AsyncStream because its yield rate is already paced by wall-clock device callbacks
+/// (~50 buffers/sec mic, similar speaker), so unboundedness there is bounded in
+/// practice. A file feeder has no such pacing and would otherwise let memory grow
+/// proportionally to (read-speed − analyze-speed) × duration on long files, violating
+/// the "memory stays bounded across long sessions" invariant CLAUDE.md asserts.
+///
+/// Conforms to AsyncSequence so it can be passed straight to
+/// `SpeechAnalyzer.start(inputSequence:)`.
+actor BoundedAnalyzerInputBuffer {
+    private let capacity: Int
+    private var items: [AnalyzerInput] = []
+    private var takeWaiters: [CheckedContinuation<AnalyzerInput?, Never>] = []
+    private var sendWaiters: [(AnalyzerInput, CheckedContinuation<Void, Never>)] = []
+    private var finished = false
+
+    init(capacity: Int) {
+        precondition(capacity > 0)
+        self.capacity = capacity
+    }
+
+    /// Append an item; suspends until there is room (or finish() is called).
+    func send(_ item: AnalyzerInput) async {
+        if finished { return }
+        if let waiter = takeWaiters.first {
+            takeWaiters.removeFirst()
+            waiter.resume(returning: item)
+            return
+        }
+        if items.count < capacity {
+            items.append(item)
+            return
+        }
+        await withCheckedContinuation { cont in
+            sendWaiters.append((item, cont))
+        }
+    }
+
+    /// Pop the next item; suspends until one is available, or returns nil after finish().
+    func next() async -> AnalyzerInput? {
+        if let item = items.first {
+            items.removeFirst()
+            // Free one capacity slot for the oldest waiting sender.
+            if !sendWaiters.isEmpty {
+                let (queued, cont) = sendWaiters.removeFirst()
+                items.append(queued)
+                cont.resume()
+            }
+            return item
+        }
+        if finished { return nil }
+        return await withCheckedContinuation { cont in
+            takeWaiters.append(cont)
+        }
+    }
+
+    /// Mark the buffer closed. Pending takers wake with nil; pending senders wake
+    /// without their items being delivered (the consumer is gone, so the items
+    /// would be lost regardless). Idempotent.
+    func finish() {
+        if finished { return }
+        finished = true
+        for waiter in takeWaiters { waiter.resume(returning: nil) }
+        takeWaiters.removeAll()
+        for (_, cont) in sendWaiters { cont.resume() }
+        sendWaiters.removeAll()
+    }
+}
+
+extension BoundedAnalyzerInputBuffer: AsyncSequence {
+    typealias Element = AnalyzerInput
+
+    nonisolated func makeAsyncIterator() -> AsyncIterator {
+        AsyncIterator(buffer: self)
+    }
+
+    struct AsyncIterator: AsyncIteratorProtocol {
+        let buffer: BoundedAnalyzerInputBuffer
+        func next() async -> AnalyzerInput? {
+            await buffer.next()
+        }
+    }
+}
+
 /// Coordinates a channel's device-follow rebind between the device-change callback
 /// (which fires on the main queue, where DefaultDeviceChangeListener installs it) and
 /// the feeder task that pulls audio buffers.
@@ -449,8 +535,14 @@ struct Pipeline {
     ///   - sessionStart is 0, so audio offsets in JSONL line up with the file's playback
     ///     position (the first buffer's hostTime is also 0; the resampler injects no
     ///     leading silence)
+    ///   - end-to-end backpressure via pull-based `FileSource.nextBuffer()` plus a
+    ///     `BoundedAnalyzerInputBuffer`. A push stream would let memory grow with file
+    ///     duration when the disk feeds audio faster than the analyzer drains it.
     ///   - the analyzer's input naturally finishes when the file hits EOF, which closes
-    ///     transcriber.results and lets this function return without external cancel
+    ///     transcriber.results and lets this function return without external cancel.
+    ///     A mid-stream read failure surfaces as a thrown VoError.inputFileReadFailed
+    ///     via `try await resampler.value` at the end, instead of the silent truncation
+    ///     a `break`-on-error feeder would produce.
     private func runFileChannel(
         inputURL: URL,
         counter: SeqCounter,
@@ -476,41 +568,55 @@ struct Pipeline {
             throw VoError.inputFileOpenFailed(url: inputURL, underlying: error)
         }
 
-        // Register the stopper before starting so a SIGINT that races startup still
+        // Register the stopper before any read so a SIGINT that races startup still
         // halts the feeder (StopRegistry invokes stoppers inline once stopAll has run).
         let stopper: () async -> Void = { source.stop() }
         await stops.register(AsyncStopper(action: stopper))
 
-        source.start()
+        // Capacity 8 is enough to absorb short producer / consumer rate mismatches
+        // without ever holding more than a fraction of a second of PCM in memory:
+        // 4096 frames per chunk × 8 ≈ 32 K frames, ~0.67 s at the typical 48 kHz
+        // analyzer format and well under 1 MB for any mono / stereo float32 input.
+        let inputBuffer = BoundedAnalyzerInputBuffer(capacity: 8)
 
-        let (inputSeq, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
-
-        let resampler = Task.detached {
+        // Resampler: pull one buffer at a time from the file, bridge gaps with silence
+        // exactly like runChannel does for live capture, and send into the bounded
+        // input. `send` suspends when the buffer is full, so file reads are paced by
+        // the analyzer's drain rate end-to-end. A read failure rethrows as
+        // VoError.inputFileReadFailed; the success path closes the buffer cleanly so
+        // the analyzer's results stream drains and exits.
+        let resampler: Task<Void, Error> = Task.detached { [inputURL] in
             var fedEndHostTime: Double? = nil
-            for await timed in source.stream {
+            while !Task.isCancelled {
+                let timed: TimedBuffer?
+                do {
+                    timed = try source.nextBuffer()
+                } catch {
+                    await inputBuffer.finish()
+                    throw VoError.inputFileReadFailed(url: inputURL, underlying: error)
+                }
+                guard let timed else { break }
                 let reference = fedEndHostTime ?? sessionStart
                 let h = max(timed.hostTime, reference)
                 if let silence = makeSilentBuffer(seconds: h - reference, format: analyzerFormat) {
-                    inputBuilder.yield(AnalyzerInput(buffer: silence))
+                    await inputBuffer.send(AnalyzerInput(buffer: silence))
                 }
                 if let converted = convertBuffer(timed.buffer, to: analyzerFormat) {
-                    inputBuilder.yield(AnalyzerInput(buffer: converted))
+                    await inputBuffer.send(AnalyzerInput(buffer: converted))
                     fedEndHostTime = h + Double(timed.buffer.frameLength) / timed.buffer.format.sampleRate
                 } else {
                     fedEndHostTime = h
                 }
             }
-            // Closing the analyzer input lets prepareToAnalyze / start return their tail
-            // results and exit transcriber.results below, completing the channel.
-            inputBuilder.finish()
+            await inputBuffer.finish()
         }
 
         do {
             try await analyzer.prepareToAnalyze(in: analyzerFormat)
-            try await analyzer.start(inputSequence: inputSeq)
+            try await analyzer.start(inputSequence: inputBuffer)
         } catch {
             resampler.cancel()
-            inputBuilder.finish()
+            await inputBuffer.finish()
             await stopper()
             throw error
         }
@@ -570,10 +676,14 @@ struct Pipeline {
             throw error
         }
 
-        resampler.cancel()
         await stopper()
         chunkBuilder.finish()
         await translator?.value
+        // The analyzer's results finished because the resampler closed the input
+        // buffer. If the close was preceded by a read failure, that failure is still
+        // pending on the resampler's value; rethrow it here so a corrupt / truncated
+        // file does not surface as a clean exit.
+        try await resampler.value
     }
 
     // MARK: - Helpers
@@ -713,6 +823,7 @@ enum VoError: Error, CustomStringConvertible {
     case translationModelNotInstalled(source: Locale, target: Locale)
     case unsupportedTranslationPair(source: Locale, target: Locale)
     case inputFileOpenFailed(url: URL, underlying: Error)
+    case inputFileReadFailed(url: URL, underlying: Error)
 
     var description: String {
         switch self {
@@ -722,6 +833,10 @@ enum VoError: Error, CustomStringConvertible {
         case .inputFileOpenFailed(let url, let underlying):
             let path = url.isFileURL ? url.path : url.absoluteString
             return "Could not open input file \(path): \(underlying.localizedDescription)"
+
+        case .inputFileReadFailed(let url, let underlying):
+            let path = url.isFileURL ? url.path : url.absoluteString
+            return "Read failure on input file \(path) (the file may be corrupt or truncated, or the volume may have disconnected): \(underlying.localizedDescription)"
 
         case .translationModelNotInstalled(let s, let t):
             return """

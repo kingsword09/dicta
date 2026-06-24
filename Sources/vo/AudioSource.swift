@@ -410,24 +410,28 @@ extension AVAudioPCMBuffer {
     }
 }
 
-/// Audio source backed by an on-disk file. Unlike MicCapture / SpeakerCapture, this one
-/// has no wall-clock pacing: the feeder reads buffers as fast as the file system allows
-/// and yields them with a synthetic `hostTime` that is just the cumulative playback
-/// position. Pair it with `sessionStart = 0` in the pipeline so `audio.start` in the
-/// JSONL becomes the file timecode directly.
+/// Audio source backed by an on-disk file. Unlike MicCapture / SpeakerCapture, this is
+/// pull-based: the resampler calls `nextBuffer()` per iteration instead of consuming an
+/// AsyncStream. The intent is end-to-end backpressure for file mode. A push stream that
+/// reads ahead would let memory grow proportionally to (disk-speed − analyzer-speed) ×
+/// duration on long files, breaking the "memory stays bounded across long sessions"
+/// invariant CLAUDE.md asserts. Pull keeps exactly one decoded buffer alive at a time
+/// here and the bounded analyzer-input buffer caps the rest.
 ///
-/// AVAudioFile accepts any format AudioToolbox can decode (wav, m4a/aac, mp3, caf, …).
-/// The `processingFormat` it reports is the natural decoded format; the pipeline's
-/// existing AVAudioConverter step resamples it into the SpeechAnalyzer-best format the
-/// same way it does for live capture buffers.
+/// `TimedBuffer.hostTime` is the cumulative playback position on the file's own
+/// timeline, so pairing this with `sessionStart = 0` makes `audio.start` in the JSONL
+/// the file timecode directly. AVAudioFile accepts anything AudioToolbox can decode
+/// (wav, m4a/aac, mp3, caf, …); `processingFormat` is the natural decoded format and
+/// the pipeline's AVAudioConverter step resamples it into the SpeechAnalyzer-best
+/// format the same way it does for live capture buffers.
 final class FileSource: @unchecked Sendable {
-    let stream: AsyncStream<TimedBuffer>
     let format: AVAudioFormat
     let durationSeconds: Double
-    private let builder: AsyncStream<TimedBuffer>.Continuation
     private let file: AVAudioFile
     private let chunkFrames: AVAudioFrameCount
-    private var feeder: Task<Void, Never>?
+    private let lock = NSLock()
+    private var cursor: Double = 0
+    private var stopped = false
 
     init(url: URL, chunkFrames: AVAudioFrameCount = 4096) throws {
         let f = try AVAudioFile(forReading: url)
@@ -437,46 +441,33 @@ final class FileSource: @unchecked Sendable {
             ? Double(f.length) / f.processingFormat.sampleRate
             : 0
         self.chunkFrames = chunkFrames
-        let (s, b) = AsyncStream<TimedBuffer>.makeStream()
-        self.stream = s
-        self.builder = b
     }
 
-    /// Start the feeder task. Safe to call once; a second call is a no-op.
-    func start() {
-        guard feeder == nil else { return }
-        // Capture only the values the task needs so this class doesn't have to thread
-        // its non-Sendable AVAudioFile through Sendable bounds explicitly. The class is
-        // marked @unchecked Sendable and only the feeder reads the file, so there is no
-        // concurrent access to it.
-        feeder = Task { [self] in
-            // Cursor on the file's own timeline (seconds). Starts at 0 so the pipeline,
-            // with sessionStart = 0, sees the first buffer at offset 0 and emits no
-            // silence padding. Each yield advances by frameLength / sampleRate.
-            var cursor: Double = 0
-            let sampleRate = format.sampleRate
-            while !Task.isCancelled {
-                guard let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: chunkFrames) else { break }
-                do {
-                    try file.read(into: buf, frameCount: chunkFrames)
-                } catch {
-                    break
-                }
-                if buf.frameLength == 0 { break }
-                builder.yield(TimedBuffer(buffer: buf, hostTime: cursor))
-                if sampleRate > 0 {
-                    cursor += Double(buf.frameLength) / sampleRate
-                }
-            }
-            builder.finish()
+    /// Read and return the next decoded buffer. Returns nil at EOF or after `stop()`.
+    /// Throws the underlying error if `AVAudioFile.read` fails mid-stream so the
+    /// caller can surface a corrupt / truncated / disconnected-volume failure instead
+    /// of silently treating it as EOF.
+    func nextBuffer() throws -> TimedBuffer? {
+        lock.lock()
+        let isStopped = stopped
+        lock.unlock()
+        if isStopped { return nil }
+        guard let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: chunkFrames) else { return nil }
+        try file.read(into: buf, frameCount: chunkFrames)
+        if buf.frameLength == 0 { return nil }
+        let timed = TimedBuffer(buffer: buf, hostTime: cursor)
+        if format.sampleRate > 0 {
+            cursor += Double(buf.frameLength) / format.sampleRate
         }
+        return timed
     }
 
-    /// Stop the feeder. Idempotent. Cancels the read loop and closes the stream so the
-    /// resampler can drain pending buffers and exit.
+    /// Stop further reads. Subsequent `nextBuffer()` calls return nil. Idempotent and
+    /// safe to call from any thread (the SIGINT-driven stopper runs on the main queue
+    /// while the resampler task reads on its own executor).
     func stop() {
-        feeder?.cancel()
-        feeder = nil
-        builder.finish()
+        lock.lock()
+        stopped = true
+        lock.unlock()
     }
 }
