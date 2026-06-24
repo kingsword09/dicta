@@ -9,6 +9,7 @@ https://github.com/user-attachments/assets/6c11b6bc-395f-4593-8eca-856c4e7fbc93
 - Live transcription via Apple's [`SpeechTranscriber`](https://developer.apple.com/documentation/speech/speechtranscriber) (on-device, no network)
 - Live translation via [`TranslationSession`](https://developer.apple.com/documentation/translation/translationsession) (on-device)
 - Mic and system speaker captured as separate channels
+- On-disk audio file as input via `--input` (any format `AVAudioFile` reads), runs as fast as the analyzer can keep up
 - Strict source-order output, even when translations arrive out of order
 - TTY and JSONL output modes (auto-detected)
 - Wall-clock timestamps and audio time range per chunk
@@ -48,6 +49,7 @@ $ vo                                  # Listen to mic + speaker, transcribe only
 $ vo --src en-US --dst ja-JP          # Transcribe and translate
 $ vo --no-speaker                     # Mic only
 $ vo --no-mic --src en-US --dst ja-JP # Speaker only, with translation
+$ vo --input meeting.m4a              # Transcribe an on-disk audio file instead
 $ vo --select-device                  # Pick & pin the mic / speaker at startup
 $ vo --json | jq                      # JSONL output for piping
 $ vo --doctor                         # Environment diagnostics
@@ -110,6 +112,18 @@ A pinned device that is unplugged mid-session goes quiet rather than rebuilding,
 
 `--voice-processing` turns on Apple's voice IO (echo cancellation + noise reduction + AGC). Useful when running mic + speaker on the same physical device without headphones. The trade-off is that the macOS audio session enters communication mode, which lowers system speaker volume while `vo` is running. Off by default.
 
+### Transcribing from a file
+
+`--input PATH` reads an on-disk audio file and feeds it through the same `SpeechTranscriber` + `TranslationSession` pipeline as live capture. Any format `AVAudioFile` accepts works (wav, m4a, mp3, caf, aiff, and so on). Processing is bounded by what the analyzer can do per chunk rather than by the file's playback length, so a long recording finishes in a fraction of its runtime on Apple Silicon.
+
+```console
+$ vo --input meeting.m4a --src en-US --dst ja-JP > meeting.jsonl
+```
+
+Mic and speaker capture are bypassed in this mode. `--input` is mutually exclusive with `--no-mic`, `--no-speaker`, `--voice-processing`, and `--select-device`; passing any of those alongside `--input` errors out with a message naming the conflict. `audio.start` / `audio.end` in the JSONL line up with the file's own timecode, so a downstream consumer (e.g. an SRT writer) can use them as the playback timeline directly.
+
+File reads are paced by the analyzer's drain rate via a bounded internal buffer, so memory stays small even for multi-hour files. A mid-stream read failure (truncated, corrupt, or disconnected-volume file) exits with an error naming the path, rather than silently producing a partial transcript.
+
 ### Flags
 
 | Flag | Default | Description |
@@ -120,6 +134,7 @@ A pinned device that is unplugged mid-session goes quiet rather than rebuilding,
 | `--no-speaker` | (off, speaker on) | Disable system audio capture |
 | `--select-device` | off | Interactively pick (and pin) the mic / speaker device at startup. Needs a terminal |
 | `--voice-processing` | off | Apply echo cancellation on mic input |
+| `--input <path>` | (none) | Transcribe an on-disk audio file instead of live mic / speaker. Mutually exclusive with `--no-mic` / `--no-speaker` / `--voice-processing` / `--select-device` |
 | `--json` | | Force JSONL output |
 | `--transcript <path>` | (none; prompts at exit in TTY) | Stream finalized chunks as JSONL to `<path>` incrementally. Skips the interactive save prompt |
 | `--doctor` | | Print full environment diagnostics and exit |
