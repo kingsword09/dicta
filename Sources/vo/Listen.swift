@@ -2,6 +2,8 @@ import ArgumentParser
 import Foundation
 
 /// Run the live capture loop: mic + speaker -> SpeechTranscriber -> TranslationSession -> Renderer.
+/// When `input` is set, transcribe that file instead — mic and speaker capture are bypassed
+/// and the file is processed as fast as the analyzer allows.
 func runListen(
     src: String,
     dst: String?,
@@ -10,10 +12,23 @@ func runListen(
     speaker: Bool,
     voiceProcessing: Bool,
     selectDevice: Bool,
+    input: String?,
     transcript: String?
 ) async throws {
-    guard mic || speaker else {
-        throw ValidationError("Cannot disable both mic and speaker. Drop one of --no-mic / --no-speaker.")
+    let inputURL: URL?
+    if let input {
+        // --input is mutually exclusive with the live-capture switches. Each combination
+        // is rejected with its own message so the user knows which flag to drop.
+        if !mic { throw ValidationError("--no-mic has no meaning with --input (mic capture is already off).") }
+        if !speaker { throw ValidationError("--no-speaker has no meaning with --input (speaker capture is already off).") }
+        if voiceProcessing { throw ValidationError("--voice-processing only applies to mic capture; drop it when using --input.") }
+        if selectDevice { throw ValidationError("--select-device only applies to mic / speaker capture; drop it when using --input.") }
+        inputURL = URL(fileURLWithPath: input)
+    } else {
+        inputURL = nil
+        guard mic || speaker else {
+            throw ValidationError("Cannot disable both mic and speaker. Drop one of --no-mic / --no-speaker.")
+        }
     }
 
     // Claim vo's own TCC identity before touching audio, so the Microphone / Speech
@@ -22,6 +37,9 @@ func runListen(
     // spawning. On a release build this re-execs and never returns here; the
     // disclaimed child resumes below. On a plain `swift build` (no embedded
     // Info.plist) it is a no-op and vo keeps the terminal's identity.
+    // File mode still re-execs because the Speech Recognition grant attaches to vo
+    // (the file path bypasses mic / audio-recording grants but the Speech framework
+    // still checks Speech Recognition).
     Responsibility.reexecAsResponsibleProcess()
 
     let sourceLocale = Locale(identifier: src)
@@ -68,12 +86,16 @@ func runListen(
         }
     }
 
+    // File mode is always single-channel, so suppress the [file] label the same way the
+    // single-channel live modes (--no-mic / --no-speaker) suppress [mic] / [spk].
+    let showChannelLabel = inputURL == nil && mic && speaker
+
     let renderer = StreamRenderer(
         mode: mode,
         sourceLang: sourceLocale.identifier(.bcp47),
         targetLang: targetLocale?.identifier(.bcp47) ?? "",
         translationEnabled: targetLocale != nil,
-        showChannelLabel: mic && speaker,
+        showChannelLabel: showChannelLabel,
         logSink: sessionLog
     )
 
@@ -85,20 +107,29 @@ func runListen(
         enableSpeaker: speaker,
         voiceProcessing: voiceProcessing,
         micDeviceID: selectedDevices.micDeviceID,
-        speakerDeviceUID: selectedDevices.speakerDeviceUID
+        speakerDeviceUID: selectedDevices.speakerDeviceUID,
+        inputURL: inputURL
     )
 
     let startedAt = Date()
     if isTTY {
-        let deviceLabels = resolvedCaptureDeviceLabels(mic: mic, speaker: speaker, selected: selectedDevices)
-        printBanner(
-            sourceLocale: sourceLocale,
-            targetLocale: targetLocale,
-            mic: mic,
-            speaker: speaker,
-            micDevice: deviceLabels.mic,
-            speakerDevice: deviceLabels.speaker
-        )
+        if let inputURL {
+            printFileBanner(
+                inputURL: inputURL,
+                sourceLocale: sourceLocale,
+                targetLocale: targetLocale
+            )
+        } else {
+            let deviceLabels = resolvedCaptureDeviceLabels(mic: mic, speaker: speaker, selected: selectedDevices)
+            printBanner(
+                sourceLocale: sourceLocale,
+                targetLocale: targetLocale,
+                mic: mic,
+                speaker: speaker,
+                micDevice: deviceLabels.mic,
+                speakerDevice: deviceLabels.speaker
+            )
+        }
     }
 
     // pipeline.cancel() lets pipeline.run() below return, so after SIGINT the natural
@@ -232,6 +263,23 @@ private func printBanner(
     if mic, let micDevice { deviceLine(.mic, micDevice) }
     if speaker, let speakerDevice { deviceLine(.speaker, speakerDevice) }
 
+    print("")
+}
+
+private func printFileBanner(
+    inputURL: URL,
+    sourceLocale: Locale,
+    targetLocale: Locale?
+) {
+    let langs: String
+    if let t = targetLocale {
+        langs = "\(sourceLocale.identifier(.bcp47)) → \(t.identifier(.bcp47))"
+    } else {
+        langs = sourceLocale.identifier(.bcp47)
+    }
+    let version = Vo.configuration.version
+    let display = inputURL.isFileURL ? inputURL.path : inputURL.absoluteString
+    print("vo \(version) — transcribing \(display) (\(langs))")
     print("")
 }
 

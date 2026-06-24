@@ -247,7 +247,12 @@ actor StreamRenderer: Renderer {
     }
 
     private func ttyChannel(_ channel: AudioChannel) -> String {
-        let label = (channel == .mic) ? "[mic]" : "[spk]"
+        let label: String
+        switch channel {
+        case .mic:     label = "[mic]"
+        case .speaker: label = "[spk]"
+        case .file:    label = "[file]"
+        }
         return "\u{001B}[38;5;\(channelColor(channel))m\(label)\u{001B}[0m"
     }
 

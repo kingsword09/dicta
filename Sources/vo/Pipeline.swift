@@ -135,6 +135,10 @@ struct Pipeline {
     let voiceProcessing: Bool  // apply AEC + NR + AGC on mic input
     let micDeviceID: AudioDeviceID?  // nil = follow system default input
     let speakerDeviceUID: String?    // nil = follow system default output
+    /// When set, transcribe this file instead of mic / speaker. Mic and speaker flags
+    /// are ignored in this mode (Listen.swift's validation rejects the combination so
+    /// they're never both true here).
+    let inputURL: URL?
     /// Lets callers (notably the SIGINT handler in Listen.swift) stop every active
     /// audio source without having to wait for `run()` to unwind on its own.
     let stops: StopRegistry = StopRegistry()
@@ -150,6 +154,16 @@ struct Pipeline {
         try await ensureSpeechAsset(locale: sourceLocale)
         if let targetLocale {
             try await ensureTranslationModel(source: sourceLocale, target: targetLocale)
+        }
+
+        // File mode runs a single channel with its own timeline origin at 0, so audio
+        // offsets in the JSONL line up with the file's playback position. Live mode
+        // shares one host-time origin between the mic and speaker channels.
+        if let inputURL {
+            try await runFileChannel(inputURL: inputURL, counter: counter, sessionStart: 0)
+            await renderer.handle(.eof)
+            await renderer.flush()
+            return
         }
 
         // Shared origin for both channels' audio offsets, on the same host-time clock the
@@ -250,6 +264,9 @@ struct Pipeline {
                 try await cap.start()
                 if !rebind.setCurrent({ await cap.stop() }) { await cap.stop() }
                 return cap.stream
+            case .file:
+                // runFileChannel is the file-mode entry; runChannel is never called with .file.
+                fatalError("runChannel does not handle .file; use runFileChannel")
             }
         }
 
@@ -424,6 +441,141 @@ struct Pipeline {
         await translator?.value
     }
 
+    // MARK: - File channel
+
+    /// Drive the same SpeechTranscriber + TranslationSession pipeline from an on-disk
+    /// audio file rather than a live capture. Differences from runChannel:
+    ///   - single source, no device-follow / RebindBox machinery
+    ///   - sessionStart is 0, so audio offsets in JSONL line up with the file's playback
+    ///     position (the first buffer's hostTime is also 0; the resampler injects no
+    ///     leading silence)
+    ///   - the analyzer's input naturally finishes when the file hits EOF, which closes
+    ///     transcriber.results and lets this function return without external cancel
+    private func runFileChannel(
+        inputURL: URL,
+        counter: SeqCounter,
+        sessionStart: Double
+    ) async throws {
+        let willTranslate = targetLocale != nil
+        let transcriber = SpeechTranscriber(
+            locale: sourceLocale,
+            transcriptionOptions: [],
+            reportingOptions: [.volatileResults, .fastResults],
+            attributeOptions: [.audioTimeRange, .transcriptionConfidence]
+        )
+        let analyzer = SpeechAnalyzer(modules: [transcriber])
+
+        guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
+            throw VoError.noCompatibleAudioFormat
+        }
+
+        let source: FileSource
+        do {
+            source = try FileSource(url: inputURL)
+        } catch {
+            throw VoError.inputFileOpenFailed(url: inputURL, underlying: error)
+        }
+
+        // Register the stopper before starting so a SIGINT that races startup still
+        // halts the feeder (StopRegistry invokes stoppers inline once stopAll has run).
+        let stopper: () async -> Void = { source.stop() }
+        await stops.register(AsyncStopper(action: stopper))
+
+        source.start()
+
+        let (inputSeq, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
+
+        let resampler = Task.detached {
+            var fedEndHostTime: Double? = nil
+            for await timed in source.stream {
+                let reference = fedEndHostTime ?? sessionStart
+                let h = max(timed.hostTime, reference)
+                if let silence = makeSilentBuffer(seconds: h - reference, format: analyzerFormat) {
+                    inputBuilder.yield(AnalyzerInput(buffer: silence))
+                }
+                if let converted = convertBuffer(timed.buffer, to: analyzerFormat) {
+                    inputBuilder.yield(AnalyzerInput(buffer: converted))
+                    fedEndHostTime = h + Double(timed.buffer.frameLength) / timed.buffer.format.sampleRate
+                } else {
+                    fedEndHostTime = h
+                }
+            }
+            // Closing the analyzer input lets prepareToAnalyze / start return their tail
+            // results and exit transcriber.results below, completing the channel.
+            inputBuilder.finish()
+        }
+
+        do {
+            try await analyzer.prepareToAnalyze(in: analyzerFormat)
+            try await analyzer.start(inputSequence: inputSeq)
+        } catch {
+            resampler.cancel()
+            inputBuilder.finish()
+            await stopper()
+            throw error
+        }
+
+        let (chunkSeq, chunkBuilder) = AsyncStream<(Int, String)>.makeStream()
+        let renderer = renderer
+        let sourceLang = sourceLocale.language
+        let targetLang = targetLocale?.language
+        let translator: Task<Void, Never>? = willTranslate ? Task {
+            guard let targetLang else { return }
+            let session = TranslationSession(installedSource: sourceLang, target: targetLang)
+            do {
+                try await session.prepareTranslation()
+            } catch is CancellationError {
+                return
+            } catch {}
+            for await (seq, text) in chunkSeq {
+                do {
+                    let response = try await session.translate(text)
+                    await renderer.handle(.translated(seq: seq, target: response.targetText))
+                } catch {
+                    await renderer.handle(.translated(seq: seq, target: "[translation failed: \(error.localizedDescription)]"))
+                }
+            }
+        } : nil
+
+        do {
+            for try await result in transcriber.results {
+                let text = String(result.text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
+                if result.isFinal {
+                    guard !text.isEmpty else { continue }
+                    let seq = await counter.next()
+                    func sessionSeconds(_ t: CMTime) -> Double? {
+                        guard t.isValid else { return nil }
+                        let s = t.seconds
+                        return s.isFinite ? s : nil
+                    }
+                    let timing = ChunkTiming(
+                        timestamp: Date(),
+                        audioStart: sessionSeconds(result.range.start),
+                        audioEnd:   sessionSeconds(result.range.end)
+                    )
+                    let confidence = aggregateConfidence(result.text)
+                    await renderer.handle(.finalized(channel: .file, seq: seq, source: text, timing: timing, confidence: confidence))
+                    if willTranslate {
+                        chunkBuilder.yield((seq, text))
+                    }
+                } else {
+                    await renderer.handle(.volatile(channel: .file, text: text))
+                }
+            }
+        } catch {
+            resampler.cancel()
+            chunkBuilder.finish()
+            translator?.cancel()
+            await stopper()
+            throw error
+        }
+
+        resampler.cancel()
+        await stopper()
+        chunkBuilder.finish()
+        await translator?.value
+    }
+
     // MARK: - Helpers
 
     private func ensureSpeechAsset(locale: Locale) async throws {
@@ -560,11 +712,16 @@ enum VoError: Error, CustomStringConvertible {
     case unsupportedSpeechLocale(Locale, supported: [String])
     case translationModelNotInstalled(source: Locale, target: Locale)
     case unsupportedTranslationPair(source: Locale, target: Locale)
+    case inputFileOpenFailed(url: URL, underlying: Error)
 
     var description: String {
         switch self {
         case .noCompatibleAudioFormat:
             return "No audio format compatible with SpeechTranscriber is available on this device."
+
+        case .inputFileOpenFailed(let url, let underlying):
+            let path = url.isFileURL ? url.path : url.absoluteString
+            return "Could not open input file \(path): \(underlying.localizedDescription)"
 
         case .translationModelNotInstalled(let s, let t):
             return """

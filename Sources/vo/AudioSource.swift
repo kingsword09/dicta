@@ -6,11 +6,13 @@ import AudioToolbox
 enum AudioChannel: String, Sendable, CaseIterable {
     case mic
     case speaker
+    case file
 
     var shortLabel: String {
         switch self {
         case .mic:     return "MIC"
         case .speaker: return "SPK"
+        case .file:    return "FILE"
         }
     }
 
@@ -19,15 +21,20 @@ enum AudioChannel: String, Sendable, CaseIterable {
         switch self {
         case .mic:     return "microphone input device"
         case .speaker: return "system audio output device"
+        case .file:    return "input file"
         }
     }
 
     /// 256-color palette tint for this channel's TTY output (Terminal.app safe).
-    /// mic = amber, speaker = teal. Shared by the live renderer and the startup banner.
+    /// mic = amber, speaker = teal, file = steel blue. Shared by the live renderer and
+    /// the startup banner. The file tint is used only when --input is set; it shows up
+    /// on the timestamp column (the [file] label is suppressed since file mode is
+    /// always a single channel).
     var tint256: Int {
         switch self {
         case .mic:     return 130
         case .speaker: return 24
+        case .file:    return 67
         }
     }
 }
@@ -400,5 +407,76 @@ extension AVAudioPCMBuffer {
             }
         }
         return out
+    }
+}
+
+/// Audio source backed by an on-disk file. Unlike MicCapture / SpeakerCapture, this one
+/// has no wall-clock pacing: the feeder reads buffers as fast as the file system allows
+/// and yields them with a synthetic `hostTime` that is just the cumulative playback
+/// position. Pair it with `sessionStart = 0` in the pipeline so `audio.start` in the
+/// JSONL becomes the file timecode directly.
+///
+/// AVAudioFile accepts any format AudioToolbox can decode (wav, m4a/aac, mp3, caf, …).
+/// The `processingFormat` it reports is the natural decoded format; the pipeline's
+/// existing AVAudioConverter step resamples it into the SpeechAnalyzer-best format the
+/// same way it does for live capture buffers.
+final class FileSource: @unchecked Sendable {
+    let stream: AsyncStream<TimedBuffer>
+    let format: AVAudioFormat
+    let durationSeconds: Double
+    private let builder: AsyncStream<TimedBuffer>.Continuation
+    private let file: AVAudioFile
+    private let chunkFrames: AVAudioFrameCount
+    private var feeder: Task<Void, Never>?
+
+    init(url: URL, chunkFrames: AVAudioFrameCount = 4096) throws {
+        let f = try AVAudioFile(forReading: url)
+        self.file = f
+        self.format = f.processingFormat
+        self.durationSeconds = f.processingFormat.sampleRate > 0
+            ? Double(f.length) / f.processingFormat.sampleRate
+            : 0
+        self.chunkFrames = chunkFrames
+        let (s, b) = AsyncStream<TimedBuffer>.makeStream()
+        self.stream = s
+        self.builder = b
+    }
+
+    /// Start the feeder task. Safe to call once; a second call is a no-op.
+    func start() {
+        guard feeder == nil else { return }
+        // Capture only the values the task needs so this class doesn't have to thread
+        // its non-Sendable AVAudioFile through Sendable bounds explicitly. The class is
+        // marked @unchecked Sendable and only the feeder reads the file, so there is no
+        // concurrent access to it.
+        feeder = Task { [self] in
+            // Cursor on the file's own timeline (seconds). Starts at 0 so the pipeline,
+            // with sessionStart = 0, sees the first buffer at offset 0 and emits no
+            // silence padding. Each yield advances by frameLength / sampleRate.
+            var cursor: Double = 0
+            let sampleRate = format.sampleRate
+            while !Task.isCancelled {
+                guard let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: chunkFrames) else { break }
+                do {
+                    try file.read(into: buf, frameCount: chunkFrames)
+                } catch {
+                    break
+                }
+                if buf.frameLength == 0 { break }
+                builder.yield(TimedBuffer(buffer: buf, hostTime: cursor))
+                if sampleRate > 0 {
+                    cursor += Double(buf.frameLength) / sampleRate
+                }
+            }
+            builder.finish()
+        }
+    }
+
+    /// Stop the feeder. Idempotent. Cancels the read loop and closes the stream so the
+    /// resampler can drain pending buffers and exit.
+    func stop() {
+        feeder?.cancel()
+        feeder = nil
+        builder.finish()
     }
 }
