@@ -303,8 +303,12 @@ actor ChunkReconciler {
         guard let start = candidate.timing.audioStart,
               let end = candidate.timing.audioEnd,
               end > start else {
-            // No timing → can't overlap-match. Emit standalone rather than swallow.
-            await onEmit(candidate)
+            // No timing → can't overlap-match, so this candidate also can't ride
+            // the recentlyEmitted dedup. Emitting it anyway would let the same
+            // utterance double-emit if another locale produced a valid range for
+            // it. SpeechTranscriber returns invalid / open-ended ranges only on
+            // degenerate inputs in practice, so dropping the candidate is the
+            // right tradeoff for the multi-source "never emits twice" guarantee.
             return
         }
 
