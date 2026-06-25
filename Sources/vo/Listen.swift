@@ -45,8 +45,22 @@ func runListen(
     // still checks Speech Recognition).
     Responsibility.reexecAsResponsibleProcess()
 
-    let sourceLocale = Locale(identifier: src)
-    let targetLocale = dst.map { Locale(identifier: $0) }
+    let sourceLocales = try parseLocaleList(src, flag: "--src")
+    let targetLocales: [Locale]?
+    if let dst {
+        let parsed = try parseLocaleList(dst, flag: "--dst")
+        guard parsed.count == sourceLocales.count else {
+            throw ValidationError("--dst must have the same number of locales as --src (got \(sourceLocales.count) source, \(parsed.count) target).")
+        }
+        targetLocales = parsed
+    } else {
+        targetLocales = nil
+    }
+    // For multi-source mode the renderer carries dummy defaults; every finalized
+    // chunk arrives with srcLang / dstLang overrides set by the reconciler. For
+    // single-source mode the defaults are what JSONL uses, so pass the actual id.
+    let primarySource = sourceLocales[0]
+    let primaryTarget = targetLocales?[0]
 
     // Resolve pinned devices before any capture starts. Done after the re-exec so the
     // prompt runs once in the disclaimed child (which owns stdin), and before the
@@ -95,16 +109,16 @@ func runListen(
 
     let renderer = StreamRenderer(
         mode: mode,
-        sourceLang: sourceLocale.identifier(.bcp47),
-        targetLang: targetLocale?.identifier(.bcp47) ?? "",
-        translationEnabled: targetLocale != nil,
+        sourceLang: primarySource.identifier(.bcp47),
+        targetLang: primaryTarget?.identifier(.bcp47) ?? "",
+        translationEnabled: targetLocales != nil,
         showChannelLabel: showChannelLabel,
         logSink: sessionLog
     )
 
     let pipeline = Pipeline(
-        sourceLocale: sourceLocale,
-        targetLocale: targetLocale,
+        sourceLocales: sourceLocales,
+        targetLocales: targetLocales,
         renderer: renderer,
         enableMic: mic,
         enableSpeaker: speaker,
@@ -119,14 +133,14 @@ func runListen(
         if let inputURL {
             printFileBanner(
                 inputURL: inputURL,
-                sourceLocale: sourceLocale,
-                targetLocale: targetLocale
+                sourceLocales: sourceLocales,
+                targetLocales: targetLocales
             )
         } else {
             let deviceLabels = resolvedCaptureDeviceLabels(mic: mic, speaker: speaker, selected: selectedDevices)
             printBanner(
-                sourceLocale: sourceLocale,
-                targetLocale: targetLocale,
+                sourceLocales: sourceLocales,
+                targetLocales: targetLocales,
                 mic: mic,
                 speaker: speaker,
                 micDevice: deviceLabels.mic,
@@ -233,8 +247,8 @@ private func finalizeSession(
 // MARK: - Banner / Summary
 
 private func printBanner(
-    sourceLocale: Locale,
-    targetLocale: Locale?,
+    sourceLocales: [Locale],
+    targetLocales: [Locale]?,
     mic: Bool,
     speaker: Bool,
     micDevice: CaptureDeviceLabel?,
@@ -243,12 +257,7 @@ private func printBanner(
     let channels = [mic ? "mic" : nil, speaker ? "speaker" : nil]
         .compactMap { $0 }
         .joined(separator: " + ")
-    let langs: String
-    if let t = targetLocale {
-        langs = "\(sourceLocale.identifier(.bcp47)) → \(t.identifier(.bcp47))"
-    } else {
-        langs = sourceLocale.identifier(.bcp47)
-    }
+    let langs = bannerLanguagePair(sourceLocales: sourceLocales, targetLocales: targetLocales)
     let version = Vo.configuration.version
     print("vo \(version) — listening on \(channels) (\(langs))")
 
@@ -271,19 +280,38 @@ private func printBanner(
 
 private func printFileBanner(
     inputURL: URL,
-    sourceLocale: Locale,
-    targetLocale: Locale?
+    sourceLocales: [Locale],
+    targetLocales: [Locale]?
 ) {
-    let langs: String
-    if let t = targetLocale {
-        langs = "\(sourceLocale.identifier(.bcp47)) → \(t.identifier(.bcp47))"
-    } else {
-        langs = sourceLocale.identifier(.bcp47)
-    }
+    let langs = bannerLanguagePair(sourceLocales: sourceLocales, targetLocales: targetLocales)
     let version = Vo.configuration.version
     let display = inputURL.isFileURL ? inputURL.path : inputURL.absoluteString
     print("vo \(version) — transcribing \(display) (\(langs))")
     print("")
+}
+
+/// Render the locale list pair shown in the banner. Single-locale collapses to the
+/// familiar "en-US" / "en-US → ja-JP" forms; multi-locale uses a comma-separated
+/// list on each side matching what the user typed.
+private func bannerLanguagePair(sourceLocales: [Locale], targetLocales: [Locale]?) -> String {
+    let srcStr = sourceLocales.map { $0.identifier(.bcp47) }.joined(separator: ",")
+    if let targetLocales {
+        let dstStr = targetLocales.map { $0.identifier(.bcp47) }.joined(separator: ",")
+        return "\(srcStr) → \(dstStr)"
+    }
+    return srcStr
+}
+
+/// Split a comma-separated locale list flag value into trimmed Locale instances.
+/// Empty list or an empty entry produces a ValidationError naming the flag.
+private func parseLocaleList(_ raw: String, flag: String) throws -> [Locale] {
+    let parts = raw.split(separator: ",", omittingEmptySubsequences: false).map {
+        $0.trimmingCharacters(in: .whitespaces)
+    }
+    guard !parts.isEmpty, parts.allSatisfy({ !$0.isEmpty }) else {
+        throw ValidationError("\(flag) cannot be empty or contain empty entries.")
+    }
+    return parts.map { Locale(identifier: $0) }
 }
 
 /// Wrap a string in a 256-color foreground SGR escape. Matches the renderer's palette.

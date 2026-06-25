@@ -11,10 +11,10 @@ struct Vo: AsyncParsableCommand {
 
     // MARK: - Capture options
 
-    @Option(name: .long, help: "Source locale, BCP-47 (e.g. en-US, ja-JP). Defaults to your system locale.")
+    @Option(name: .long, help: "Source locale(s), BCP-47, comma-separated for auto-detect (e.g. en-US,ja-JP). With more than one locale every channel runs a transcriber per locale in parallel and the highest-confidence result wins per utterance. Defaults to your system locale.")
     var src: String = Locale.current.identifier(.bcp47)
 
-    @Option(name: .long, help: "Target locale, BCP-47. Omit to skip translation.")
+    @Option(name: .long, help: "Target locale(s), BCP-47, comma-separated and position-paired with --src (e.g. --src en-US,ja-JP --dst ja-JP,en-US for bidirectional interpretation). Omit to skip translation.")
     var dst: String?
 
     @Flag(name: .long, help: "Disable microphone capture")

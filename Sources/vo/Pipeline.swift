@@ -220,6 +220,200 @@ final class RebindBox: @unchecked Sendable {
     }
 }
 
+/// Per-channel reconciler for the multi-source (auto-detect) pipeline. Each enabled
+/// source locale runs its own SpeechTranscriber on the same audio. They independently
+/// segment by their own VAD, so the same utterance arrives as N (slightly offset)
+/// finalized chunks. The reconciler matches them by `audio.range` overlap and emits
+/// exactly one winner per utterance to the renderer + translator routing.
+///
+/// Matching: a candidate joins an existing pending region when
+///   overlap(region, candidate) / min(region.length, candidate.length) > 0.5
+/// (the shorter side must be majority-covered). The pending region's union expands
+/// to include the new candidate so subsequent candidates can still match.
+///
+/// Emission: a region fires when either
+///   - all N source locales have contributed a candidate, or
+///   - 300 ms has elapsed since the first candidate for that region arrived
+/// The winner is the candidate with the highest `confidence.mean`. A candidate that
+/// arrives after its region already fired is dropped via the short-lived
+/// `recentlyEmitted` window so the same utterance never emits twice.
+///
+/// `nLocales == 1` is the legacy single-source mode; the reconciler short-circuits
+/// straight to `onEmit` with no buffering or timer, so output latency is unchanged.
+actor ChunkReconciler {
+    struct Candidate: Sendable {
+        let locale: Locale
+        let text: String
+        let timing: ChunkTiming
+        let confidence: ChunkConfidence?
+    }
+
+    private struct PendingRegion {
+        let id: UUID
+        var unionStart: Double
+        var unionEnd: Double
+        var candidates: [String: Candidate]   // locale.identifier(.bcp47) -> candidate
+        var timeoutTask: Task<Void, Never>?
+    }
+
+    private struct EmittedRegion {
+        let unionStart: Double
+        let unionEnd: Double
+        let expiresAt: Date
+    }
+
+    private let nLocales: Int
+    private let timeoutSeconds: Double
+    private let onEmit: @Sendable (Candidate) async -> Void
+    private var pendings: [PendingRegion] = []
+    /// Regions emitted within the last `recentlyEmittedTTL` seconds. A late-arriving
+    /// candidate that overlaps one of these is dropped instead of starting a fresh
+    /// pending and double-emitting the same utterance.
+    private var recentlyEmitted: [EmittedRegion] = []
+    private let recentlyEmittedTTL: TimeInterval = 0.5
+    private var finished = false
+
+    init(
+        nLocales: Int,
+        timeoutSeconds: Double = 0.3,
+        onEmit: @escaping @Sendable (Candidate) async -> Void
+    ) {
+        precondition(nLocales >= 1)
+        self.nLocales = nLocales
+        self.timeoutSeconds = timeoutSeconds
+        self.onEmit = onEmit
+    }
+
+    /// Submit a finalized candidate from one source-locale transcriber. The actor
+    /// decides whether it merges into an existing pending region, opens a new one,
+    /// or short-circuits straight to emission (n=1 or invalid timing).
+    func receive(_ candidate: Candidate) async {
+        if finished { return }
+
+        // Single-source: nothing to reconcile, emit synchronously.
+        if nLocales == 1 {
+            await onEmit(candidate)
+            return
+        }
+
+        guard let start = candidate.timing.audioStart,
+              let end = candidate.timing.audioEnd,
+              end > start else {
+            // No timing → can't overlap-match. Emit standalone rather than swallow.
+            await onEmit(candidate)
+            return
+        }
+
+        pruneExpiredEmissions()
+
+        // A candidate overlapping a recently-emitted region was already represented
+        // by an earlier winner; drop to prevent double output.
+        if recentlyEmitted.contains(where: { overlaps(aStart: $0.unionStart, aEnd: $0.unionEnd, bStart: start, bEnd: end) }) {
+            return
+        }
+
+        if let idx = pendings.firstIndex(where: { p in
+            overlaps(aStart: p.unionStart, aEnd: p.unionEnd, bStart: start, bEnd: end)
+        }) {
+            // Same locale arriving twice (e.g. two short fragments from one transcriber
+            // overlapping one chunk from the other) keeps the higher-mean one. The
+            // alternative — replacing unconditionally — would discard a high-confidence
+            // first fragment in favour of a noisy continuation.
+            let key = candidate.locale.identifier(.bcp47)
+            if let existing = pendings[idx].candidates[key] {
+                let existingMean = existing.confidence?.mean ?? 0
+                let newMean = candidate.confidence?.mean ?? 0
+                if newMean > existingMean {
+                    pendings[idx].candidates[key] = candidate
+                }
+            } else {
+                pendings[idx].candidates[key] = candidate
+            }
+            pendings[idx].unionStart = Swift.min(pendings[idx].unionStart, start)
+            pendings[idx].unionEnd = Swift.max(pendings[idx].unionEnd, end)
+
+            if pendings[idx].candidates.count >= nLocales {
+                let region = pendings.remove(at: idx)
+                region.timeoutTask?.cancel()
+                await emitWinner(from: region)
+            }
+        } else {
+            // First candidate for a new region. Schedule a one-shot timeout.
+            let id = UUID()
+            var region = PendingRegion(
+                id: id,
+                unionStart: start,
+                unionEnd: end,
+                candidates: [candidate.locale.identifier(.bcp47): candidate],
+                timeoutTask: nil
+            )
+            let timeoutSeconds = self.timeoutSeconds
+            region.timeoutTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
+                if Task.isCancelled { return }
+                await self?.fireTimeout(id: id)
+            }
+            pendings.append(region)
+        }
+    }
+
+    /// Cancel all timers and emit whatever has been collected so far. Called by the
+    /// channel teardown path so a pending region never strands its candidate after
+    /// the transcribers have finished.
+    func finish() async {
+        if finished { return }
+        finished = true
+        let remaining = pendings
+        pendings.removeAll()
+        for region in remaining {
+            region.timeoutTask?.cancel()
+            await emitWinner(from: region)
+        }
+    }
+
+    // MARK: - Internals
+
+    private func fireTimeout(id: UUID) async {
+        if finished { return }
+        guard let idx = pendings.firstIndex(where: { $0.id == id }) else { return }
+        let region = pendings.remove(at: idx)
+        await emitWinner(from: region)
+    }
+
+    private func emitWinner(from region: PendingRegion) async {
+        guard let winner = region.candidates.values.max(by: {
+            ($0.confidence?.mean ?? 0) < ($1.confidence?.mean ?? 0)
+        }) else { return }
+
+        // Remember this emission so a stray late candidate for the same utterance
+        // is dropped instead of creating a new region.
+        recentlyEmitted.append(EmittedRegion(
+            unionStart: region.unionStart,
+            unionEnd: region.unionEnd,
+            expiresAt: Date().addingTimeInterval(recentlyEmittedTTL)
+        ))
+
+        await onEmit(winner)
+    }
+
+    private func pruneExpiredEmissions() {
+        let now = Date()
+        recentlyEmitted.removeAll { $0.expiresAt < now }
+    }
+
+    private func overlaps(aStart: Double, aEnd: Double, bStart: Double, bEnd: Double) -> Bool {
+        let ovStart = Swift.max(aStart, bStart)
+        let ovEnd = Swift.min(aEnd, bEnd)
+        let ov = ovEnd - ovStart
+        guard ov > 0 else { return false }
+        let aLen = aEnd - aStart
+        let bLen = bEnd - bStart
+        let shorter = Swift.min(aLen, bLen)
+        guard shorter > 0 else { return false }
+        return ov / shorter > 0.5
+    }
+}
+
 /// End-to-end pipeline that orchestrates one or more audio channels.
 ///
 /// For each enabled channel:
@@ -230,8 +424,16 @@ final class RebindBox: @unchecked Sendable {
 /// Mic and Speaker run concurrently in a TaskGroup but share one renderer + one seq counter,
 /// so the output order reflects which channel finalized first.
 struct Pipeline {
-    let sourceLocale: Locale
-    let targetLocale: Locale?  // nil = transcribe only, no translation
+    /// One or more source locales. When the list has more than one entry, every
+    /// channel runs a SpeechTranscriber per locale in parallel and the
+    /// `ChunkReconciler` picks one winner per utterance via overlap-based matching
+    /// (see ChunkReconciler for the algorithm).
+    let sourceLocales: [Locale]
+    /// Target locales for translation, position-paired with `sourceLocales`. nil
+    /// → transcribe only. When provided, length must match `sourceLocales` (Listen
+    /// validates this), so the per-utterance routing `srcLocales[i] → dstLocales[i]`
+    /// is a direct array lookup.
+    let targetLocales: [Locale]?
     let renderer: any Renderer
     let enableMic: Bool
     let enableSpeaker: Bool
@@ -250,13 +452,18 @@ struct Pipeline {
         let counter = SeqCounter()
 
         // Resolve models once, before any channel starts. Both channels share the
-        // source locale, so doing this here (instead of per-channel) avoids a double
-        // download and lets us emit a single progress line. The speech asset can be
-        // fetched headlessly; the translation model cannot, so we fail fast with
-        // install instructions rather than letting every chunk surface a failure.
-        try await ensureSpeechAsset(locale: sourceLocale)
-        if let targetLocale {
-            try await ensureTranslationModel(source: sourceLocale, target: targetLocale)
+        // source-locale list, so doing this here (instead of per-channel) avoids a
+        // double download and lets us emit a single progress line per locale. The
+        // speech asset can be fetched headlessly; the translation model cannot, so
+        // we fail fast with install instructions rather than letting every chunk
+        // surface a failure.
+        for locale in sourceLocales {
+            try await ensureSpeechAsset(locale: locale)
+        }
+        if let targetLocales {
+            for (src, dst) in zip(sourceLocales, targetLocales) {
+                try await ensureTranslationModel(source: src, target: dst)
+            }
         }
 
         // File mode runs a single channel with its own timeline origin at 0, so audio
@@ -301,12 +508,19 @@ struct Pipeline {
 
     // MARK: - Per-channel
 
-    private func runChannel(
-        channel: AudioChannel,
-        counter: SeqCounter,
-        sessionStart: Double
-    ) async throws {
-        let willTranslate = targetLocale != nil
+    /// Per source-locale stack: one transcriber + analyzer + analyzer-input stream.
+    /// Audio fans out from one resampler to every entry's `inputBuilder`. The
+    /// transcribers run independently; their finalized chunks meet at the
+    /// `ChunkReconciler` which picks the winning locale per utterance.
+    private struct PerLocale {
+        let locale: Locale
+        let transcriber: SpeechTranscriber
+        let analyzer: SpeechAnalyzer
+        let inputSeq: AsyncStream<AnalyzerInput>
+        let inputBuilder: AsyncStream<AnalyzerInput>.Continuation
+    }
+
+    private func makeTranscriberStack(for locale: Locale) -> SpeechTranscriber {
         // `.fastResults` biases the transcriber toward a shorter context window so
         // both volatile and finalized chunks arrive with lower latency. Apple
         // documents an accuracy trade-off but it is acceptable here: the live
@@ -317,28 +531,48 @@ struct Pipeline {
         // give us; we spell it out explicitly to keep the trade-off readable.
         // Request per-run transcription confidence alongside the time range. It is
         // aggregated per chunk (mean + min) and emitted under `src.confidence`. Note
-        // the value is acoustic per-character confidence, not word correctness.
-        let transcriber = SpeechTranscriber(
-            locale: sourceLocale,
+        // the value is acoustic per-character confidence, not word correctness, but
+        // for multi-source auto-detect mode the mean is also the primary signal
+        // ChunkReconciler uses to pick a winner across locales.
+        SpeechTranscriber(
+            locale: locale,
             transcriptionOptions: [],
             reportingOptions: [.volatileResults, .fastResults],
             attributeOptions: [.audioTimeRange, .transcriptionConfidence]
         )
-        let analyzer = SpeechAnalyzer(modules: [transcriber])
+    }
 
-        guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
+    private func runChannel(
+        channel: AudioChannel,
+        counter: SeqCounter,
+        sessionStart: Double
+    ) async throws {
+        let willTranslate = targetLocales != nil
+
+        // One transcriber + analyzer + input stream per source locale. With a single
+        // locale this collapses to one entry and the ChunkReconciler fast-paths
+        // straight through, so the auto-detect machinery costs nothing in that case.
+        var perLocale: [PerLocale] = []
+        for src in sourceLocales {
+            let t = makeTranscriberStack(for: src)
+            let a = SpeechAnalyzer(modules: [t])
+            let (seq, builder) = AsyncStream<AnalyzerInput>.makeStream()
+            perLocale.append(PerLocale(locale: src, transcriber: t, analyzer: a, inputSeq: seq, inputBuilder: builder))
+        }
+
+        guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: perLocale.map { $0.transcriber }) else {
             throw VoError.noCompatibleAudioFormat
         }
 
         // Start audio capture and the resampler BEFORE warming the analyzer so
         // any speech the user produces during the ANE compile window lands in
-        // the inputBuilder buffer instead of being lost. Without this ordering
+        // the inputBuilder buffers instead of being lost. Without this ordering
         // the ~1.5 s `prepareToAnalyze` would silently drop the first words of
         // a session.
         //
         // An unpinned channel follows the system default device: if the default
         // changes mid-session, the capture is rebuilt on the new default and keeps
-        // feeding the same analyzer, so the session continues instead of stopping.
+        // feeding the same analyzers, so the session continues instead of stopping.
         // A pinned (--select-device) channel installs no device-change listener, so
         // makeCapture below runs exactly once.
         let rebind = RebindBox()
@@ -383,57 +617,124 @@ struct Pipeline {
         // capture before any save prompt blocks the main task.
         await stops.register(AsyncStopper(action: stopper))
 
-        let (inputSeq, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
-
+        let inputBuilders = perLocale.map { $0.inputBuilder }
         let resampler = makeResampler(
             channel: channel,
             sessionStart: sessionStart,
             analyzerFormat: analyzerFormat,
             firstStream: firstStream,
             rebind: rebind,
-            inputBuilder: inputBuilder,
+            inputBuilders: inputBuilders,
             makeCapture: makeCapture
         )
 
-        // Warm the model / ANE in parallel with the now-flowing capture so the
+        // Warm each model / ANE in parallel with the now-flowing capture so the
         // first finalized chunk comes back in ~1.45 s instead of ~2.2 s. If
-        // either prepare/start throws, the resampler we just spawned would be
+        // any prepare/start throws, the resampler we just spawned would be
         // orphaned, so cancel it explicitly before propagating.
         do {
-            try await analyzer.prepareToAnalyze(in: analyzerFormat)
-            try await analyzer.start(inputSequence: inputSeq)
+            for p in perLocale {
+                try await p.analyzer.prepareToAnalyze(in: analyzerFormat)
+                try await p.analyzer.start(inputSequence: p.inputSeq)
+            }
         } catch {
             resampler.cancel()
-            inputBuilder.finish()
+            for b in inputBuilders { b.finish() }
             await stopper()
             throw error
         }
 
-        // Translation worker for this channel (only when targetLocale is set).
-        let (chunkSeq, chunkBuilder) = AsyncStream<(Int, String)>.makeStream()
-        let translator = makeTranslator(chunkSeq: chunkSeq)
+        // One translator + chunk pipe per (src → dst) pair. Built up-front and held as
+        // `let` so the reconciler's @Sendable onEmit closure can capture without a
+        // mutable-var diagnostic. Keyed by source-locale BCP-47 so the reconciler's
+        // winner routes in O(1).
+        let lanes: [String: TranslationLane] = makeTranslationLanes()
+        let dstLangByLocale: [String: String] = {
+            guard let targetLocales else { return [:] }
+            var m: [String: String] = [:]
+            for (i, src) in sourceLocales.enumerated() {
+                m[src.identifier(.bcp47)] = targetLocales[i].identifier(.bcp47)
+            }
+            return m
+        }()
 
-        // Drain transcriber results.
-        do {
-            try await drainTranscriberResults(
+        // Reconciler: receives finalized candidates from every per-locale transcriber,
+        // picks a winner per utterance, and assigns the renderer's monotonic `seq` at
+        // emission time so renderer source-order commit stays unaffected by reconciliation.
+        let rendererRef = renderer
+        let reconciler = ChunkReconciler(nLocales: sourceLocales.count) { winner in
+            let seq = await counter.next()
+            let srcLang = winner.locale.identifier(.bcp47)
+            let dstLang = dstLangByLocale[srcLang]
+            await rendererRef.handle(.finalized(
                 channel: channel,
-                counter: counter,
-                transcriber: transcriber,
-                willTranslate: willTranslate,
-                chunkBuilder: chunkBuilder
-            )
+                seq: seq,
+                source: winner.text,
+                timing: winner.timing,
+                confidence: winner.confidence,
+                srcLangOverride: srcLang,
+                dstLangOverride: dstLang
+            ))
+            if willTranslate, let lane = lanes[srcLang] {
+                lane.builder.yield((seq, winner.text))
+            }
+        }
+
+        // Drain each transcriber's results concurrently. Volatile updates from every
+        // locale flow straight to the renderer (the live region is per-channel, not
+        // per-locale, so the latest-arriving fragment wins); finalized chunks go to
+        // the reconciler with a wall-clock-now timestamp.
+        do {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for p in perLocale {
+                    group.addTask {
+                        try await self.drainTranscriberResults(
+                            channel: channel,
+                            transcriber: p.transcriber,
+                            locale: p.locale,
+                            reconciler: reconciler,
+                            timestampFor: { _ in Date() }
+                        )
+                    }
+                }
+                try await group.waitForAll()
+            }
         } catch {
             resampler.cancel()
-            chunkBuilder.finish()
-            translator?.cancel()
+            for b in inputBuilders { b.finish() }
+            for lane in lanes.values { lane.builder.finish() }
+            for lane in lanes.values { lane.translator.cancel() }
             await stopper()
+            await reconciler.finish()
             throw error
         }
 
         resampler.cancel()
         await stopper()
-        chunkBuilder.finish()
-        await translator?.value
+        await reconciler.finish()
+        for lane in lanes.values { lane.builder.finish() }
+        for lane in lanes.values { await lane.translator.value }
+    }
+
+    /// One translator + matching chunk-feeder per (src → dst) pair, keyed by the
+    /// source locale's BCP-47 identifier. Empty when `targetLocales` is nil
+    /// (transcribe-only). Built once per channel call so the lookup table stays
+    /// immutable and captures cleanly into the reconciler's Sendable closure.
+    private struct TranslationLane: Sendable {
+        let translator: Task<Void, Never>
+        let builder: AsyncStream<(Int, String)>.Continuation
+    }
+
+    private func makeTranslationLanes() -> [String: TranslationLane] {
+        guard let targetLocales else { return [:] }
+        var m: [String: TranslationLane] = [:]
+        for (i, src) in sourceLocales.enumerated() {
+            let dst = targetLocales[i]
+            let (chunkSeq, builder) = AsyncStream<(Int, String)>.makeStream()
+            let translator = makeTranslator(source: src, target: dst, chunkSeq: chunkSeq)
+            m[src.identifier(.bcp47)] = TranslationLane(translator: translator, builder: builder)
+        }
+        return m
     }
 
     /// Resample + device-follow task: pull from the active capture, convert to the
@@ -447,7 +748,7 @@ struct Pipeline {
         analyzerFormat: AVAudioFormat,
         firstStream: AsyncStream<TimedBuffer>,
         rebind: RebindBox,
-        inputBuilder: AsyncStream<AnalyzerInput>.Continuation,
+        inputBuilders: [AsyncStream<AnalyzerInput>.Continuation],
         makeCapture: @escaping @Sendable () async throws -> AsyncStream<TimedBuffer>
     ) -> Task<Void, Never> {
         Task.detached {
@@ -472,8 +773,10 @@ struct Pipeline {
                     // device-rebind reopen gap, and a hole left by a failed convert all
                     // collapse to "fill [fedEnd, h) with silence". A near-zero span rounds
                     // to no samples and is skipped, so a contiguous stream injects nothing.
+                    // Each analyzer needs its own AnalyzerInput so they iterate the same
+                    // PCM buffer independently.
                     if let silence = makeSilentBuffer(seconds: h - reference, format: analyzerFormat) {
-                        inputBuilder.yield(AnalyzerInput(buffer: silence))
+                        for b in inputBuilders { b.yield(AnalyzerInput(buffer: silence)) }
                     }
                     // Advance the fed position past h only by audio actually fed. If the
                     // convert fails, the hole stays open and the next buffer bridges it with
@@ -481,7 +784,7 @@ struct Pipeline {
                     // pre-conversion duration in seconds is resampling-invariant, so it is
                     // the right amount to advance this host-time marker by.
                     if let converted = convertBuffer(timed.buffer, to: analyzerFormat) {
-                        inputBuilder.yield(AnalyzerInput(buffer: converted))
+                        for b in inputBuilders { b.yield(AnalyzerInput(buffer: converted)) }
                         fedEndHostTime = h + Double(timed.buffer.frameLength) / timed.buffer.format.sampleRate
                     } else {
                         fedEndHostTime = h
@@ -504,17 +807,31 @@ struct Pipeline {
                     break
                 }
             }
-            inputBuilder.finish()
+            for b in inputBuilders { b.finish() }
         }
     }
 
-    /// Translation worker for this channel. Returns nil when no target locale is set
-    /// (transcribe-only), so the caller skips translation teardown.
+    /// Translation worker for one (src → dst) locale pair. The caller spawns one of
+    /// these per pair in the source-locale list and routes each finalized chunk's
+    /// text to the worker matching the winning locale.
+    ///
+    /// Same-language pair (e.g. `--src ja-JP --dst ja-JP`, useful when one direction
+    /// of a bidirectional setup should pass through untranslated) bypasses the
+    /// TranslationSession entirely and echoes source text as target. The Translation
+    /// framework rejects identity pairs as unsupported, so we must not call it.
+    ///
     /// TranslationSession is non-Sendable so we create it inside the Task closure.
-    private func makeTranslator(chunkSeq: AsyncStream<(Int, String)>) -> Task<Void, Never>? {
-        guard let targetLang = targetLocale?.language else { return nil }
+    private func makeTranslator(source: Locale, target: Locale, chunkSeq: AsyncStream<(Int, String)>) -> Task<Void, Never> {
         let renderer = renderer
-        let sourceLang = sourceLocale.language
+        if isSameLanguage(source, target) {
+            return Task {
+                for await (seq, text) in chunkSeq {
+                    await renderer.handle(.translated(seq: seq, target: text))
+                }
+            }
+        }
+        let sourceLang = source.language
+        let targetLang = target.language
         return Task {
             let box = SendableTranslationSession(inner: TranslationSession(installedSource: sourceLang, target: targetLang))
             // run() already verified the pair via ensureTranslationModel (it throws
@@ -553,15 +870,22 @@ struct Pipeline {
         }
     }
 
-    /// Drain the transcriber's result stream, emitting volatile previews and finalized
-    /// chunks to the renderer (and finalized source text to the translator when enabled).
+    /// Drain one transcriber's result stream. Volatile previews flow straight to the
+    /// renderer's per-channel live region; finalized chunks become candidates fed to
+    /// the per-channel `ChunkReconciler`, which picks one winner per utterance across
+    /// every source-locale transcriber sharing the channel.
+    ///
+    /// `timestampFor` returns the wall-clock instant a finalized chunk represents.
+    /// Live mode passes `_ in Date()` (now); file mode passes
+    /// `audioStart in localEpoch + audioStart` so timestamp tracks the file's own timeline.
     private func drainTranscriberResults(
         channel: AudioChannel,
-        counter: SeqCounter,
         transcriber: SpeechTranscriber,
-        willTranslate: Bool,
-        chunkBuilder: AsyncStream<(Int, String)>.Continuation
+        locale: Locale,
+        reconciler: ChunkReconciler,
+        timestampFor: @Sendable (Double?) -> Date
     ) async throws {
+        let renderer = renderer
         for try await result in transcriber.results {
             // SpeechTranscriber emits every chunk after the first with a leading
             // space (stream-concatenation artifact). Trim so TTY columns stay
@@ -571,7 +895,6 @@ struct Pipeline {
                 // Whitespace-only finals carry no content; skip them so they
                 // don't burn a seq or emit blank lines.
                 guard !text.isEmpty else { continue }
-                let seq = await counter.next()
                 // The resampler has already aligned this channel's analyzer timeline to
                 // the shared session axis (silence padding at the start and across
                 // rebinds), so the range is the offset directly. A CMTime can be valid
@@ -586,16 +909,20 @@ struct Pipeline {
                     let s = t.seconds
                     return s.isFinite ? s : nil
                 }
+                let audioStart = sessionSeconds(result.range.start)
+                let audioEnd = sessionSeconds(result.range.end)
                 let timing = ChunkTiming(
-                    timestamp: Date(),
-                    audioStart: sessionSeconds(result.range.start),
-                    audioEnd:   sessionSeconds(result.range.end)
+                    timestamp: timestampFor(audioStart),
+                    audioStart: audioStart,
+                    audioEnd: audioEnd
                 )
                 let confidence = aggregateConfidence(result.text)
-                await renderer.handle(.finalized(channel: channel, seq: seq, source: text, timing: timing, confidence: confidence))
-                if willTranslate {
-                    chunkBuilder.yield((seq, text))
-                }
+                await reconciler.receive(ChunkReconciler.Candidate(
+                    locale: locale,
+                    text: text,
+                    timing: timing,
+                    confidence: confidence
+                ))
             } else {
                 await renderer.handle(.volatile(channel: channel, text: text))
             }
@@ -623,16 +950,29 @@ struct Pipeline {
         counter: SeqCounter,
         sessionStart: Double
     ) async throws {
-        let willTranslate = targetLocale != nil
-        let transcriber = SpeechTranscriber(
-            locale: sourceLocale,
-            transcriptionOptions: [],
-            reportingOptions: [.volatileResults, .fastResults],
-            attributeOptions: [.audioTimeRange, .transcriptionConfidence]
-        )
-        let analyzer = SpeechAnalyzer(modules: [transcriber])
+        let willTranslate = targetLocales != nil
 
-        guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
+        // One transcriber + analyzer + bounded input buffer per source locale, same
+        // as runChannel but with BoundedAnalyzerInputBuffer instead of AsyncStream so
+        // file reads are paced end-to-end by the slowest analyzer's drain rate.
+        struct PerLocaleFile {
+            let locale: Locale
+            let transcriber: SpeechTranscriber
+            let analyzer: SpeechAnalyzer
+            let inputBuffer: BoundedAnalyzerInputBuffer
+        }
+        var perLocale: [PerLocaleFile] = []
+        for src in sourceLocales {
+            let t = makeTranscriberStack(for: src)
+            let a = SpeechAnalyzer(modules: [t])
+            // Capacity 8 is enough to absorb short producer / consumer rate mismatches
+            // without ever holding more than a fraction of a second of PCM in memory:
+            // 4096 frames per chunk × 8 ≈ 32 K frames, ~0.67 s at the typical 48 kHz
+            // analyzer format and well under 1 MB for any mono / stereo float32 input.
+            perLocale.append(PerLocaleFile(locale: src, transcriber: t, analyzer: a, inputBuffer: BoundedAnalyzerInputBuffer(capacity: 8)))
+        }
+
+        guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: perLocale.map { $0.transcriber }) else {
             throw VoError.noCompatibleAudioFormat
         }
 
@@ -648,18 +988,14 @@ struct Pipeline {
         let stopper: () async -> Void = { source.stop() }
         await stops.register(AsyncStopper(action: stopper))
 
-        // Capacity 8 is enough to absorb short producer / consumer rate mismatches
-        // without ever holding more than a fraction of a second of PCM in memory:
-        // 4096 frames per chunk × 8 ≈ 32 K frames, ~0.67 s at the typical 48 kHz
-        // analyzer format and well under 1 MB for any mono / stereo float32 input.
-        let inputBuffer = BoundedAnalyzerInputBuffer(capacity: 8)
+        let inputBuffers = perLocale.map { $0.inputBuffer }
 
         // Resampler: pull one buffer at a time from the file, bridge gaps with silence
-        // exactly like runChannel does for live capture, and send into the bounded
-        // input. `send` suspends when the buffer is full, so file reads are paced by
-        // the analyzer's drain rate end-to-end. A read failure rethrows as
+        // exactly like runChannel does for live capture, and send into every bounded
+        // input. `send` suspends when any buffer is full, so file reads are paced by
+        // the slowest analyzer's drain rate end-to-end. A read failure rethrows as
         // VoError.inputFileReadFailed; the success path closes the buffer cleanly so
-        // the analyzer's results stream drains and exits.
+        // the analyzers' results streams drain and exit.
         let resampler: Task<Void, Error> = Task.detached { [inputURL] in
             var fedEndHostTime: Double? = nil
             while !Task.isCancelled {
@@ -667,70 +1003,46 @@ struct Pipeline {
                 do {
                     timed = try source.nextBuffer()
                 } catch {
-                    await inputBuffer.finish()
+                    for buf in inputBuffers { await buf.finish() }
                     throw VoError.inputFileReadFailed(url: inputURL, underlying: error)
                 }
                 guard let timed else { break }
                 let reference = fedEndHostTime ?? sessionStart
                 let h = max(timed.hostTime, reference)
                 if let silence = makeSilentBuffer(seconds: h - reference, format: analyzerFormat) {
-                    await inputBuffer.send(AnalyzerInput(buffer: silence))
+                    for buf in inputBuffers { await buf.send(AnalyzerInput(buffer: silence)) }
                 }
                 if let converted = convertBuffer(timed.buffer, to: analyzerFormat) {
-                    await inputBuffer.send(AnalyzerInput(buffer: converted))
+                    for buf in inputBuffers { await buf.send(AnalyzerInput(buffer: converted)) }
                     fedEndHostTime = h + Double(timed.buffer.frameLength) / timed.buffer.format.sampleRate
                 } else {
                     fedEndHostTime = h
                 }
             }
-            await inputBuffer.finish()
+            for buf in inputBuffers { await buf.finish() }
         }
 
         do {
-            try await analyzer.prepareToAnalyze(in: analyzerFormat)
-            try await analyzer.start(inputSequence: inputBuffer)
+            for p in perLocale {
+                try await p.analyzer.prepareToAnalyze(in: analyzerFormat)
+                try await p.analyzer.start(inputSequence: p.inputBuffer)
+            }
         } catch {
             resampler.cancel()
-            await inputBuffer.finish()
+            for buf in inputBuffers { await buf.finish() }
             await stopper()
             throw error
         }
 
-        let (chunkSeq, chunkBuilder) = AsyncStream<(Int, String)>.makeStream()
-        let renderer = renderer
-        let sourceLang = sourceLocale.language
-        let targetLang = targetLocale?.language
-        let translator: Task<Void, Never>? = willTranslate ? Task {
-            guard let targetLang else { return }
-            let box = SendableTranslationSession(inner: TranslationSession(installedSource: sourceLang, target: targetLang))
-            do {
-                try await box.inner.prepareTranslation()
-            } catch is CancellationError {
-                return
-            } catch {}
-            // See makeTranslator(): bounded TaskGroup fan-out. File mode is the
-            // hot path for this -- transcribe finalizes faster than serial translate
-            // can drain, and the commitQueue head stalls until the head's translate
-            // returns. Without this the JSONL stream emits nothing until SIGINT.
-            await withTaskGroup(of: Void.self) { group in
-                var inFlight = 0
-                for await (seq, text) in chunkSeq {
-                    if inFlight >= translateConcurrency {
-                        await group.next()
-                        inFlight -= 1
-                    }
-                    group.addTask {
-                        do {
-                            let response = try await box.inner.translate(text)
-                            await renderer.handle(.translated(seq: seq, target: response.targetText))
-                        } catch {
-                            await renderer.handle(.translated(seq: seq, target: "[translation failed: \(error.localizedDescription)]"))
-                        }
-                    }
-                    inFlight += 1
-                }
+        let lanes: [String: TranslationLane] = makeTranslationLanes()
+        let dstLangByLocale: [String: String] = {
+            guard let targetLocales else { return [:] }
+            var m: [String: String] = [:]
+            for (i, src) in sourceLocales.enumerated() {
+                m[src.identifier(.bcp47)] = targetLocales[i].identifier(.bcp47)
             }
-        } : nil
+            return m
+        }()
 
         // In file mode, anchor timestamp to a "local-TZ epoch" (wall-clock
         // 1970-01-01T00:00:00 in the renderer's local timezone) plus
@@ -752,54 +1064,63 @@ struct Pipeline {
             return cal.date(from: DateComponents(year: 1970, month: 1, day: 1)) ?? Date(timeIntervalSince1970: 0)
         }()
 
+        let rendererRef = renderer
+        let reconciler = ChunkReconciler(nLocales: sourceLocales.count) { winner in
+            let seq = await counter.next()
+            let srcLang = winner.locale.identifier(.bcp47)
+            let dstLang = dstLangByLocale[srcLang]
+            await rendererRef.handle(.finalized(
+                channel: .file,
+                seq: seq,
+                source: winner.text,
+                timing: winner.timing,
+                confidence: winner.confidence,
+                srcLangOverride: srcLang,
+                dstLangOverride: dstLang
+            ))
+            if willTranslate, let lane = lanes[srcLang] {
+                lane.builder.yield((seq, winner.text))
+            }
+        }
+
         do {
-            for try await result in transcriber.results {
-                let text = String(result.text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
-                if result.isFinal {
-                    guard !text.isEmpty else { continue }
-                    let seq = await counter.next()
-                    func sessionSeconds(_ t: CMTime) -> Double? {
-                        guard t.isValid else { return nil }
-                        let s = t.seconds
-                        return s.isFinite ? s : nil
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for p in perLocale {
+                    group.addTask {
+                        try await self.drainTranscriberResults(
+                            channel: .file,
+                            transcriber: p.transcriber,
+                            locale: p.locale,
+                            reconciler: reconciler,
+                            // A missing audio.start (invalid range) falls back to the
+                            // same anchor as audio.start = 0 (the local-TZ epoch),
+                            // not Unix epoch 00:00Z.
+                            timestampFor: { audioStart in localEpoch.addingTimeInterval(audioStart ?? 0) }
+                        )
                     }
-                    let audioStart = sessionSeconds(result.range.start)
-                    let audioEnd   = sessionSeconds(result.range.end)
-                    // A missing audio.start (invalid range) falls back to
-                    // the same anchor as audio.start = 0 (the local-TZ
-                    // epoch above), not Unix epoch 00:00Z.
-                    let timing = ChunkTiming(
-                        timestamp: localEpoch.addingTimeInterval(audioStart ?? 0),
-                        audioStart: audioStart,
-                        audioEnd:   audioEnd
-                    )
-                    let confidence = aggregateConfidence(result.text)
-                    await renderer.handle(.finalized(channel: .file, seq: seq, source: text, timing: timing, confidence: confidence))
-                    if willTranslate {
-                        chunkBuilder.yield((seq, text))
-                    }
-                } else {
-                    await renderer.handle(.volatile(channel: .file, text: text))
                 }
+                try await group.waitForAll()
             }
         } catch {
             resampler.cancel()
-            // Close the bounded buffer so a resampler suspended in `send` (buffer
+            // Close the bounded buffers so a resampler suspended in `send` (buffer
             // full at the moment the drain threw) is unblocked. Without this, cancel
             // alone leaves the CheckedContinuation unresumed and the resampler task
             // strands, leaking its frame and the buffered AVAudioPCMBuffers.
-            await inputBuffer.finish()
-            chunkBuilder.finish()
-            translator?.cancel()
+            for buf in inputBuffers { await buf.finish() }
+            for lane in lanes.values { lane.builder.finish() }
+            for lane in lanes.values { lane.translator.cancel() }
             await stopper()
+            await reconciler.finish()
             throw error
         }
 
         await stopper()
-        chunkBuilder.finish()
-        await translator?.value
+        await reconciler.finish()
+        for lane in lanes.values { lane.builder.finish() }
+        for lane in lanes.values { await lane.translator.value }
         // The analyzer's results finished because the resampler closed the input
-        // buffer. If the close was preceded by a read failure, that failure is still
+        // buffers. If the close was preceded by a read failure, that failure is still
         // pending on the resampler's value; rethrow it here so a corrupt / truncated
         // file does not surface as a clean exit.
         try await resampler.value
@@ -836,7 +1157,12 @@ struct Pipeline {
     /// framework only downloads via a UI confirmation sheet, which a CLI cannot
     /// present, so an uninstalled pair would otherwise fail silently on every
     /// chunk. Fail fast with install instructions instead.
+    ///
+    /// Same-language pairs (e.g. `ja-JP → ja-JP` in a bidi setup) are a no-op
+    /// passthrough handled in `makeTranslator`; `LanguageAvailability.status`
+    /// reports them as `.unsupported`, which would otherwise abort startup.
     private func ensureTranslationModel(source: Locale, target: Locale) async throws {
+        if isSameLanguage(source, target) { return }
         let status = await LanguageAvailability().status(from: source.language, to: target.language)
         switch status {
         case .installed:
@@ -878,6 +1204,15 @@ private func aggregateConfidence(_ text: AttributedString) -> ChunkConfidence? {
     guard weight > 0 else { return nil }
     let round3 = { (x: Double) in (x * 1000).rounded() / 1000 }
     return ChunkConfidence(mean: round3(weightedSum / Double(weight)), min: round3(lowest))
+}
+
+/// Two locales share the same underlying language. Used to detect the passthrough
+/// case in bidi setups (e.g. `--src en-US,ja-JP --dst ja-JP,ja-JP` where the second
+/// pair is `ja-JP → ja-JP`, meaning leave the source untranslated). Compares the
+/// language code only, so `ja-JP` / `ja` / `ja-Hira-JP` all match.
+private func isSameLanguage(_ a: Locale, _ b: Locale) -> Bool {
+    guard let lhs = a.language.languageCode, let rhs = b.language.languageCode else { return false }
+    return lhs == rhs
 }
 
 /// Current host time in seconds on the mach timebase, matching the `hostTime` that captured

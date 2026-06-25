@@ -27,9 +27,14 @@ struct ChunkConfidence: Sendable {
 }
 
 /// Events fed into Renderer from the pipeline.
+///
+/// `srcLangOverride` / `dstLangOverride` exist for multi-source (auto-detect)
+/// mode, where each finalized chunk's locale is decided per-utterance rather
+/// than fixed by the renderer's constructor. Single-locale callers leave them
+/// nil and the renderer's `sourceLang` / `targetLang` defaults apply.
 enum RenderEvent: Sendable {
     case volatile(channel: AudioChannel, text: String)
-    case finalized(channel: AudioChannel, seq: Int, source: String, timing: ChunkTiming, confidence: ChunkConfidence?)
+    case finalized(channel: AudioChannel, seq: Int, source: String, timing: ChunkTiming, confidence: ChunkConfidence?, srcLangOverride: String? = nil, dstLangOverride: String? = nil)
     case translated(seq: Int, target: String)
     case eof
 }
@@ -57,6 +62,11 @@ actor StreamRenderer: Renderer {
         let source: String
         let timing: ChunkTiming
         let confidence: ChunkConfidence?
+        /// Per-chunk source-locale override (multi-source auto-detect mode). nil
+        /// means fall back to the renderer's constructor-time `sourceLang`.
+        let srcLangOverride: String?
+        /// Per-chunk target-locale override. nil → renderer's `targetLang`.
+        let dstLangOverride: String?
         var target: String?
     }
 
@@ -111,11 +121,11 @@ actor StreamRenderer: Renderer {
             volatileTexts[channel] = text
             if mode == .tty { redrawLiveRegion() }
 
-        case .finalized(let channel, let seq, let source, let timing, let confidence):
+        case .finalized(let channel, let seq, let source, let timing, let confidence, let srcLangOverride, let dstLangOverride):
             volatileTexts[channel] = ""
             finalizedCount += 1
             if translationEnabled {
-                commitQueue.append(Pair(seq: seq, channel: channel, source: source, timing: timing, confidence: confidence, target: nil))
+                commitQueue.append(Pair(seq: seq, channel: channel, source: source, timing: timing, confidence: confidence, srcLangOverride: srcLangOverride, dstLangOverride: dstLangOverride, target: nil))
                 // Drain before redrawing. drainCommitQueue clears the live region
                 // as a side effect, so the reverse order would blank the pending
                 // "(translating…)" lines until the next event arrives.
@@ -124,7 +134,7 @@ actor StreamRenderer: Renderer {
             } else {
                 // No translation: commit immediately, source-only.
                 if mode == .tty { clearLiveRegion() }
-                emitSourceOnly(channel: channel, seq: seq, source: source, timing: timing, confidence: confidence)
+                emitSourceOnly(channel: channel, seq: seq, source: source, timing: timing, confidence: confidence, srcLangOverride: srcLangOverride)
                 if mode == .tty { redrawLiveRegion() }
             }
 
@@ -169,13 +179,13 @@ actor StreamRenderer: Renderer {
         }
     }
 
-    private func emitSourceOnly(channel: AudioChannel, seq: Int, source: String, timing: ChunkTiming, confidence: ChunkConfidence?) {
+    private func emitSourceOnly(channel: AudioChannel, seq: Int, source: String, timing: ChunkTiming, confidence: ChunkConfidence?, srcLangOverride: String?) {
         // Skip the JSONSerialization unless someone is going to consume it. In TTY
         // mode with no transcript sink (e.g. `vo < /dev/null` where stdout is a TTY
         // but stdin isn't, so SessionLog is never opened) the serialized bytes
         // would just be thrown away.
         let jsonl: String? = (mode == .jsonl || logSink != nil)
-            ? buildJSONL(seq: seq, channel: channel, source: source, target: nil, timing: timing, confidence: confidence, includeTarget: false)
+            ? buildJSONL(seq: seq, channel: channel, source: source, target: nil, timing: timing, confidence: confidence, includeTarget: false, srcLangOverride: srcLangOverride, dstLangOverride: nil)
             : nil
 
         if let jsonl { logSink?.append(jsonl) }
@@ -190,7 +200,7 @@ actor StreamRenderer: Renderer {
 
     private func emitCommittedPair(pair: Pair, target: String?) {
         let jsonl: String? = (mode == .jsonl || logSink != nil)
-            ? buildJSONL(seq: pair.seq, channel: pair.channel, source: pair.source, target: target, timing: pair.timing, confidence: pair.confidence, includeTarget: translationEnabled)
+            ? buildJSONL(seq: pair.seq, channel: pair.channel, source: pair.source, target: target, timing: pair.timing, confidence: pair.confidence, includeTarget: translationEnabled, srcLangOverride: pair.srcLangOverride, dstLangOverride: pair.dstLangOverride)
             : nil
 
         if let jsonl { logSink?.append(jsonl) }
@@ -199,7 +209,16 @@ actor StreamRenderer: Renderer {
         case .tty:
             writeLine("\(ttyHeader(pair.timing.timestamp, pair.channel))\(pair.source)")
             if let target {
-                writeLine("\(sourceColumnPad)\u{001B}[38;5;244m\(target)\u{001B}[0m")
+                // Skip the translation line in TTY when the (src → dst) is a
+                // passthrough: same locale on both sides and identical text.
+                // JSONL still emits the redundant `dst` because downstream readers
+                // may rely on the schema being uniform across chunks.
+                let srcLang = pair.srcLangOverride ?? self.sourceLang
+                let dstLang = pair.dstLangOverride ?? self.targetLang
+                let isPassthrough = srcLang == dstLang && target == pair.source
+                if !isPassthrough {
+                    writeLine("\(sourceColumnPad)\u{001B}[38;5;244m\(target)\u{001B}[0m")
+                }
             } else {
                 writeLine("\(sourceColumnPad)\u{001B}[38;5;240m(no translation)\u{001B}[0m")
             }
@@ -215,10 +234,14 @@ actor StreamRenderer: Renderer {
         target: String?,
         timing: ChunkTiming,
         confidence: ChunkConfidence?,
-        includeTarget: Bool
+        includeTarget: Bool,
+        srcLangOverride: String?,
+        dstLangOverride: String?
     ) -> String? {
         var obj: [String: Any] = jsonlBase(seq: seq, channel: channel, timing: timing)
-        var srcObj: [String: Any] = ["lang": sourceLang, "text": source]
+        let srcLang = srcLangOverride ?? self.sourceLang
+        let dstLang = dstLangOverride ?? self.targetLang
+        var srcObj: [String: Any] = ["lang": srcLang, "text": source]
         if let confidence {
             srcObj["confidence"] = [
                 "mean": StreamRenderer.decimal3(confidence.mean),
@@ -227,8 +250,8 @@ actor StreamRenderer: Renderer {
         }
         obj["src"] = srcObj
         if includeTarget {
-            obj["dst"] = target.map { ["lang": targetLang, "text": $0] }
-                ?? ["lang": targetLang, "text": NSNull()]
+            obj["dst"] = target.map { ["lang": dstLang, "text": $0] }
+                ?? ["lang": dstLang, "text": NSNull()]
         }
         return jsonString(obj)
     }
