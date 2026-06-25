@@ -390,6 +390,18 @@ actor ChunkReconciler {
     }
 
     private func emitWinner(from region: PendingRegion) async {
+        // Skip if this region's audio range was already represented by an earlier
+        // emission. The receive-time check only protects against late-arriving
+        // candidates; two pendings can each survive `receive` (non-overlapping at
+        // creation) and then have one expand via a bridging candidate to absorb
+        // the other's range before the laggard's timer fires. Without this second
+        // check the laggard would double-emit. Prune by the region's own start so
+        // the list stays bounded across the actor's lifetime.
+        recentlyEmitted.removeAll { $0.unionEnd <= region.unionStart }
+        if recentlyEmitted.contains(where: { overlaps(aStart: $0.unionStart, aEnd: $0.unionEnd, bStart: region.unionStart, bEnd: region.unionEnd) }) {
+            return
+        }
+
         guard let winner = region.candidates.values.max(by: {
             ($0.confidence?.mean ?? 0) < ($1.confidence?.mean ?? 0)
         }) else { return }
