@@ -556,8 +556,17 @@ struct Pipeline {
             try await ensureSpeechAsset(locale: locale)
         }
         if let targetLocales {
-            for (src, dst) in zip(sourceLocales, targetLocales) {
-                try await ensureTranslationModel(source: src, target: dst)
+            // Listen.parseLocaleList already rejects unequal --src / --dst lengths
+            // at the CLI boundary, but pin the invariant here so a future caller
+            // that bypasses Listen (a test, an embedding) gets a clear crash
+            // instead of a silently truncated `zip` that skips validation for
+            // some pairs and later traps on `targetLocales[i]` out of bounds.
+            precondition(
+                sourceLocales.count == targetLocales.count,
+                "Pipeline requires sourceLocales.count == targetLocales.count; Listen.parseLocaleList enforces this at the CLI boundary."
+            )
+            for i in sourceLocales.indices {
+                try await ensureTranslationModel(source: sourceLocales[i], target: targetLocales[i])
             }
         }
 
