@@ -734,14 +734,21 @@ struct Pipeline {
             makeCapture: makeCapture
         )
 
-        // Warm each model / ANE in parallel with the now-flowing capture so the
-        // first finalized chunk comes back in ~1.45 s instead of ~2.2 s. If
-        // any prepare/start throws, the resampler we just spawned would be
-        // orphaned, so cancel it explicitly before propagating.
+        // Warm each model / ANE concurrently — both with the now-flowing capture
+        // and with each other across locales — so the first finalized chunk
+        // comes back in ~1.45 s instead of ~2.2 s and adding source locales does
+        // not multiply startup latency by ANE compile time. If any prepare/start
+        // throws, the resampler we just spawned would be orphaned, so cancel it
+        // explicitly before propagating.
         do {
-            for p in perLocale {
-                try await p.analyzer.prepareToAnalyze(in: analyzerFormat)
-                try await p.analyzer.start(inputSequence: p.inputSeq)
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for p in perLocale {
+                    group.addTask {
+                        try await p.analyzer.prepareToAnalyze(in: analyzerFormat)
+                        try await p.analyzer.start(inputSequence: p.inputSeq)
+                    }
+                }
+                try await group.waitForAll()
             }
         } catch {
             resampler.cancel()
@@ -1141,10 +1148,18 @@ struct Pipeline {
             for buf in inputBuffers { await buf.finish() }
         }
 
+        // Same parallel warm-up as runChannel: prepareToAnalyze + start fan out
+        // across locales so multi-source file mode does not multiply startup
+        // latency by ANE compile time per locale.
         do {
-            for p in perLocale {
-                try await p.analyzer.prepareToAnalyze(in: analyzerFormat)
-                try await p.analyzer.start(inputSequence: p.inputBuffer)
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for p in perLocale {
+                    group.addTask {
+                        try await p.analyzer.prepareToAnalyze(in: analyzerFormat)
+                        try await p.analyzer.start(inputSequence: p.inputBuffer)
+                    }
+                }
+                try await group.waitForAll()
             }
         } catch {
             resampler.cancel()
