@@ -210,12 +210,17 @@ actor StreamRenderer: Renderer {
             writeLine("\(ttyHeader(pair.timing.timestamp, pair.channel))\(pair.source)")
             if let target {
                 // Skip the translation line in TTY when the (src → dst) is a
-                // passthrough: same locale on both sides and identical text.
-                // JSONL still emits the redundant `dst` because downstream readers
-                // may rely on the schema being uniform across chunks.
+                // passthrough: same language on both sides and identical text.
+                // Compare language subtags so this matches Pipeline.isSameLanguage,
+                // which decides upstream passthrough by language code only.
+                // Otherwise --src ja-JP --dst ja (same language, different region)
+                // would be a passthrough in the translator (text echoed) but the
+                // TTY would still print the redundant line. JSONL still emits the
+                // redundant `dst` because downstream readers may rely on the
+                // schema being uniform across chunks.
                 let srcLang = pair.srcLangOverride ?? self.sourceLang
                 let dstLang = pair.dstLangOverride ?? self.targetLang
-                let isPassthrough = srcLang == dstLang && target == pair.source
+                let isPassthrough = sameLanguageSubtag(srcLang, dstLang) && target == pair.source
                 if !isPassthrough {
                     writeLine("\(sourceColumnPad)\u{001B}[38;5;244m\(target)\u{001B}[0m")
                 }
@@ -225,6 +230,18 @@ actor StreamRenderer: Renderer {
         case .jsonl:
             if let jsonl { writeLine(jsonl) }
         }
+    }
+
+    /// True when two BCP-47 strings name the same primary language regardless of
+    /// region or script (e.g. `ja-JP` matches `ja`). Used to decide TTY passthrough
+    /// suppression consistently with `Pipeline.isSameLanguage`. Returns false when
+    /// either side has no parseable language subtag, so a malformed identifier
+    /// never suppresses output silently.
+    private func sameLanguageSubtag(_ a: String, _ b: String) -> Bool {
+        let aCode = Locale(identifier: a).language.languageCode?.identifier
+        let bCode = Locale(identifier: b).language.languageCode?.identifier
+        guard let aCode, let bCode else { return false }
+        return aCode == bCode
     }
 
     private func buildJSONL(
