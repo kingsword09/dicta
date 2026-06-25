@@ -624,6 +624,17 @@ struct Pipeline {
         for locale in sourceLocales {
             try await ensureSpeechAsset(locale: locale)
         }
+        // Listen.parseLocaleList already rejects duplicate --src entries at the
+        // CLI boundary, but pin the invariant here so a future caller (a test,
+        // an embedding) gets a clear crash instead of subtle misrouting:
+        // ChunkReconciler's candidate dictionary, `lastSeenStart`, the
+        // dstLangByLocale map, and the translation lanes table are all keyed by
+        // `identifier(.bcp47)`, so a duplicate would silently collapse two
+        // configured pairs into one and break dedup / routing.
+        precondition(
+            Set(sourceLocales.map { $0.identifier(.bcp47) }).count == sourceLocales.count,
+            "Pipeline requires sourceLocales to be unique by BCP-47 identifier; Listen.parseLocaleList enforces this at the CLI boundary."
+        )
         if let targetLocales {
             // Listen.parseLocaleList already rejects unequal --src / --dst lengths
             // at the CLI boundary, but pin the invariant here so a future caller
