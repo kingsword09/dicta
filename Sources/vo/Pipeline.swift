@@ -275,6 +275,16 @@ actor ChunkReconciler {
     /// audio range (see `recentlyEmittedPruneBoundary`), not wall clock, so a slow
     /// transcriber that lags the fast one by seconds still hits this guard.
     private var recentlyEmitted: [EmittedRegion] = []
+    /// Defensive cap on `recentlyEmitted`. The boundary-based prune only advances
+    /// once every locale has contributed a valid-timing chunk, so a misconfigured
+    /// bidi run where one of the configured locales is never actually spoken
+    /// (transcriber never finalizes anything usable) would otherwise let the list
+    /// grow without bound. On overflow we sort and drop the oldest entries by
+    /// `unionEnd`; a very-late candidate for one of those dropped utterances could
+    /// then double-emit, but the user has long since moved past it. ~1024 entries
+    /// at ~6 utterances/minute is roughly three hours of normal speech before the
+    /// cap kicks in, which means well-configured runs never hit it.
+    private let recentlyEmittedCap = 1024
     /// Latest `audioStart` observed per locale (BCP-47 identifier → max start).
     /// Pruning recentlyEmitted by the *current* candidate's start was unsafe in
     /// multi-source mode: a faster transcriber could advance far enough that
@@ -455,6 +465,14 @@ actor ChunkReconciler {
             unionStart: region.unionStart,
             unionEnd: region.unionEnd
         ))
+        // Apply the defensive cap. In a healthy run the boundary prune above
+        // already keeps recentlyEmitted small, so this overflow path stays
+        // dormant; only triggers in misconfigured bidi where one locale never
+        // contributes a valid-timing finalized chunk.
+        if recentlyEmitted.count > recentlyEmittedCap {
+            recentlyEmitted.sort { $0.unionEnd < $1.unionEnd }
+            recentlyEmitted.removeFirst(recentlyEmitted.count - recentlyEmittedCap)
+        }
 
         await onEmit(winner)
     }
