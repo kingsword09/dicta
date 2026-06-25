@@ -414,6 +414,98 @@ actor ChunkReconciler {
     }
 }
 
+/// Per-channel hybrid leaderboard for partial (volatile) transcripts in multi-source
+/// mode. Each locale's transcriber yields its own stream of partial fragments while
+/// it is still recognizing; without arbitration the renderer's per-channel live
+/// region would flip between locales mid-utterance and read as flicker. The gate
+/// sits between `drainTranscriberResults` and the renderer and decides which
+/// fragment to show:
+///
+///   1. **Sticky winner**: prefer the locale that won the most recent finalized
+///      utterance on this channel. Speech tends to stay in one language for
+///      several utterances in a row, so this stays stable across them.
+///   2. **Override**: if another locale's latest volatile mean confidence beats
+///      the sticky winner's by `overrideThreshold` (default 0.15), switch to it.
+///      This catches a real language switch without flipping on close scores.
+///   3. **Staleness**: drop scores older than `staleThreshold` so a transcriber
+///      that went quiet does not strand the live region with old text.
+///
+/// `nLocales == 1` short-circuits straight to the renderer so single-source mode
+/// keeps its existing zero-overhead path.
+actor VolatileGate {
+    private struct Score {
+        let text: String
+        let mean: Double
+        let receivedAt: Date
+    }
+    private let channel: AudioChannel
+    private let renderer: any Renderer
+    private let nLocales: Int
+    private let overrideThreshold: Double
+    private let staleThreshold: TimeInterval
+    private var scores: [String: Score] = [:]
+    private var sticky: String?
+
+    init(
+        channel: AudioChannel,
+        renderer: any Renderer,
+        nLocales: Int,
+        overrideThreshold: Double = 0.15,
+        staleThreshold: TimeInterval = 1.0
+    ) {
+        self.channel = channel
+        self.renderer = renderer
+        self.nLocales = nLocales
+        self.overrideThreshold = overrideThreshold
+        self.staleThreshold = staleThreshold
+    }
+
+    /// Record a partial fragment from one source locale and forward the currently
+    /// preferred fragment (per the sticky / override / staleness rules above) to
+    /// the renderer's live region.
+    func update(locale: Locale, text: String, mean: Double) async {
+        if nLocales == 1 {
+            await renderer.handle(.volatile(channel: channel, text: text))
+            return
+        }
+        let key = locale.identifier(.bcp47)
+        let now = Date()
+        scores[key] = Score(text: text, mean: mean, receivedAt: now)
+        for (k, v) in scores where now.timeIntervalSince(v.receivedAt) > staleThreshold {
+            scores.removeValue(forKey: k)
+        }
+        guard let chosen = pickLeader() else { return }
+        await renderer.handle(.volatile(channel: channel, text: chosen.text))
+    }
+
+    /// Record which locale won the latest finalized utterance. Called from the
+    /// reconciler's emit path so the next utterance's sticky preference matches
+    /// the speaker's most recently confirmed language.
+    func setStickyWinner(_ locale: String) {
+        sticky = locale
+        // Drop the accumulated leaderboard so the next utterance starts on a
+        // clean slate; the sticky alone seeds the next decision until new
+        // volatiles populate the table.
+        scores.removeAll()
+    }
+
+    private func pickLeader() -> Score? {
+        if let sticky, let stickyScore = scores[sticky] {
+            let bestOther = scores
+                .filter { $0.key != sticky }
+                .values
+                .max(by: { $0.mean < $1.mean })
+            if let bestOther, bestOther.mean - stickyScore.mean > overrideThreshold {
+                return bestOther
+            }
+            return stickyScore
+        }
+        // No sticky yet, or the sticky's most recent score aged out of the
+        // table; pick by raw mean among whatever is current.
+        return scores.values.max(by: { $0.mean < $1.mean })
+    }
+}
+
 /// End-to-end pipeline that orchestrates one or more audio channels.
 ///
 /// For each enabled channel:
@@ -658,9 +750,14 @@ struct Pipeline {
             return m
         }()
 
+        let volatileGate = VolatileGate(channel: channel, renderer: renderer, nLocales: sourceLocales.count)
+
         // Reconciler: receives finalized candidates from every per-locale transcriber,
         // picks a winner per utterance, and assigns the renderer's monotonic `seq` at
         // emission time so renderer source-order commit stays unaffected by reconciliation.
+        // It also nudges the VolatileGate's sticky preference toward the winner so the
+        // next utterance's live region defaults to the same language unless a
+        // competing locale clearly outscores it.
         let rendererRef = renderer
         let reconciler = ChunkReconciler(nLocales: sourceLocales.count) { winner in
             let seq = await counter.next()
@@ -678,11 +775,11 @@ struct Pipeline {
             if willTranslate, let lane = lanes[srcLang] {
                 lane.builder.yield((seq, winner.text))
             }
+            await volatileGate.setStickyWinner(srcLang)
         }
 
-        // Drain each transcriber's results concurrently. Volatile updates from every
-        // locale flow straight to the renderer (the live region is per-channel, not
-        // per-locale, so the latest-arriving fragment wins); finalized chunks go to
+        // Drain each transcriber's results concurrently. Volatile updates go through
+        // the gate (per-channel arbitration across locales); finalized chunks go to
         // the reconciler with a wall-clock-now timestamp.
         do {
             try await withThrowingTaskGroup(of: Void.self) { group in
@@ -693,6 +790,7 @@ struct Pipeline {
                             transcriber: p.transcriber,
                             locale: p.locale,
                             reconciler: reconciler,
+                            volatileGate: volatileGate,
                             timestampFor: { _ in Date() }
                         )
                     }
@@ -870,9 +968,10 @@ struct Pipeline {
         }
     }
 
-    /// Drain one transcriber's result stream. Volatile previews flow straight to the
-    /// renderer's per-channel live region; finalized chunks become candidates fed to
-    /// the per-channel `ChunkReconciler`, which picks one winner per utterance across
+    /// Drain one transcriber's result stream. Volatile previews go through the
+    /// per-channel `VolatileGate` (which arbitrates between locales so the live
+    /// region does not flicker); finalized chunks become candidates fed to the
+    /// per-channel `ChunkReconciler`, which picks one winner per utterance across
     /// every source-locale transcriber sharing the channel.
     ///
     /// `timestampFor` returns the wall-clock instant a finalized chunk represents.
@@ -883,9 +982,9 @@ struct Pipeline {
         transcriber: SpeechTranscriber,
         locale: Locale,
         reconciler: ChunkReconciler,
+        volatileGate: VolatileGate,
         timestampFor: @Sendable (Double?) -> Date
     ) async throws {
-        let renderer = renderer
         for try await result in transcriber.results {
             // SpeechTranscriber emits every chunk after the first with a leading
             // space (stream-concatenation artifact). Trim so TTY columns stay
@@ -924,7 +1023,13 @@ struct Pipeline {
                     confidence: confidence
                 ))
             } else {
-                await renderer.handle(.volatile(channel: channel, text: text))
+                // Volatile partials may not always carry transcriptionConfidence
+                // (the attribute is requested but Apple does not guarantee per-run
+                // values mid-recognition); a nil aggregate falls back to mean 0 so
+                // the gate at worst degrades to "first arrival wins" without
+                // crashing the leaderboard comparison.
+                let mean = aggregateConfidence(result.text)?.mean ?? 0
+                await volatileGate.update(locale: locale, text: text, mean: mean)
             }
         }
     }
@@ -1064,6 +1169,8 @@ struct Pipeline {
             return cal.date(from: DateComponents(year: 1970, month: 1, day: 1)) ?? Date(timeIntervalSince1970: 0)
         }()
 
+        let volatileGate = VolatileGate(channel: .file, renderer: renderer, nLocales: sourceLocales.count)
+
         let rendererRef = renderer
         let reconciler = ChunkReconciler(nLocales: sourceLocales.count) { winner in
             let seq = await counter.next()
@@ -1081,6 +1188,7 @@ struct Pipeline {
             if willTranslate, let lane = lanes[srcLang] {
                 lane.builder.yield((seq, winner.text))
             }
+            await volatileGate.setStickyWinner(srcLang)
         }
 
         do {
@@ -1092,6 +1200,7 @@ struct Pipeline {
                             transcriber: p.transcriber,
                             locale: p.locale,
                             reconciler: reconciler,
+                            volatileGate: volatileGate,
                             // A missing audio.start (invalid range) falls back to the
                             // same anchor as audio.start = 0 (the local-TZ epoch),
                             // not Unix epoch 00:00Z.
