@@ -303,15 +303,30 @@ private func bannerLanguagePair(sourceLocales: [Locale], targetLocales: [Locale]
 }
 
 /// Split a comma-separated locale list flag value into trimmed Locale instances.
-/// Empty list or an empty entry produces a ValidationError naming the flag.
+/// Empty list, empty entries, and duplicate locales each produce a ValidationError
+/// naming the flag. Duplicates are rejected because ChunkReconciler keys per-region
+/// candidates and TranslationLane keys translator pipes by `identifier(.bcp47)`,
+/// so a repeat would either lock the reconciler into always waiting its 300ms
+/// timeout (count stays under nLocales because two transcribers share one slot)
+/// or silently overwrite a translator lane. Newlines are trimmed alongside spaces
+/// so `--src "$(cat list.txt)"`-style usage does not leak a trailing newline into
+/// the SpeechTranscriber locale lookup later.
 private func parseLocaleList(_ raw: String, flag: String) throws -> [Locale] {
     let parts = raw.split(separator: ",", omittingEmptySubsequences: false).map {
-        $0.trimmingCharacters(in: .whitespaces)
+        $0.trimmingCharacters(in: .whitespacesAndNewlines)
     }
     guard !parts.isEmpty, parts.allSatisfy({ !$0.isEmpty }) else {
         throw ValidationError("\(flag) cannot be empty or contain empty entries.")
     }
-    return parts.map { Locale(identifier: $0) }
+    let locales = parts.map { Locale(identifier: $0) }
+    var seen: Set<String> = []
+    for locale in locales {
+        let id = locale.identifier(.bcp47)
+        if !seen.insert(id).inserted {
+            throw ValidationError("\(flag) contains duplicate locale \(id).")
+        }
+    }
+    return locales
 }
 
 /// Wrap a string in a 256-color foreground SGR escape. Matches the renderer's palette.
