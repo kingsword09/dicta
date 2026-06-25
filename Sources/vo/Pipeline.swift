@@ -272,9 +272,17 @@ actor ChunkReconciler {
     private var pendings: [PendingRegion] = []
     /// Audio-range regions that have already been emitted. A late-arriving candidate
     /// that overlaps one of these is dropped to prevent double output. Pruned by
-    /// audio range (see `receive`), not wall clock, so a slow transcriber that lags
-    /// the fast one by seconds still hits this guard.
+    /// audio range (see `recentlyEmittedPruneBoundary`), not wall clock, so a slow
+    /// transcriber that lags the fast one by seconds still hits this guard.
     private var recentlyEmitted: [EmittedRegion] = []
+    /// Latest `audioStart` observed per locale (BCP-47 identifier → max start).
+    /// Pruning recentlyEmitted by the *current* candidate's start was unsafe in
+    /// multi-source mode: a faster transcriber could advance far enough that
+    /// already-emitted regions were dropped before the slower locale caught up,
+    /// letting its late candidate for an earlier utterance create a fresh region
+    /// and double-emit. Tracking per-locale progress lets us drop a region only
+    /// after every locale has moved past it.
+    private var lastSeenStart: [String: Double] = [:]
     private var finished = false
 
     init(
@@ -312,12 +320,15 @@ actor ChunkReconciler {
             return
         }
 
-        // Drop emitted regions that ended at or before this candidate's start;
-        // each transcriber moves monotonically forward, so any future chunk's
-        // audioStart will be >= start, meaning these regions can no longer
-        // overlap anything. This keeps `recentlyEmitted` bounded without a
-        // wall-clock TTL that would race a slow-language transcriber.
-        recentlyEmitted.removeAll { $0.unionEnd <= start }
+        // Track the locale's latest start, then prune recentlyEmitted only past
+        // the slowest locale's progress (`recentlyEmittedPruneBoundary`). A
+        // per-candidate boundary would drop entries before a lagging locale's
+        // late candidate could match them, letting the late candidate form a
+        // fresh region and double-emit.
+        let locKey = candidate.locale.identifier(.bcp47)
+        lastSeenStart[locKey] = Swift.max(lastSeenStart[locKey] ?? 0, start)
+        let bound = recentlyEmittedPruneBoundary()
+        recentlyEmitted.removeAll { $0.unionEnd <= bound }
 
         // A candidate overlapping a recently-emitted region was already represented
         // by an earlier winner; drop to prevent double output.
@@ -425,9 +436,11 @@ actor ChunkReconciler {
         // candidates; two pendings can each survive `receive` (non-overlapping at
         // creation) and then have one expand via a bridging candidate to absorb
         // the other's range before the laggard's timer fires. Without this second
-        // check the laggard would double-emit. Prune by the region's own start so
-        // the list stays bounded across the actor's lifetime.
-        recentlyEmitted.removeAll { $0.unionEnd <= region.unionStart }
+        // check the laggard would double-emit. Use the same per-locale safe
+        // boundary as receive so a slow transcriber's late candidate still finds
+        // its earlier region in recentlyEmitted instead of being treated as new.
+        let bound = recentlyEmittedPruneBoundary()
+        recentlyEmitted.removeAll { $0.unionEnd <= bound }
         if recentlyEmitted.contains(where: { overlaps(aStart: $0.unionStart, aEnd: $0.unionEnd, bStart: region.unionStart, bEnd: region.unionEnd) }) {
             return
         }
@@ -444,6 +457,18 @@ actor ChunkReconciler {
         ))
 
         await onEmit(winner)
+    }
+
+    /// Safe boundary for pruning `recentlyEmitted`. Returns the smallest
+    /// `audioStart` any locale has reported so far; an emitted region with
+    /// `unionEnd <= boundary` can no longer overlap any future candidate from
+    /// any locale (each transcriber moves monotonically forward), so it is safe
+    /// to drop. Returns 0 until every locale has contributed at least one
+    /// valid-timing candidate, because a locale we have not seen yet might
+    /// still send a chunk for an earlier audio range.
+    private func recentlyEmittedPruneBoundary() -> Double {
+        guard lastSeenStart.count >= nLocales else { return 0 }
+        return lastSeenStart.values.min() ?? 0
     }
 
     private func overlaps(aStart: Double, aEnd: Double, bStart: Double, bEnd: Double) -> Bool {
