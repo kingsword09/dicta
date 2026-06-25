@@ -474,9 +474,11 @@ actor VolatileGate {
         let key = locale.identifier(.bcp47)
         let now = Date()
         scores[key] = Score(text: text, mean: mean, receivedAt: now)
-        for (k, v) in scores where now.timeIntervalSince(v.receivedAt) > staleThreshold {
-            scores.removeValue(forKey: k)
-        }
+        // Rebuild the table rather than mutate-while-iterating; Swift's Dictionary
+        // traps with "Dictionary mutated while being enumerated" if we both walk
+        // and remove from the same instance, and this runs on every volatile
+        // partial in multi-locale mode (hot path).
+        scores = scores.filter { _, v in now.timeIntervalSince(v.receivedAt) <= staleThreshold }
         guard let chosen = pickLeader() else { return }
         await renderer.handle(.volatile(channel: channel, text: chosen.text))
     }
