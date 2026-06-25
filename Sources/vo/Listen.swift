@@ -292,7 +292,9 @@ private func printFileBanner(
 
 /// Render the locale list pair shown in the banner. Single-locale collapses to the
 /// familiar "en-US" / "en-US → ja-JP" forms; multi-locale uses a comma-separated
-/// list on each side matching what the user typed.
+/// list of normalized BCP-47 identifiers on each side (so `en_US` shows as
+/// `en-US`, surrounding whitespace already stripped by `parseLocaleList`), which
+/// may differ slightly from the exact text the user typed.
 private func bannerLanguagePair(sourceLocales: [Locale], targetLocales: [Locale]?) -> String {
     let srcStr = sourceLocales.map { $0.identifier(.bcp47) }.joined(separator: ",")
     if let targetLocales {
