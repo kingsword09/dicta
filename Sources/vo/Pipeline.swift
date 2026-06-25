@@ -321,28 +321,54 @@ actor ChunkReconciler {
             return
         }
 
-        if let idx = pendings.firstIndex(where: { p in
-            overlaps(aStart: p.unionStart, aEnd: p.unionEnd, bStart: start, bEnd: end)
-        }) {
+        let overlappingIdxs = pendings.indices.filter { i in
+            overlaps(aStart: pendings[i].unionStart, aEnd: pendings[i].unionEnd, bStart: start, bEnd: end)
+        }
+
+        if let primary = overlappingIdxs.first {
+            // Fold every other overlapping pending into the primary. A bridging
+            // candidate that spans two near-adjacent regions (each opened earlier
+            // by a different locale that did not yet overlap) would otherwise
+            // leave the secondary regions stranded; their timers fire later and
+            // are dropped by the emitWinner check, taking any high-confidence
+            // candidates they held down with them. Merging here keeps the best
+            // candidate per locale across all overlapping regions.
+            for j in overlappingIdxs.dropFirst().reversed() {
+                let other = pendings[j]
+                other.timeoutTask?.cancel()
+                for (key, c) in other.candidates {
+                    if let existing = pendings[primary].candidates[key] {
+                        if (c.confidence?.mean ?? 0) > (existing.confidence?.mean ?? 0) {
+                            pendings[primary].candidates[key] = c
+                        }
+                    } else {
+                        pendings[primary].candidates[key] = c
+                    }
+                }
+                pendings[primary].unionStart = Swift.min(pendings[primary].unionStart, other.unionStart)
+                pendings[primary].unionEnd = Swift.max(pendings[primary].unionEnd, other.unionEnd)
+                pendings.remove(at: j)
+            }
+
             // Same locale arriving twice (e.g. two short fragments from one transcriber
             // overlapping one chunk from the other) keeps the higher-mean one. The
             // alternative — replacing unconditionally — would discard a high-confidence
             // first fragment in favour of a noisy continuation.
             let key = candidate.locale.identifier(.bcp47)
-            if let existing = pendings[idx].candidates[key] {
+            if let existing = pendings[primary].candidates[key] {
                 let existingMean = existing.confidence?.mean ?? 0
                 let newMean = candidate.confidence?.mean ?? 0
                 if newMean > existingMean {
-                    pendings[idx].candidates[key] = candidate
+                    pendings[primary].candidates[key] = candidate
                 }
             } else {
-                pendings[idx].candidates[key] = candidate
+                pendings[primary].candidates[key] = candidate
             }
-            pendings[idx].unionStart = Swift.min(pendings[idx].unionStart, start)
-            pendings[idx].unionEnd = Swift.max(pendings[idx].unionEnd, end)
+            pendings[primary].unionStart = Swift.min(pendings[primary].unionStart, start)
+            pendings[primary].unionEnd = Swift.max(pendings[primary].unionEnd, end)
 
-            if pendings[idx].candidates.count >= nLocales {
-                let region = pendings.remove(at: idx)
+            if pendings[primary].candidates.count >= nLocales {
+                let region = pendings.remove(at: primary)
                 region.timeoutTask?.cancel()
                 await emitWinner(from: region)
             }
