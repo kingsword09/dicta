@@ -235,8 +235,13 @@ final class RebindBox: @unchecked Sendable {
 ///   - all N source locales have contributed a candidate, or
 ///   - 300 ms has elapsed since the first candidate for that region arrived
 /// The winner is the candidate with the highest `confidence.mean`. A candidate that
-/// arrives after its region already fired is dropped via the short-lived
-/// `recentlyEmitted` window so the same utterance never emits twice.
+/// arrives after its region already fired is dropped via the `recentlyEmitted` audio
+/// range list so the same utterance never emits twice. We prune that list by audio
+/// range (not wall clock) because a slow-language transcriber can lag the fast one
+/// by seconds on long utterances; a wall-clock TTL would expire too early and let
+/// the laggard double-emit. Since each transcriber moves monotonically forward on
+/// the session timeline, an emitted region with `unionEnd <= incoming.audioStart`
+/// can never overlap a future chunk and is safe to drop.
 ///
 /// `nLocales == 1` is the legacy single-source mode; the reconciler short-circuits
 /// straight to `onEmit` with no buffering or timer, so output latency is unchanged.
@@ -259,18 +264,17 @@ actor ChunkReconciler {
     private struct EmittedRegion {
         let unionStart: Double
         let unionEnd: Double
-        let expiresAt: Date
     }
 
     private let nLocales: Int
     private let timeoutSeconds: Double
     private let onEmit: @Sendable (Candidate) async -> Void
     private var pendings: [PendingRegion] = []
-    /// Regions emitted within the last `recentlyEmittedTTL` seconds. A late-arriving
-    /// candidate that overlaps one of these is dropped instead of starting a fresh
-    /// pending and double-emitting the same utterance.
+    /// Audio-range regions that have already been emitted. A late-arriving candidate
+    /// that overlaps one of these is dropped to prevent double output. Pruned by
+    /// audio range (see `receive`), not wall clock, so a slow transcriber that lags
+    /// the fast one by seconds still hits this guard.
     private var recentlyEmitted: [EmittedRegion] = []
-    private let recentlyEmittedTTL: TimeInterval = 0.5
     private var finished = false
 
     init(
@@ -304,7 +308,12 @@ actor ChunkReconciler {
             return
         }
 
-        pruneExpiredEmissions()
+        // Drop emitted regions that ended at or before this candidate's start;
+        // each transcriber moves monotonically forward, so any future chunk's
+        // audioStart will be >= start, meaning these regions can no longer
+        // overlap anything. This keeps `recentlyEmitted` bounded without a
+        // wall-clock TTL that would race a slow-language transcriber.
+        recentlyEmitted.removeAll { $0.unionEnd <= start }
 
         // A candidate overlapping a recently-emitted region was already represented
         // by an earlier winner; drop to prevent double output.
@@ -389,16 +398,10 @@ actor ChunkReconciler {
         // is dropped instead of creating a new region.
         recentlyEmitted.append(EmittedRegion(
             unionStart: region.unionStart,
-            unionEnd: region.unionEnd,
-            expiresAt: Date().addingTimeInterval(recentlyEmittedTTL)
+            unionEnd: region.unionEnd
         ))
 
         await onEmit(winner)
-    }
-
-    private func pruneExpiredEmissions() {
-        let now = Date()
-        recentlyEmitted.removeAll { $0.expiresAt < now }
     }
 
     private func overlaps(aStart: Double, aEnd: Double, bStart: Double, bEnd: Double) -> Bool {
