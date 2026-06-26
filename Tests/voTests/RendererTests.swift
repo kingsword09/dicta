@@ -188,4 +188,65 @@ struct RendererTests {
 
         #expect(src(objs[0])?["confidence"] == nil)
     }
+
+    /// Per-chunk `srcLangOverride` takes precedence over the renderer's
+    /// constructor `sourceLang`. This is how the multi-source reconciler
+    /// surfaces the detected locale per utterance; without the override
+    /// JSONL would always show the constructor default.
+    @Test func srcLangOverrideOverridesConstructorDefault() async {
+        let objs = await renderJSONL(translationEnabled: false) { r in
+            await r.handle(.finalized(channel: .mic, seq: 0, source: "Bonjour", timing: timing, confidence: nil, srcLangOverride: "fr-FR", dstLangOverride: nil))
+        }
+
+        #expect(objs.count == 1)
+        #expect(src(objs[0])?["lang"] as? String == "fr-FR")
+    }
+
+    /// Per-chunk `dstLangOverride` takes precedence over the renderer's
+    /// constructor `targetLang`. Mirrors `srcLangOverride`; both knobs are
+    /// how the bidi pipeline tells the renderer which `(src → dst)` pair the
+    /// per-utterance winner belongs to.
+    @Test func dstLangOverrideOverridesConstructorDefault() async {
+        let objs = await renderJSONL(translationEnabled: true) { r in
+            await r.handle(.finalized(channel: .mic, seq: 0, source: "Hello", timing: timing, confidence: nil, srcLangOverride: nil, dstLangOverride: "zh-CN"))
+            await r.handle(.translated(seq: 0, target: "你好"))
+        }
+
+        #expect(objs.count == 1)
+        #expect(dst(objs[0])?["lang"] as? String == "zh-CN")
+    }
+
+    /// Bidi scenario: a single renderer handles two utterances whose detected
+    /// source / destination locales swap. Each chunk's `src.lang` and
+    /// `dst.lang` reflects its own per-event overrides, not the constructor
+    /// defaults, so a downstream reader sees the actual routing per chunk.
+    @Test func perChunkOverridesSupportBidirectionalRouting() async {
+        let objs = await renderJSONL(translationEnabled: true) { r in
+            await r.handle(.finalized(channel: .mic, seq: 0, source: "Hello", timing: timing, confidence: nil, srcLangOverride: "en-US", dstLangOverride: "ja-JP"))
+            await r.handle(.translated(seq: 0, target: "こんにちは"))
+            await r.handle(.finalized(channel: .speaker, seq: 1, source: "元気ですか", timing: timing, confidence: nil, srcLangOverride: "ja-JP", dstLangOverride: "en-US"))
+            await r.handle(.translated(seq: 1, target: "How are you"))
+        }
+
+        #expect(objs.count == 2)
+        #expect(src(objs[0])?["lang"] as? String == "en-US")
+        #expect(dst(objs[0])?["lang"] as? String == "ja-JP")
+        #expect(src(objs[1])?["lang"] as? String == "ja-JP")
+        #expect(dst(objs[1])?["lang"] as? String == "en-US")
+    }
+
+    /// When neither override is set, the renderer falls back to its
+    /// constructor `sourceLang` / `targetLang`. Single-source mode relies on
+    /// this fallback; spelling it out as a test guards against a future
+    /// refactor that always emits the override values.
+    @Test func nilOverridesFallBackToConstructorDefaults() async {
+        let objs = await renderJSONL(translationEnabled: true) { r in
+            await r.handle(.finalized(channel: .mic, seq: 0, source: "Hello", timing: timing, confidence: nil))
+            await r.handle(.translated(seq: 0, target: "こんにちは"))
+        }
+
+        #expect(objs.count == 1)
+        #expect(src(objs[0])?["lang"] as? String == "en-US")
+        #expect(dst(objs[0])?["lang"] as? String == "ja-JP")
+    }
 }
