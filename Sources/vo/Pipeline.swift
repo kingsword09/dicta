@@ -528,7 +528,9 @@ actor VolatileGate {
     }
     private let channel: AudioChannel
     private let renderer: any Renderer
-    private let nLocales: Int
+    /// Exposed as nonisolated so callers can skip work (e.g. aggregateConfidence)
+    /// when the gate is going to ignore it. `nLocales` is immutable after init.
+    nonisolated let nLocales: Int
     private let overrideThreshold: Double
     private let staleThreshold: TimeInterval
     private var scores: [String: Score] = [:]
@@ -1144,8 +1146,12 @@ struct Pipeline {
                 // (the attribute is requested but Apple does not guarantee per-run
                 // values mid-recognition); a nil aggregate falls back to mean 0 so
                 // the gate at worst degrades to "first arrival wins" without
-                // crashing the leaderboard comparison.
-                let mean = aggregateConfidence(result.text)?.mean ?? 0
+                // crashing the leaderboard comparison. Skip the aggregation
+                // entirely in single-source mode where the gate ignores the value
+                // (volatile partials are a ~50/sec hot path on live capture).
+                let mean: Double = volatileGate.nLocales > 1
+                    ? (aggregateConfidence(result.text)?.mean ?? 0)
+                    : 0
                 await volatileGate.update(locale: locale, text: text, mean: mean)
             }
         }
