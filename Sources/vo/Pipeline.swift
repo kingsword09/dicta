@@ -919,10 +919,15 @@ struct Pipeline {
         } catch {
             resampler.cancel()
             for b in inputBuilders { b.finish() }
+            // Drain pending reconciler winners BEFORE closing the lanes, mirroring
+            // the success-path order below. emitWinner's onEmit yields into
+            // lane.builder; once the builder is finished those yields are silently
+            // dropped, leaving the renderer's commitQueue holding an untranslated
+            // pair the error path then has no way to satisfy.
+            await reconciler.finish()
             for lane in lanes.values { lane.builder.finish() }
             for lane in lanes.values { lane.translator.cancel() }
             await stopper()
-            await reconciler.finish()
             throw error
         }
 
@@ -1348,10 +1353,15 @@ struct Pipeline {
             // alone leaves the CheckedContinuation unresumed and the resampler task
             // strands, leaking its frame and the buffered AVAudioPCMBuffers.
             for buf in inputBuffers { await buf.finish() }
+            // Drain pending reconciler winners BEFORE closing the lanes, mirroring
+            // the success-path order below. emitWinner's onEmit yields into
+            // lane.builder; once the builder is finished those yields are silently
+            // dropped, leaving the renderer's commitQueue holding an untranslated
+            // pair the error path then has no way to satisfy.
+            await reconciler.finish()
             for lane in lanes.values { lane.builder.finish() }
             for lane in lanes.values { lane.translator.cancel() }
             await stopper()
-            await reconciler.finish()
             throw error
         }
 
