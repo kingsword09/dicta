@@ -8,6 +8,7 @@ https://github.com/user-attachments/assets/6c11b6bc-395f-4593-8eca-856c4e7fbc93
 
 - Live transcription via Apple's [`SpeechTranscriber`](https://developer.apple.com/documentation/speech/speechtranscriber) (on-device, no network)
 - Live translation via [`TranslationSession`](https://developer.apple.com/documentation/translation/translationsession) (on-device)
+- Bidirectional / multi-locale interpretation via comma-separated `--src` / `--dst` (e.g. `--src en-US,ja-JP --dst ja-JP,en-US` in one process)
 - Mic and system speaker captured as separate channels
 - On-disk audio file as input via `--input` (any format `AVAudioFile` reads), runs as fast as the analyzer can keep up
 - Strict source-order output, even when translations arrive out of order
@@ -124,12 +125,33 @@ Mic and speaker capture are bypassed in this mode. `--input` is mutually exclusi
 
 File reads are paced by the analyzer's drain rate via a bounded internal buffer, so memory stays small even for multi-hour files. A mid-stream read failure (truncated, corrupt, or disconnected-volume file) exits with an error naming the path, rather than silently producing a partial transcript.
 
+### Bidirectional translation
+
+`--src` and `--dst` accept comma-separated locale lists, position-paired. Each `--src` entry runs its own `SpeechTranscriber` in parallel, and the matching `--dst` entry is the translation target for that source.
+
+```console
+$ vo --src en-US,ja-JP --dst ja-JP,en-US
+```
+
+The command above turns `vo` into a single bidirectional interpreter. English speech becomes Japanese output, and Japanese speech becomes English output, all from one process.
+
+For each utterance, `vo` listens with every `--src` transcriber in parallel, waits up to 300 ms after the first finalized candidate so slower locales can contribute, and emits the candidate with the highest `src.confidence.mean`. Its translation is routed to the position-paired `--dst`. `seq` is assigned at decision time, so the renderer's strict source-order guarantee still holds. A late candidate that overlaps an already-emitted utterance is dropped so the same utterance is never doubled.
+
+A same-language pair such as `--dst ja-JP,ja-JP` short-circuits the Translation framework (which rejects same-language pairs as unsupported) and passes the source text through as `dst.text`. The TTY view skips the redundant translation line in that case, while JSONL keeps `dst` present so consumers see a stable schema.
+
+The single-locale form (`--src en-US --dst ja-JP`) takes a fast path with no buffering and no timer, so its behaviour and latency match earlier releases.
+
+```console
+$ vo --src en-US,ja-JP --dst ja-JP,ja-JP   # English in to ja, Japanese in passthrough
+$ vo --src en-US,ja-JP                     # transcribe-only, language auto-picked per utterance
+```
+
 ### Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--src` | system locale | Source locale (BCP-47, must be in `SpeechTranscriber.supportedLocales`) |
-| `--dst` | (none) | Target locale. Omit to skip translation |
+| `--src` | system locale | Source locale(s), BCP-47. Comma-separated for auto-detect (e.g. `en-US,ja-JP`); each entry must be in `SpeechTranscriber.supportedLocales` |
+| `--dst` | (none) | Target locale(s), BCP-47. Comma-separated and position-paired with `--src` (e.g. `--src en-US,ja-JP --dst ja-JP,en-US` for bidirectional interpretation). Omit to skip translation |
 | `--no-mic` | (off, mic on) | Disable microphone capture |
 | `--no-speaker` | (off, speaker on) | Disable system audio capture |
 | `--select-device` | off | Interactively pick (and pin) the mic / speaker device at startup. Needs a terminal |
