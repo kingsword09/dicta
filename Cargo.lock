@@ -1839,7 +1839,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vo-asr"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "async-trait",
  "thiserror 2.0.18",
@@ -1848,7 +1848,7 @@ dependencies = [
 
 [[package]]
 name = "vo-asr-doubao"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1868,7 +1868,7 @@ dependencies = [
 
 [[package]]
 name = "vo-asr-native-adapter"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "async-trait",
  "serde_json",
@@ -1879,7 +1879,7 @@ dependencies = [
 
 [[package]]
 name = "vo-asr-openai-compatible"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -1892,7 +1892,7 @@ dependencies = [
 
 [[package]]
 name = "vo-audio"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "cc",
  "cpal",
@@ -1902,7 +1902,7 @@ dependencies = [
 
 [[package]]
 name = "vo-cli"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1920,7 +1920,7 @@ dependencies = [
 
 [[package]]
 name = "vo-core"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "chrono",
  "serde",
@@ -1930,7 +1930,7 @@ dependencies = [
 
 [[package]]
 name = "vo-web"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "js-sys",
  "serde",
