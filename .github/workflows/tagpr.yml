@@ -26,7 +26,36 @@ jobs:
   assets:
     needs: tagpr
     if: needs.tagpr.outputs.tagpr-tag != ''
-    runs-on: macos-26
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            archive_suffix: linux_x86_64
+            bin: target/release/vo
+            exe_name: vo
+            archive_ext: tar.gz
+          - os: ubuntu-24.04-arm
+            archive_suffix: linux_arm64
+            bin: target/release/vo
+            exe_name: vo
+            archive_ext: tar.gz
+          - os: macos-26
+            archive_suffix: darwin_arm64
+            bin: target/release/vo
+            exe_name: vo
+            archive_ext: tar.gz
+          - os: windows-latest
+            archive_suffix: windows_x86_64
+            bin: target/release/vo.exe
+            exe_name: vo.exe
+            archive_ext: zip
+          - os: windows-11-arm
+            archive_suffix: windows_arm64
+            bin: target/release/vo.exe
+            exe_name: vo.exe
+            archive_ext: zip
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: write
     steps:
@@ -36,27 +65,47 @@ jobs:
           ref: ${{ needs.tagpr.outputs.tagpr-tag }}
           fetch-depth: 0
 
+      - name: Install Linux audio dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+
       - name: Show toolchain
         run: |
-          sw_vers
-          xcode-select -p
-          swift --version
+          rustc --version
+          cargo --version
 
       - name: Build release binary
-        run: ./scripts/build.sh
+        run: cargo build --release -p vo-cli
+
+      - name: Build Apple Swift adapter
+        if: matrix.archive_suffix == 'darwin_arm64'
+        run: ./scripts/build-apple-swift-adapter.sh
 
       - name: Package archive
         id: pkg
         run: |
           TAG="${{ needs.tagpr.outputs.tagpr-tag }}"
           VERSION="${TAG#v}"
-          BIN="$(swift build -c release --arch arm64 --show-bin-path)/vo"
+          BIN="${{ matrix.bin }}"
           STAGE="$(mktemp -d)"
-          cp "$BIN" "$STAGE/vo"
+          cp "$BIN" "$STAGE/${{ matrix.exe_name }}"
+          if [ "${{ matrix.archive_suffix }}" = "darwin_arm64" ]; then
+            ADAPTER_BIN="$(cd legacy/apple-swift-adapter && swift build -c release --arch arm64 --show-bin-path)/vo"
+            cp "$ADAPTER_BIN" "$STAGE/vo-apple-adapter"
+          fi
           cp LICENSE README.md "$STAGE/"
-          ARCHIVE="vo_v${VERSION}_darwin_arm64.tar.gz"
-          tar -C "$STAGE" -czf "$ARCHIVE" .
+          ARCHIVE="vo_v${VERSION}_${{ matrix.archive_suffix }}.${{ matrix.archive_ext }}"
+          LATEST_ARCHIVE="vo_${{ matrix.archive_suffix }}.${{ matrix.archive_ext }}"
+          if [ "${{ matrix.archive_ext }}" = "zip" ]; then
+            7z a "$ARCHIVE" "$STAGE"/*
+            cp "$ARCHIVE" "$LATEST_ARCHIVE"
+          else
+            tar -C "$STAGE" -czf "$ARCHIVE" .
+            cp "$ARCHIVE" "$LATEST_ARCHIVE"
+          fi
           echo "archive=${ARCHIVE}" >> "$GITHUB_OUTPUT"
+          echo "latest_archive=${LATEST_ARCHIVE}" >> "$GITHUB_OUTPUT"
+        shell: bash
 
       - name: Upload assets to release
         env:
@@ -64,7 +113,9 @@ jobs:
         run: |
           gh release upload "${{ needs.tagpr.outputs.tagpr-tag }}" \
             "${{ steps.pkg.outputs.archive }}" \
+            "${{ steps.pkg.outputs.latest_archive }}" \
             --clobber
+        shell: bash
 
   release:
     needs: [tagpr, assets]

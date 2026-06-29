@@ -13,7 +13,8 @@ func runListen(
     voiceProcessing: Bool,
     selectDevice: Bool,
     input: String?,
-    transcript: String?
+    transcript: String?,
+    eventJson: Bool = false
 ) async throws {
     let inputURL: URL?
     if let input {
@@ -75,7 +76,7 @@ func runListen(
         selectedDevices = try selectDevicesInteractively(mic: mic, speaker: speaker)
     }
 
-    let mode = detectRenderMode(jsonForced: json)
+    let mode = detectRenderMode(jsonForced: json || eventJson)
     let isTTY = (mode == .tty)
 
     // Stream JSONL to disk as utterances finalize, so memory stays bounded for long
@@ -85,7 +86,7 @@ func runListen(
     // e.g. piped JSONL run), skip the temp file entirely so we don't burn disk I/O
     // writing bytes we know we are about to discard, and don't leave a large temp
     // behind on a SIGKILL.
-    let canSaveTranscript = transcript != nil || (isTTY && canPromptForLog())
+    let canSaveTranscript = !eventJson && (transcript != nil || (isTTY && canPromptForLog()))
     let sessionLog: SessionLog? = canSaveTranscript ? try SessionLog.open(explicitPath: transcript) : nil
 
     // If we throw out of this function before finalizeSession runs (e.g. the pipeline
@@ -107,14 +108,22 @@ func runListen(
     // single-channel live modes (--no-mic / --no-speaker) suppress [mic] / [spk].
     let showChannelLabel = inputURL == nil && mic && speaker
 
-    let renderer = StreamRenderer(
-        mode: mode,
-        sourceLang: primarySource.identifier(.bcp47),
-        targetLang: primaryTarget?.identifier(.bcp47) ?? "",
-        translationEnabled: targetLocales != nil,
-        showChannelLabel: showChannelLabel,
-        logSink: sessionLog
-    )
+    let sourceLang = primarySource.identifier(.bcp47)
+    let targetLang = primaryTarget?.identifier(.bcp47)
+    let renderer: any Renderer = eventJson
+        ? EventJSONRenderer(
+            sourceLang: sourceLang,
+            targetLang: targetLang,
+            translationEnabled: targetLocales != nil
+        )
+        : StreamRenderer(
+            mode: mode,
+            sourceLang: sourceLang,
+            targetLang: targetLang ?? "",
+            translationEnabled: targetLocales != nil,
+            showChannelLabel: showChannelLabel,
+            logSink: sessionLog
+        )
 
     let pipeline = Pipeline(
         sourceLocales: sourceLocales,
@@ -129,7 +138,20 @@ func runListen(
     )
 
     let startedAt = Date()
-    if isTTY {
+    if eventJson {
+        let deviceLabels = inputURL == nil
+            ? resolvedCaptureDeviceLabels(mic: mic, speaker: speaker, selected: selectedDevices)
+            : (mic: nil as CaptureDeviceLabel?, speaker: nil as CaptureDeviceLabel?)
+        await emitMetaEvent(
+            renderer: renderer,
+            sourceLocales: sourceLocales,
+            targetLocales: targetLocales,
+            mic: inputURL == nil && mic,
+            speaker: inputURL == nil && speaker,
+            micDevice: deviceLabels.mic,
+            speakerDevice: deviceLabels.speaker
+        )
+    } else if isTTY {
         if let inputURL {
             printFileBanner(
                 inputURL: inputURL,
@@ -155,33 +177,40 @@ func runListen(
     // have two readLine calls fighting over stdin).
     let finalizeGate = FinalizeGate()
 
-    let signalSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-    signalSource.setEventHandler {
-        Task {
-            // Stop the audio sources before the save prompt blocks. Otherwise mic
-            // and speaker capture keep running for as long as the user is reading
-            // the prompt, which is wasted work and a small privacy footgun.
-            await pipeline.cancel()
-            guard await finalizeGate.claim() else {
-                // Finalization is already underway (a repeat Ctrl-C, likely at the
-                // save prompt). Abort hard but leave the temp file in place so the
-                // captured session is still recoverable.
-                Foundation.exit(130)
+    let signalSource: DispatchSourceSignal?
+    if eventJson {
+        signalSource = nil
+    } else {
+        let source = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+        source.setEventHandler {
+            Task {
+                // Stop the audio sources before the save prompt blocks. Otherwise mic
+                // and speaker capture keep running for as long as the user is reading
+                // the prompt, which is wasted work and a small privacy footgun.
+                await pipeline.cancel()
+                guard await finalizeGate.claim() else {
+                    // Finalization is already underway (a repeat Ctrl-C, likely at the
+                    // save prompt). Abort hard but leave the temp file in place so the
+                    // captured session is still recoverable.
+                    Foundation.exit(130)
+                }
+                await renderer.handle(.eof)
+                await renderer.flush()
+                let count = await renderer.utteranceCount
+                await finalizeSession(
+                    sessionLog: sessionLog,
+                    isTTY: isTTY,
+                    count: count,
+                    duration: Date().timeIntervalSince(startedAt)
+                )
+                Foundation.exit(0)
             }
-            await renderer.handle(.eof)
-            await renderer.flush()
-            let count = await renderer.utteranceCount
-            await finalizeSession(
-                sessionLog: sessionLog,
-                isTTY: isTTY,
-                count: count,
-                duration: Date().timeIntervalSince(startedAt)
-            )
-            Foundation.exit(0)
         }
+        signal(SIGINT, SIG_IGN)
+        source.resume()
+        signalSource = source
     }
-    signal(SIGINT, SIG_IGN)
-    signalSource.resume()
+    _ = signalSource
 
     try await pipeline.run()
 
@@ -217,6 +246,32 @@ private actor FinalizeGate {
         claimed = true
         return true
     }
+}
+
+private func emitMetaEvent(
+    renderer: any Renderer,
+    sourceLocales: [Locale],
+    targetLocales: [Locale]?,
+    mic: Bool,
+    speaker: Bool,
+    micDevice: CaptureDeviceLabel?,
+    speakerDevice: CaptureDeviceLabel?
+) async {
+    var devices: [LiveDeviceEvent] = []
+    if let micDevice {
+        devices.append(LiveDeviceEvent(channel: .mic, name: micDevice.name, pinned: micDevice.pinned))
+    }
+    if let speakerDevice {
+        devices.append(LiveDeviceEvent(channel: .speaker, name: speakerDevice.name, pinned: speakerDevice.pinned))
+    }
+    await renderer.handle(.meta(
+        backend: "apple",
+        src: sourceLocales.map { $0.identifier(.bcp47) }.joined(separator: ","),
+        dst: targetLocales?.map { $0.identifier(.bcp47) }.joined(separator: ","),
+        mic: mic,
+        speaker: speaker,
+        devices: devices
+    ))
 }
 
 /// Close the session log, run save/discard logic, then print the exit summary.

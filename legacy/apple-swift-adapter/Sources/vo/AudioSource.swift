@@ -403,7 +403,7 @@ extension AVAudioPCMBuffer {
 /// AsyncStream. The intent is end-to-end backpressure for file mode. A push stream that
 /// reads ahead would let memory grow proportionally to (disk-speed − analyzer-speed) ×
 /// duration on long files, breaking the "memory stays bounded across long sessions"
-/// invariant CLAUDE.md asserts. Pull keeps exactly one decoded buffer alive at a time
+    /// invariant AGENTS.md asserts. Pull keeps exactly one decoded buffer alive at a time
 /// here and the bounded analyzer-input buffer caps the rest.
 ///
 /// `TimedBuffer.hostTime` is the cumulative playback position on the file's own

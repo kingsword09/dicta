@@ -75,7 +75,7 @@ actor StopRegistry {
 /// (~50 buffers/sec mic, similar speaker), so unboundedness there is bounded in
 /// practice. A file feeder has no such pacing and would otherwise let memory grow
 /// proportionally to (read-speed − analyze-speed) × duration on long files, violating
-/// the "memory stays bounded across long sessions" invariant CLAUDE.md asserts.
+/// the "memory stays bounded across long sessions" invariant AGENTS.md asserts.
 ///
 /// Conforms to AsyncSequence so it can be passed straight to
 /// `SpeechAnalyzer.start(inputSequence:)`.
@@ -1045,10 +1045,11 @@ struct Pipeline {
     /// TranslationSession is non-Sendable so we create it inside the Task closure.
     private func makeTranslator(source: Locale, target: Locale, chunkSeq: AsyncStream<(Int, String)>) -> Task<Void, Never> {
         let renderer = renderer
+        let targetIdentifier = target.identifier(.bcp47)
         if isSameLanguage(source, target) {
             return Task {
                 for await (seq, text) in chunkSeq {
-                    await renderer.handle(.translated(seq: seq, target: text))
+                    await renderer.handle(.translated(seq: seq, target: text, dstLangOverride: targetIdentifier))
                 }
             }
         }
@@ -1081,9 +1082,9 @@ struct Pipeline {
                     group.addTask {
                         do {
                             let response = try await box.inner.translate(text)
-                            await renderer.handle(.translated(seq: seq, target: response.targetText))
+                            await renderer.handle(.translated(seq: seq, target: response.targetText, dstLangOverride: targetIdentifier))
                         } catch {
-                            await renderer.handle(.translated(seq: seq, target: "[translation failed: \(error.localizedDescription)]"))
+                            await renderer.handle(.translated(seq: seq, target: "[translation failed: \(error.localizedDescription)]", dstLangOverride: targetIdentifier))
                         }
                     }
                     inFlight += 1

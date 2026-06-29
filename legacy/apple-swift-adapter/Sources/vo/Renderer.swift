@@ -33,15 +33,23 @@ struct ChunkConfidence: Sendable {
 /// than fixed by the renderer's constructor. Single-locale callers leave them
 /// nil and the renderer's `sourceLang` / `targetLang` defaults apply.
 enum RenderEvent: Sendable {
+    case meta(backend: String, src: String, dst: String?, mic: Bool, speaker: Bool, devices: [LiveDeviceEvent])
     case volatile(channel: AudioChannel, text: String)
     case finalized(channel: AudioChannel, seq: Int, source: String, timing: ChunkTiming, confidence: ChunkConfidence?, srcLangOverride: String? = nil, dstLangOverride: String? = nil)
-    case translated(seq: Int, target: String)
+    case translated(seq: Int, target: String, dstLangOverride: String? = nil)
     case eof
+}
+
+struct LiveDeviceEvent: Sendable {
+    let channel: AudioChannel
+    let name: String
+    let pinned: Bool
 }
 
 protocol Renderer: Sendable {
     func handle(_ event: RenderEvent) async
     func flush() async
+    var utteranceCount: Int { get async }
 }
 
 /// Renderer that keeps source order strict and supports multiple audio channels.
@@ -117,6 +125,9 @@ actor StreamRenderer: Renderer {
     func handle(_ event: RenderEvent) async {
         if isShuttingDown { return }
         switch event {
+        case .meta:
+            break
+
         case .volatile(let channel, let text):
             volatileTexts[channel] = text
             if mode == .tty { redrawLiveRegion() }
@@ -138,7 +149,7 @@ actor StreamRenderer: Renderer {
                 if mode == .tty { redrawLiveRegion() }
             }
 
-        case .translated(let seq, let target):
+        case .translated(let seq, let target, _):
             if let idx = commitQueue.firstIndex(where: { $0.seq == seq }) {
                 commitQueue[idx].target = target
             }
@@ -485,6 +496,139 @@ actor StreamRenderer: Renderer {
             try? out.write(contentsOf: data)
         }
     }
+}
+
+/// Headless event sink used by the Rust CLI. It deliberately avoids TTY rendering,
+/// transcript prompts, and session summaries; Rust owns those CLI responsibilities.
+actor EventJSONRenderer: Renderer {
+    private let out: FileHandle
+    private let sourceLang: String
+    private let targetLang: String?
+    private var finalizedCount: Int = 0
+    private var isShuttingDown = false
+
+    var utteranceCount: Int { finalizedCount }
+
+    init(
+        sourceLang: String,
+        targetLang: String?,
+        translationEnabled _: Bool,
+        out: FileHandle = .standardOutput
+    ) {
+        self.sourceLang = sourceLang
+        self.targetLang = targetLang
+        self.out = out
+    }
+
+    func handle(_ event: RenderEvent) async {
+        if isShuttingDown { return }
+        switch event {
+        case .meta(let backend, let src, let dst, let mic, let speaker, let devices):
+            var obj: [String: Any] = [
+                "type": "meta",
+                "backend": backend,
+                "src": src,
+                "mic": mic,
+                "speaker": speaker,
+                "devices": devices.map {
+                    [
+                        "channel": $0.channel.rawValue,
+                        "name": $0.name,
+                        "pinned": $0.pinned,
+                    ] as [String: Any]
+                },
+            ]
+            if let dst {
+                obj["dst"] = dst
+            }
+            writeObject(obj)
+
+        case .volatile(let channel, let text):
+            writeObject([
+                "type": "volatile",
+                "channel": channel.rawValue,
+                "text": text,
+            ])
+
+        case .finalized(let channel, let seq, let source, let timing, let confidence, let srcLangOverride, _):
+            finalizedCount += 1
+            var obj = jsonlBase(seq: seq, channel: channel, timing: timing)
+            var srcObj: [String: Any] = [
+                "lang": srcLangOverride ?? sourceLang,
+                "text": source,
+            ]
+            if let confidence {
+                srcObj["confidence"] = [
+                    "mean": Self.decimal3(confidence.mean),
+                    "min": Self.decimal3(confidence.min),
+                ]
+            }
+            obj["type"] = "finalized"
+            obj["src"] = srcObj
+            writeObject(obj)
+
+        case .translated(let seq, let target, let dstLangOverride):
+            var obj: [String: Any] = [
+                "type": "translated",
+                "seq": seq,
+                "text": target,
+            ]
+            if let lang = dstLangOverride ?? targetLang {
+                obj["lang"] = lang
+            }
+            writeObject(obj)
+
+        case .eof:
+            writeObject(["type": "eof"])
+            isShuttingDown = true
+        }
+    }
+
+    func flush() async {
+        try? out.synchronize()
+    }
+
+    private func jsonlBase(seq: Int, channel: AudioChannel, timing: ChunkTiming) -> [String: Any] {
+        var obj: [String: Any] = [
+            "seq": seq,
+            "channel": channel.rawValue,
+            "timestamp": Self.iso8601.string(from: timing.timestamp),
+        ]
+        if let start = timing.audioStart, let end = timing.audioEnd {
+            obj["audio"] = [
+                "start": Self.decimal3(start),
+                "end": Self.decimal3(end),
+            ]
+        }
+        return obj
+    }
+
+    private func writeObject(_ obj: [String: Any]) {
+        guard
+            let data = try? JSONSerialization.data(withJSONObject: obj),
+            let line = String(data: data, encoding: .utf8)
+        else {
+            return
+        }
+        writeLine(line)
+    }
+
+    private func writeLine(_ s: String) {
+        if let data = (s + "\n").data(using: .utf8) {
+            try? out.write(contentsOf: data)
+        }
+    }
+
+    private static func decimal3(_ x: Double) -> Decimal {
+        Decimal(Int((x * 1000).rounded())) / 1000
+    }
+
+    nonisolated(unsafe) private static let iso8601: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        f.timeZone = .current
+        return f
+    }()
 }
 
 /// Decide which mode to use. If `jsonForced` is true, always JSONL; otherwise auto-detect via isatty.

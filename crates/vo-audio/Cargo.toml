@@ -1,0 +1,11 @@
+[package]
+name = "vo-audio"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+cpal.workspace = true
+hound.workspace = true
+thiserror.workspace = true

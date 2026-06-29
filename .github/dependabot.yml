@@ -12,8 +12,6 @@ updates:
         patterns:
           - "*"
     open-pull-requests-limit: 10
-    assignees:
-      - "k1LoW"
     commit-message:
       prefix: "chore"
       include: "scope"

@@ -2,5 +2,5 @@
 	vPrefix = true
 	releaseBranch = main
 	release = draft
-	versionFile = Sources/vo/Vo.swift
+	versionFile = Cargo.toml
 	command = "./scripts/sync-version.sh"

@@ -64,6 +64,34 @@ private func renderJSONLLines(
         .map(String.init)
 }
 
+private func renderEventJSONL(
+    translationEnabled: Bool,
+    targetLang: String? = "ja-JP",
+    _ body: (EventJSONRenderer) async -> Void
+) async -> [[String: Any]] {
+    let pipe = Pipe()
+    let renderer = EventJSONRenderer(
+        sourceLang: "en-US",
+        targetLang: targetLang,
+        translationEnabled: translationEnabled,
+        out: pipe.fileHandleForWriting
+    )
+
+    await body(renderer)
+    await renderer.flush()
+
+    try? pipe.fileHandleForWriting.close()
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    try? pipe.fileHandleForReading.close()
+    let text = String(decoding: data, as: UTF8.self)
+    return text
+        .split(separator: "\n")
+        .compactMap {
+            guard let d = $0.data(using: .utf8) else { return nil }
+            return (try? JSONSerialization.jsonObject(with: d)) as? [String: Any]
+        }
+}
+
 private let timing = ChunkTiming(
     timestamp: Date(timeIntervalSince1970: 1_700_000_000),
     audioStart: 0.124,
@@ -248,5 +276,34 @@ struct RendererTests {
         #expect(objs.count == 1)
         #expect(src(objs[0])?["lang"] as? String == "en-US")
         #expect(dst(objs[0])?["lang"] as? String == "ja-JP")
+    }
+}
+
+@Suite("EventJSONRenderer JSONL")
+struct EventJSONRendererTests {
+    @Test func emitsTypedLiveEventsForRustCli() async {
+        let objs = await renderEventJSONL(translationEnabled: true) { r in
+            await r.handle(.meta(
+                backend: "apple",
+                src: "en-US",
+                dst: "ja-JP",
+                mic: true,
+                speaker: false,
+                devices: [LiveDeviceEvent(channel: .mic, name: "Built-in Mic", pinned: false)]
+            ))
+            await r.handle(.volatile(channel: .mic, text: "hel"))
+            await r.handle(.finalized(channel: .mic, seq: 7, source: "hello", timing: timing, confidence: nil))
+            await r.handle(.translated(seq: 7, target: "こんにちは", dstLangOverride: "ja-JP"))
+            await r.handle(.eof)
+        }
+
+        #expect(objs.compactMap { $0["type"] as? String } == ["meta", "volatile", "finalized", "translated", "eof"])
+        #expect(objs[0]["backend"] as? String == "apple")
+        #expect((objs[0]["devices"] as? [[String: Any]])?.first?["name"] as? String == "Built-in Mic")
+        #expect(objs[1]["text"] as? String == "hel")
+        #expect(src(objs[2])?["text"] as? String == "hello")
+        #expect(objs[2]["dst"] == nil)
+        #expect(objs[3]["lang"] as? String == "ja-JP")
+        #expect(objs[3]["text"] as? String == "こんにちは")
     }
 }

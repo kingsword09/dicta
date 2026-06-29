@@ -1,9 +1,12 @@
 .DS_Store
 .build/
+**/.build/
 .swiftpm/
+**/.swiftpm/
 Packages/
 *.xcodeproj
 xcuserdata/
 DerivedData/
 dist/
 plans/
+target/

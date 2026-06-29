@@ -6,7 +6,7 @@ struct Vo: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "vo",
         abstract: "On-device live transcription and translation for macOS 26+",
-        version: "0.9.0"
+        version: "0.10.0"
     )
 
     // MARK: - Capture options
@@ -42,6 +42,9 @@ struct Vo: AsyncParsableCommand {
     @Flag(name: .long, help: "Force machine-readable JSON output. Without this, auto-detects based on whether STDOUT is a TTY.")
     var json: Bool = false
 
+    @Flag(name: .long, help: .hidden)
+    var eventJson: Bool = false
+
     @Option(name: .long, help: "Stream finalized chunks as JSONL to this path (written incrementally so you can `tail -f` it; memory stays bounded for long sessions). Skips the interactive save prompt.")
     var transcript: String?
 
@@ -62,7 +65,8 @@ struct Vo: AsyncParsableCommand {
             voiceProcessing: voiceProcessing,
             selectDevice: selectDevice,
             input: input,
-            transcript: transcript
+            transcript: transcript,
+            eventJson: eventJson
         )
     }
 }

@@ -1,0 +1,610 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>vo direct transcription</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: oklch(0.975 0.008 205);
+      --panel: oklch(0.995 0.004 205);
+      --ink: oklch(0.21 0.018 230);
+      --muted: oklch(0.48 0.018 230);
+      --line: oklch(0.86 0.012 220);
+      --field: oklch(0.985 0.006 205);
+      --accent: oklch(0.56 0.12 172);
+      --accent-strong: oklch(0.42 0.11 174);
+      --danger: oklch(0.53 0.16 28);
+      --shadow: 0 18px 50px color-mix(in oklch, var(--ink) 12%, transparent);
+      --space-xs: 4px;
+      --space-sm: 8px;
+      --space-md: 12px;
+      --space-lg: 16px;
+      --space-xl: 24px;
+      --space-2xl: 32px;
+      --space-3xl: 48px;
+      font-family: ui-sans-serif, "Avenir Next", "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      min-height: 100vh;
+      margin: 0;
+      background:
+        linear-gradient(90deg, color-mix(in oklch, var(--line) 42%, transparent) 1px, transparent 1px),
+        linear-gradient(0deg, color-mix(in oklch, var(--line) 42%, transparent) 1px, transparent 1px),
+        var(--bg);
+      background-size: 48px 48px;
+      color: var(--ink);
+    }
+
+    main {
+      width: min(1120px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: clamp(28px, 6vw, 72px) 0;
+    }
+
+    header {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: var(--space-xl);
+      align-items: end;
+      margin-bottom: var(--space-2xl);
+    }
+
+    h1 {
+      margin: 0;
+      max-width: 760px;
+      font-size: clamp(2rem, 5vw, 4.5rem);
+      line-height: 0.95;
+      letter-spacing: 0;
+      font-weight: 760;
+    }
+
+    .eyebrow {
+      margin: 0 0 var(--space-md);
+      color: var(--accent-strong);
+      font-size: 0.78rem;
+      font-weight: 760;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .status {
+      min-width: 190px;
+      padding: var(--space-md) var(--space-lg);
+      border: 1px solid var(--line);
+      background: color-mix(in oklch, var(--panel) 86%, transparent);
+      box-shadow: var(--shadow);
+      font-size: 0.95rem;
+    }
+
+    .status strong {
+      display: block;
+      margin-bottom: var(--space-xs);
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+    }
+
+    .workspace {
+      display: grid;
+      grid-template-columns: minmax(280px, 380px) minmax(0, 1fr);
+      gap: var(--space-xl);
+      align-items: start;
+    }
+
+    form,
+    .output {
+      border: 1px solid var(--line);
+      background: color-mix(in oklch, var(--panel) 94%, transparent);
+      box-shadow: var(--shadow);
+    }
+
+    form {
+      display: grid;
+      gap: var(--space-lg);
+      padding: var(--space-xl);
+    }
+
+    .field {
+      display: grid;
+      gap: var(--space-sm);
+    }
+
+    label {
+      color: var(--muted);
+      font-size: 0.82rem;
+      font-weight: 700;
+    }
+
+    input,
+    select,
+    textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 0;
+      background: var(--field);
+      color: var(--ink);
+      font: inherit;
+    }
+
+    input,
+    select {
+      min-height: 44px;
+      padding: 0 var(--space-md);
+    }
+
+    input[type="file"] {
+      padding: 10px var(--space-md);
+    }
+
+    textarea {
+      min-height: 120px;
+      resize: vertical;
+      padding: var(--space-md);
+      line-height: 1.5;
+    }
+
+    input:focus-visible,
+    select:focus-visible,
+    textarea:focus-visible,
+    button:focus-visible {
+      outline: 3px solid color-mix(in oklch, var(--accent) 34%, transparent);
+      outline-offset: 2px;
+    }
+
+    .advanced {
+      display: grid;
+      gap: var(--space-lg);
+      padding-top: var(--space-sm);
+      border-top: 1px solid var(--line);
+    }
+
+    .segmented {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      border: 1px solid var(--line);
+      background: var(--field);
+    }
+
+    .segmented label {
+      min-height: 44px;
+      display: grid;
+      place-items: center;
+      color: var(--ink);
+      cursor: pointer;
+      font-size: 0.92rem;
+      font-weight: 800;
+    }
+
+    .segmented label + label {
+      border-left: 1px solid var(--line);
+    }
+
+    .segmented input {
+      position: absolute;
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .segmented label:has(input:checked) {
+      background: var(--accent);
+      color: oklch(0.985 0.006 172);
+    }
+
+    .source-panel {
+      display: grid;
+      gap: var(--space-lg);
+    }
+
+    .source-panel[hidden] {
+      display: none;
+    }
+
+    .record-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: var(--space-sm);
+    }
+
+    button {
+      min-height: 48px;
+      border: 0;
+      border-radius: 0;
+      background: var(--accent);
+      color: oklch(0.985 0.006 172);
+      cursor: pointer;
+      font: inherit;
+      font-weight: 800;
+    }
+
+    button:hover {
+      background: var(--accent-strong);
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.58;
+    }
+
+    .output {
+      min-height: 540px;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+    }
+
+    .output-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--space-md);
+      padding: var(--space-lg) var(--space-xl);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .output-head h2 {
+      margin: 0;
+      font-size: 1rem;
+      line-height: 1.2;
+    }
+
+    .meta {
+      color: var(--muted);
+      font-size: 0.84rem;
+    }
+
+    pre {
+      margin: 0;
+      min-height: 0;
+      padding: var(--space-xl);
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font: 1rem/1.65 ui-serif, Georgia, "Times New Roman", serif;
+    }
+
+    .error {
+      color: var(--danger);
+    }
+
+    .copy-row {
+      display: flex;
+      justify-content: flex-end;
+      padding: var(--space-lg) var(--space-xl);
+      border-top: 1px solid var(--line);
+    }
+
+    .secondary {
+      width: auto;
+      min-height: 40px;
+      padding: 0 var(--space-lg);
+      border: 1px solid var(--line);
+      background: transparent;
+      color: var(--ink);
+    }
+
+    .secondary:hover {
+      background: color-mix(in oklch, var(--accent) 10%, var(--panel));
+    }
+
+    @media (max-width: 820px) {
+      header,
+      .workspace {
+        grid-template-columns: 1fr;
+      }
+
+      .status {
+        min-width: 0;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <p class="eyebrow">vo direct provider</p>
+        <h1>Transcribe without running a backend.</h1>
+      </div>
+      <div class="status" id="status" role="status" aria-live="polite">
+        <strong>Status</strong>
+        Idle
+      </div>
+    </header>
+
+    <section class="workspace">
+      <form id="form">
+        <div class="field">
+          <label for="endpoint">API base</label>
+          <input id="endpoint" name="endpoint" type="url" autocomplete="url" placeholder="https://api.example.com" required>
+        </div>
+
+        <div class="field">
+          <label for="apiKey">API key</label>
+          <input id="apiKey" name="apiKey" type="password" autocomplete="off" placeholder="sk-...">
+        </div>
+
+        <div class="field">
+          <label for="model">Model</label>
+          <input id="model" name="model" type="text" value="doubao-asr" required>
+        </div>
+
+        <div class="field">
+          <label>Audio source</label>
+          <div class="segmented" role="radiogroup" aria-label="Audio source">
+            <label>
+              <input type="radio" name="source" value="file" checked>
+              File
+            </label>
+            <label>
+              <input type="radio" name="source" value="mic">
+              Microphone
+            </label>
+          </div>
+        </div>
+
+        <div class="source-panel" id="filePanel">
+          <div class="field">
+            <label for="audio">Audio file</label>
+            <input id="audio" name="audio" type="file" accept="audio/*,.m4a,.mp3,.wav,.webm,.ogg,.flac,.aac">
+          </div>
+        </div>
+
+        <div class="source-panel" id="micPanel" hidden>
+          <div class="field">
+            <label for="recordSeconds">Record seconds</label>
+            <input id="recordSeconds" name="recordSeconds" type="number" min="1" max="300" step="1" value="8">
+          </div>
+          <div class="record-actions">
+            <button class="secondary" id="record" type="button">Record</button>
+            <button class="secondary" id="stop" type="button" disabled>Stop</button>
+          </div>
+        </div>
+
+        <div class="advanced">
+          <div class="field">
+            <label for="language">Language hint</label>
+            <input id="language" name="language" type="text" placeholder="en-US">
+          </div>
+
+          <div class="field">
+            <label for="prompt">Prompt</label>
+            <textarea id="prompt" name="prompt" placeholder="Optional vocabulary or context"></textarea>
+          </div>
+        </div>
+
+        <button id="submit" type="submit">Transcribe file</button>
+      </form>
+
+      <article class="output">
+        <div class="output-head">
+          <h2>Transcript</h2>
+          <span class="meta" id="meta">No file submitted</span>
+        </div>
+        <pre id="result">Choose a file or record from the microphone, then send audio to an OpenAI-compatible transcription endpoint.</pre>
+        <div class="copy-row">
+          <button class="secondary" id="copy" type="button">Copy</button>
+        </div>
+      </article>
+    </section>
+  </main>
+
+  <script>
+    const form = document.querySelector("#form");
+    const statusBox = document.querySelector("#status");
+    const result = document.querySelector("#result");
+    const meta = document.querySelector("#meta");
+    const submit = document.querySelector("#submit");
+    const copy = document.querySelector("#copy");
+    const filePanel = document.querySelector("#filePanel");
+    const micPanel = document.querySelector("#micPanel");
+    const audioInput = document.querySelector("#audio");
+    const recordSeconds = document.querySelector("#recordSeconds");
+    const record = document.querySelector("#record");
+    const stop = document.querySelector("#stop");
+    let recordedFile = null;
+    let recorder = null;
+    let recordTimer = null;
+    let mediaStream = null;
+
+    function transcriptionUrl(base) {
+      const trimmed = base.replace(/\/+$/, "");
+      return trimmed.endsWith("/v1")
+        ? `${trimmed}/audio/transcriptions`
+        : `${trimmed}/v1/audio/transcriptions`;
+    }
+
+    function setStatus(text) {
+      statusBox.innerHTML = `<strong>Status</strong>${text}`;
+    }
+
+    function showError(message) {
+      result.classList.add("error");
+      result.textContent = message;
+    }
+
+    function showText(text) {
+      result.classList.remove("error");
+      result.textContent = text || "(empty transcript)";
+    }
+
+    function selectedSource() {
+      return document.querySelector("input[name='source']:checked")?.value || "file";
+    }
+
+    function setSource(source) {
+      const isMic = source === "mic";
+      const selected = isMic ? "mic" : "file";
+      document.querySelectorAll("input[name='source']").forEach((input) => {
+        input.checked = input.value === selected;
+      });
+      filePanel.hidden = isMic;
+      micPanel.hidden = !isMic;
+      submit.textContent = isMic ? "Transcribe recording" : "Transcribe file";
+      meta.textContent = isMic
+        ? (recordedFile ? `${recordedFile.name} · ${(recordedFile.size / 1024 / 1024).toFixed(2)} MB` : "No recording")
+        : "No file submitted";
+    }
+
+    function stopRecording() {
+      if (recordTimer) {
+        clearTimeout(recordTimer);
+        recordTimer = null;
+      }
+      if (recorder && recorder.state !== "inactive") {
+        recorder.stop();
+      }
+    }
+
+    async function sendAudio(file, data) {
+      const endpoint = String(data.get("endpoint") || "").trim();
+      if (!endpoint || !(file instanceof File) || file.size === 0) {
+        showError("Choose an API base and a non-empty audio source.");
+        return;
+      }
+
+      const body = new FormData();
+      body.set("file", file, file.name);
+      body.set("model", String(data.get("model") || "doubao-asr"));
+      body.set("response_format", "json");
+
+      const language = String(data.get("language") || "").trim();
+      const prompt = String(data.get("prompt") || "").trim();
+      if (language) body.set("language", language);
+      if (prompt) body.set("prompt", prompt);
+
+      const headers = new Headers();
+      const apiKey = String(data.get("apiKey") || "").trim();
+      if (apiKey) headers.set("Authorization", `Bearer ${apiKey}`);
+
+      submit.disabled = true;
+      record.disabled = true;
+      setStatus("Sending");
+      meta.textContent = `${file.name} · ${(file.size / 1024 / 1024).toFixed(2)} MB`;
+      showText("Waiting for transcription...");
+
+      try {
+        const started = performance.now();
+        const response = await fetch(transcriptionUrl(endpoint), {
+          method: "POST",
+          headers,
+          body,
+        });
+        const raw = await response.text();
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${raw}`);
+        }
+
+        let parsed;
+        try {
+          parsed = JSON.parse(raw);
+        } catch {
+          parsed = { text: raw };
+        }
+
+        showText(parsed.text || raw);
+        setStatus("Complete");
+        meta.textContent = `${file.name} · ${((performance.now() - started) / 1000).toFixed(1)}s`;
+      } catch (error) {
+        setStatus("Failed");
+        showError(error instanceof Error ? error.message : String(error));
+      } finally {
+        submit.disabled = false;
+        record.disabled = false;
+      }
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const data = new FormData(form);
+      if (selectedSource() === "mic") {
+        if (!recordedFile) {
+          showError("Record microphone audio before transcribing.");
+          return;
+        }
+        await sendAudio(recordedFile, data);
+      } else {
+        await sendAudio(data.get("audio"), data);
+      }
+    });
+
+    document.querySelectorAll("input[name='source']").forEach((input) => {
+      input.addEventListener("change", () => setSource(selectedSource()));
+    });
+
+    record.addEventListener("click", async () => {
+      if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+        showError("This browser does not support microphone recording.");
+        return;
+      }
+
+      const seconds = Number(recordSeconds.value || 0);
+      if (!Number.isFinite(seconds) || seconds <= 0) {
+        showError("Record seconds must be greater than zero.");
+        return;
+      }
+
+      try {
+        recordedFile = null;
+        const chunks = [];
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        recorder = new MediaRecorder(mediaStream);
+
+        recorder.addEventListener("dataavailable", (event) => {
+          if (event.data.size > 0) chunks.push(event.data);
+        });
+        recorder.addEventListener("stop", () => {
+          mediaStream?.getTracks().forEach((track) => track.stop());
+          mediaStream = null;
+          const type = recorder.mimeType || "audio/webm";
+          const blob = new Blob(chunks, { type });
+          const ext = type.includes("mp4") ? "m4a" : "webm";
+          recordedFile = new File([blob], `vo-recording.${ext}`, { type });
+          record.disabled = false;
+          stop.disabled = true;
+          submit.disabled = false;
+          setStatus("Recorded");
+          meta.textContent = `${recordedFile.name} · ${(recordedFile.size / 1024 / 1024).toFixed(2)} MB`;
+          showText("Recording is ready. Submit it when you want transcription.");
+        });
+
+        recorder.start();
+        record.disabled = true;
+        stop.disabled = false;
+        submit.disabled = true;
+        setStatus("Recording");
+        showText(`Recording microphone for ${seconds.toFixed(0)}s...`);
+        recordTimer = setTimeout(stopRecording, seconds * 1000);
+      } catch (error) {
+        setStatus("Failed");
+        record.disabled = false;
+        stop.disabled = true;
+        submit.disabled = false;
+        showError(error instanceof Error ? error.message : String(error));
+      }
+    });
+
+    stop.addEventListener("click", stopRecording);
+
+    audioInput.addEventListener("change", () => {
+      const file = audioInput.files?.[0];
+      if (file) {
+        meta.textContent = `${file.name} · ${(file.size / 1024 / 1024).toFixed(2)} MB`;
+      }
+    });
+
+    copy.addEventListener("click", async () => {
+      await navigator.clipboard.writeText(result.textContent || "");
+      setStatus("Copied");
+    });
+
+    setSource("file");
+  </script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+[package]
+name = "vo-asr-apple-legacy"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+vo-asr.workspace = true
+vo-core.workspace = true
