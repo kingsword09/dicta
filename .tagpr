@@ -4,3 +4,4 @@
 	release = draft
 	versionFile = Cargo.toml
 	postVersionCommand = "./scripts/sync-version.sh"
+	template = ".github/tagpr-template.md"
