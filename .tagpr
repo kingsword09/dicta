@@ -3,4 +3,4 @@
 	releaseBranch = main
 	release = draft
 	versionFile = Cargo.toml
-	command = "./scripts/sync-version.sh"
+	postVersionCommand = "./scripts/sync-version.sh"
