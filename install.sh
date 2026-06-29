@@ -40,11 +40,12 @@ case "${1:-}" in
       *) exe_name="vo" ;;
     esac
     case "$exe_name" in
-      *.exe) adapter_name="vo-apple-adapter.exe" ;;
-      *) adapter_name="vo-apple-adapter" ;;
+      *.exe) adapter_name="vo-adapter-apple-speech.exe"; compat_adapter_name="vo-apple-adapter.exe" ;;
+      *) adapter_name="vo-adapter-apple-speech"; compat_adapter_name="vo-apple-adapter" ;;
     esac
     target="$install_dir/$exe_name"
     adapter_target="$install_dir/$adapter_name"
+    compat_adapter_target="$install_dir/$compat_adapter_name"
     if [ -e "$target" ]; then
       rm -f "$target"
       echo "vo install: removed $target"
@@ -54,6 +55,10 @@ case "${1:-}" in
     if [ -e "$adapter_target" ]; then
       rm -f "$adapter_target"
       echo "vo install: removed $adapter_target"
+    fi
+    if [ -e "$compat_adapter_target" ]; then
+      rm -f "$compat_adapter_target"
+      echo "vo install: removed $compat_adapter_target"
     fi
     exit 0
     ;;
@@ -99,11 +104,13 @@ esac
 if [ "$os" = "windows" ]; then
   archive_ext="zip"
   exe_name="vo.exe"
-  adapter_name="vo-apple-adapter.exe"
+  adapter_name="vo-adapter-apple-speech.exe"
+  compat_adapter_name="vo-apple-adapter.exe"
 else
   archive_ext="tar.gz"
   exe_name="vo"
-  adapter_name="vo-apple-adapter"
+  adapter_name="vo-adapter-apple-speech"
+  compat_adapter_name="vo-apple-adapter"
 fi
 
 if [ "$os" = "darwin" ] && [ "$arch" != "arm64" ]; then
@@ -193,7 +200,7 @@ else
         [ -n "$tag" ] || fail "download failed: $url"
         versioned_archive="vo_${tag}_${suffix}.${archive_ext}"
         versioned_url="https://github.com/$repo/releases/download/$tag/$versioned_archive"
-        echo "vo install: retrying legacy asset name: $versioned_url"
+        echo "vo install: retrying versioned asset name: $versioned_url"
         archive_path="$tmp/$versioned_archive"
         download_archive "$versioned_url" "$archive_path" || fail "download failed: $versioned_url"
       else
@@ -202,7 +209,7 @@ else
     else
       versioned_archive="vo_${tag}_${suffix}.${archive_ext}"
       versioned_url="$base_url/$versioned_archive"
-      echo "vo install: retrying legacy asset name: $versioned_url"
+      echo "vo install: retrying versioned asset name: $versioned_url"
       archive_path="$tmp/$versioned_archive"
       download_archive "$versioned_url" "$archive_path" || fail "download failed: $versioned_url"
     fi
@@ -230,6 +237,12 @@ chmod 755 "$target"
 adapter_path="$(find "$tmp/extract" -type f -name "$adapter_name" -perm -u+x | head -n 1)"
 if [ -z "$adapter_path" ]; then
   adapter_path="$(find "$tmp/extract" -type f -name "$adapter_name" | head -n 1)"
+fi
+if [ -z "$adapter_path" ]; then
+  adapter_path="$(find "$tmp/extract" -type f -name "$compat_adapter_name" -perm -u+x | head -n 1)"
+fi
+if [ -z "$adapter_path" ]; then
+  adapter_path="$(find "$tmp/extract" -type f -name "$compat_adapter_name" | head -n 1)"
 fi
 if [ -n "$adapter_path" ]; then
   adapter_target="$install_dir/$adapter_name"

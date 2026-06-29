@@ -79,9 +79,9 @@ jobs:
       - name: Build release binary
         run: cargo build --release -p vo-cli
 
-      - name: Build Apple Swift adapter
+      - name: Build Apple Speech adapter
         if: matrix.archive_suffix == 'darwin_arm64'
-        run: ./scripts/build-apple-swift-adapter.sh
+        run: ./scripts/build-apple-speech-adapter.sh
 
       - name: Package archive
         id: pkg
@@ -92,8 +92,8 @@ jobs:
           STAGE="$(mktemp -d)"
           cp "$BIN" "$STAGE/${{ matrix.exe_name }}"
           if [ "${{ matrix.archive_suffix }}" = "darwin_arm64" ]; then
-            ADAPTER_BIN="$(cd legacy/apple-swift-adapter && swift build -c release --arch arm64 --show-bin-path)/vo"
-            cp "$ADAPTER_BIN" "$STAGE/vo-apple-adapter"
+            ADAPTER_BIN="$(cd adapters/apple-speech && swift build -c release --arch arm64 --show-bin-path)/vo"
+            cp "$ADAPTER_BIN" "$STAGE/vo-adapter-apple-speech"
           fi
           cp LICENSE README.md "$STAGE/"
           ARCHIVE="vo_v${VERSION}_${{ matrix.archive_suffix }}.${{ matrix.archive_ext }}"

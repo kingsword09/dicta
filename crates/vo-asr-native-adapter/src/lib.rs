@@ -8,26 +8,26 @@ use vo_asr::{AsrCapabilities, AsrError, AsrOptions, AsrProvider, AsrResult, Tran
 use vo_core::{AudioInput, LiveEvent, TranscriptEvent};
 
 #[derive(Debug, Clone)]
-pub struct AppleLegacyConfig {
+pub struct NativeAdapterConfig {
     pub command: PathBuf,
 }
 
 #[derive(Debug, Clone)]
-pub struct AppleLegacyAsr {
-    config: AppleLegacyConfig,
+pub struct NativeAdapterAsr {
+    config: NativeAdapterConfig,
 }
 
-impl AppleLegacyAsr {
-    pub fn new(config: AppleLegacyConfig) -> AsrResult<Self> {
+impl NativeAdapterAsr {
+    pub fn new(config: NativeAdapterConfig) -> AsrResult<Self> {
         if config.command.as_os_str().is_empty() {
             return Err(AsrError::Config(
-                "apple legacy adapter command is required".to_owned(),
+                "native adapter command is required".to_owned(),
             ));
         }
         Ok(Self { config })
     }
 
-    pub async fn run_live(&self, options: AppleLiveOptions) -> AsrResult<()> {
+    pub async fn run_live(&self, options: NativeLiveOptions) -> AsrResult<()> {
         let mut command = self.live_command(options, false, false, true);
 
         let status = command
@@ -38,14 +38,14 @@ impl AppleLegacyAsr {
             .await
             .map_err(|err| {
                 AsrError::Request(format!(
-                    "failed to run apple legacy adapter {}: {err}",
+                    "failed to run native adapter {}: {err}",
                     self.config.command.display()
                 ))
             })?;
 
         if !status.success() {
             return Err(AsrError::Request(format!(
-                "apple legacy adapter exited with {status}"
+                "native adapter exited with {status}"
             )));
         }
 
@@ -54,7 +54,7 @@ impl AppleLegacyAsr {
 
     pub async fn run_live_events<F>(
         &self,
-        options: AppleLiveOptions,
+        options: NativeLiveOptions,
         mut on_event: F,
     ) -> AsrResult<()>
     where
@@ -68,14 +68,15 @@ impl AppleLegacyAsr {
             .spawn()
             .map_err(|err| {
                 AsrError::Request(format!(
-                    "failed to run apple legacy adapter {}: {err}",
+                    "failed to run native adapter {}: {err}",
                     self.config.command.display()
                 ))
             })?;
 
-        let stdout = child.stdout.take().ok_or_else(|| {
-            AsrError::Request("apple legacy adapter stdout was not piped".to_owned())
-        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| AsrError::Request("native adapter stdout was not piped".to_owned()))?;
         let mut lines = BufReader::new(stdout).lines();
         let mut interrupted = false;
         let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
@@ -93,7 +94,7 @@ impl AppleLegacyAsr {
                 }
                 line = lines.next_line() => {
                     let Some(line) = line.map_err(|err| {
-                        AsrError::Request(format!("failed to read apple legacy adapter stdout: {err}"))
+                        AsrError::Request(format!("failed to read native adapter stdout: {err}"))
                     })? else {
                         break;
                     };
@@ -109,13 +110,13 @@ impl AppleLegacyAsr {
 
         let status = child.wait().await.map_err(|err| {
             AsrError::Request(format!(
-                "failed to wait for apple legacy adapter {}: {err}",
+                "failed to wait for native adapter {}: {err}",
                 self.config.command.display()
             ))
         })?;
         if !interrupted && !status.success() {
             return Err(AsrError::Request(format!(
-                "apple legacy adapter exited with {status}"
+                "native adapter exited with {status}"
             )));
         }
 
@@ -124,7 +125,7 @@ impl AppleLegacyAsr {
 
     fn live_command(
         &self,
-        options: AppleLiveOptions,
+        options: NativeLiveOptions,
         force_json: bool,
         event_json: bool,
         pass_transcript: bool,
@@ -177,7 +178,7 @@ fn parse_live_event(line: &str) -> AsrResult<LiveEvent> {
 }
 
 #[derive(Debug, Clone)]
-pub struct AppleLiveOptions {
+pub struct NativeLiveOptions {
     pub src: Option<String>,
     pub dst: Option<String>,
     pub json: bool,
@@ -189,11 +190,11 @@ pub struct AppleLiveOptions {
 }
 
 #[async_trait]
-impl AsrProvider for AppleLegacyAsr {
+impl AsrProvider for NativeAdapterAsr {
     async fn transcribe(&self, input: AudioInput, options: AsrOptions) -> AsrResult<Transcript> {
         let AudioInput::File(path) = input else {
             return Err(AsrError::Input(
-                "apple legacy adapter only accepts file input".to_owned(),
+                "native adapter only accepts file input".to_owned(),
             ));
         };
 
@@ -205,7 +206,7 @@ impl AsrProvider for AppleLegacyAsr {
 
         let output = command.output().await.map_err(|err| {
             AsrError::Request(format!(
-                "failed to run apple legacy adapter {}: {err}",
+                "failed to run native adapter {}: {err}",
                 self.config.command.display()
             ))
         })?;
@@ -214,17 +215,17 @@ impl AsrProvider for AppleLegacyAsr {
 
         if !output.status.success() {
             return Err(AsrError::Request(format!(
-                "apple legacy adapter exited with {}: {}",
+                "native adapter exited with {}: {}",
                 output.status,
                 stderr.trim()
             )));
         }
 
-        parse_legacy_jsonl(&stdout)
+        parse_adapter_jsonl(&stdout)
     }
 
     fn name(&self) -> &'static str {
-        "apple-legacy"
+        "native-adapter"
     }
 
     fn capabilities(&self) -> AsrCapabilities {
@@ -236,7 +237,7 @@ impl AsrProvider for AppleLegacyAsr {
     }
 }
 
-fn parse_legacy_jsonl(stdout: &str) -> AsrResult<Transcript> {
+fn parse_adapter_jsonl(stdout: &str) -> AsrResult<Transcript> {
     let mut text = Vec::new();
     let mut language = None;
 
@@ -261,7 +262,7 @@ fn parse_legacy_jsonl(stdout: &str) -> AsrResult<Transcript> {
 
     if text.is_empty() {
         return Err(AsrError::InvalidResponse(
-            "apple legacy adapter produced no transcript text".to_owned(),
+            "native adapter produced no transcript text".to_owned(),
         ));
     }
 
@@ -276,8 +277,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_legacy_jsonl_source_text() {
-        let transcript = parse_legacy_jsonl(
+    fn parses_adapter_jsonl_source_text() {
+        let transcript = parse_adapter_jsonl(
             r#"{"seq":0,"channel":"file","timestamp":"2026-01-01T00:00:00+00:00","src":{"lang":"en-US","text":"hello"}}
 {"seq":1,"channel":"file","timestamp":"2026-01-01T00:00:01+00:00","src":{"lang":"en-US","text":"world"}}"#,
         )
@@ -288,8 +289,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_legacy_output() {
-        let err = parse_legacy_jsonl("").unwrap_err();
+    fn rejects_empty_adapter_output() {
+        let err = parse_adapter_jsonl("").unwrap_err();
 
         assert!(matches!(err, AsrError::InvalidResponse(_)));
     }
@@ -303,7 +304,7 @@ mod tests {
     }
 
     #[test]
-    fn wraps_legacy_live_transcript_event() {
+    fn wraps_adapter_live_transcript_event() {
         let event = parse_live_event(
             r#"{"seq":0,"channel":"mic","timestamp":"2026-01-01T00:00:00+00:00","src":{"lang":"en-US","text":"hello"}}"#,
         )

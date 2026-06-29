@@ -62,17 +62,18 @@ service. The current Rust provider accepts 16-bit PCM WAV input and resamples it
 to 16 kHz mono before Opus encoding. `--mic-duration` works because the Rust
 audio path records WAV.
 
-## Apple legacy
+## Native adapter / Apple Speech
 
-`--asr apple` uses `vo-asr-apple-legacy`. The provider is intentionally a bridge:
-it runs a macOS 26 Apple Swift adapter binary. Batch mode parses finalized
+`--asr apple` uses `vo-asr-native-adapter`. The provider is intentionally a
+bridge: it runs a platform-native adapter binary. The current implementation is
+`adapters/apple-speech`, a macOS 26 Swift adapter. Batch mode parses finalized
 transcript JSONL; live mode reads typed adapter events and lets the Rust CLI own
 rendering, transcript logging, and exit prompts.
 
 ```console
 $ vo --input audio.wav \
     --asr apple \
-    --apple-adapter legacy/apple-swift-adapter/.build/release/vo \
+    --native-adapter adapters/apple-speech/.build/release/vo \
     --src en-US
 ```
 
@@ -81,11 +82,12 @@ The Rust CLI can also host the adapter's live mic/speaker mode:
 ```console
 $ vo --live \
     --asr apple \
-    --apple-adapter legacy/apple-swift-adapter/.build/release/vo \
+    --native-adapter adapters/apple-speech/.build/release/vo \
     --src en-US
 ```
 
 The adapter is only available when the current OS supports Apple on-device ASR.
-Live capture remains implemented inside the isolated
-`legacy/apple-swift-adapter` project; the Rust CLI owns the top-level command
-surface and delegates Apple-only system capture/events to that adapter.
+Live capture remains implemented inside `adapters/apple-speech`; the Rust CLI
+owns the top-level command surface and delegates Apple-only system capture/events
+to that adapter. `--apple-adapter` and `VO_APPLE_ADAPTER` are still accepted as
+compatibility aliases for older scripts.
