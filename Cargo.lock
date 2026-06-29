@@ -1929,6 +1929,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "vo-web"
+version = "0.10.1"
+dependencies = [
+ "js-sys",
+ "serde",
+ "serde_json",
+ "vo-core",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "walkdir"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

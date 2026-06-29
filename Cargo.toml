@@ -7,6 +7,7 @@ members = [
     "crates/vo-audio",
     "crates/vo-cli",
     "crates/vo-core",
+    "crates/vo-web",
 ]
 resolver = "2"
 
