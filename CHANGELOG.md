@@ -1,5 +1,12 @@
 # Changelog
 
+## [v0.10.2](https://github.com/kingsword09/vo/compare/v0.10.1...v0.10.2) - 2026-06-29
+
+### Other Changes
+- fix: improve macos microphone capture fallback by @kingsword09 in https://github.com/kingsword09/vo/pull/11
+- feat: add web wasm provider audio storage crate by @kingsword09 in https://github.com/kingsword09/vo/pull/13
+- feat: add web wasm boundary and improve live shutdown by @kingsword09 in https://github.com/kingsword09/vo/pull/14
+
 ## [v0.10.1](https://github.com/kingsword09/vo/compare/v0.10.0...v0.10.1) - 2026-06-29
 
 ### Other Changes
