@@ -1132,6 +1132,31 @@ fn run_doctor(cli: &Cli) -> Result<()> {
 }
 
 fn gather_doctor_report(cli: &Cli) -> DoctorReport {
+    gather_doctor_report_with_audio(cli, default_audio_report())
+}
+
+fn default_audio_report() -> AudioReport {
+    match vo_audio::default_input_device_info() {
+        Ok(info) => AudioReport {
+            default_input_available: true,
+            name: Some(info.name),
+            sample_rate: Some(info.sample_rate),
+            channels: Some(info.channels),
+            sample_format: Some(info.sample_format),
+            error: None,
+        },
+        Err(err) => AudioReport {
+            default_input_available: false,
+            name: None,
+            sample_rate: None,
+            channels: None,
+            sample_format: None,
+            error: Some(err.to_string()),
+        },
+    }
+}
+
+fn gather_doctor_report_with_audio(cli: &Cli, audio: AudioReport) -> DoctorReport {
     let apple_support = apple_support();
     let backend_result = resolve_backend_for(cli, &apple_support);
     let resolved = backend_result
@@ -1149,24 +1174,6 @@ fn gather_doctor_report(cli: &Cli) -> DoctorReport {
             .unwrap_or("whisper-1")
             .to_owned()
     });
-    let audio = match vo_audio::default_input_device_info() {
-        Ok(info) => AudioReport {
-            default_input_available: true,
-            name: Some(info.name),
-            sample_rate: Some(info.sample_rate),
-            channels: Some(info.channels),
-            sample_format: Some(info.sample_format),
-            error: None,
-        },
-        Err(err) => AudioReport {
-            default_input_available: false,
-            name: None,
-            sample_rate: None,
-            channels: None,
-            sample_format: None,
-            error: Some(err.to_string()),
-        },
-    };
 
     DoctorReport {
         system: SystemReport {
@@ -1563,6 +1570,17 @@ mod tests {
         }
     }
 
+    fn test_audio_report() -> AudioReport {
+        AudioReport {
+            default_input_available: false,
+            name: None,
+            sample_rate: None,
+            channels: None,
+            sample_format: None,
+            error: Some("not probed during tests".to_owned()),
+        }
+    }
+
     #[test]
     fn auto_uses_doubao_when_apple_on_device_is_unavailable() {
         let cli = Cli {
@@ -1680,8 +1698,13 @@ mod tests {
             input: Some(PathBuf::from("audio.wav")),
             ..test_cli()
         };
+        let support = AppleSupport {
+            version: Some("15.6.1".to_owned()),
+            supported: false,
+            reason: "macOS 15.6.1 is below 26".to_owned(),
+        };
 
-        assert!(resolve_backend(&cli).is_err());
+        assert!(resolve_backend_for(&cli, &support).is_err());
     }
 
     #[test]
@@ -1840,7 +1863,7 @@ mod tests {
             ..test_cli()
         };
 
-        let report = gather_doctor_report(&cli);
+        let report = gather_doctor_report_with_audio(&cli, test_audio_report());
         assert!(!report.runtime.python_sidecar_required);
         assert!(report.runtime.web_direct_available);
         assert_eq!(report.system.os, std::env::consts::OS);
@@ -1858,7 +1881,7 @@ mod tests {
             ..test_cli()
         };
 
-        let report = gather_doctor_report(&cli);
+        let report = gather_doctor_report_with_audio(&cli, test_audio_report());
 
         assert_eq!(report.backend.resolved.as_deref(), Some("doubao"));
         assert_eq!(report.backend.model, vo_asr_doubao::DEFAULT_MODEL);
@@ -1880,7 +1903,7 @@ mod tests {
             ..test_cli()
         };
 
-        let report = gather_doctor_report(&cli);
+        let report = gather_doctor_report_with_audio(&cli, test_audio_report());
 
         assert!(!report.backend.api_base_configured);
         assert!(!report.backend.api_key_configured);
