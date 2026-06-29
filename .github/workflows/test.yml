@@ -15,6 +15,9 @@ jobs:
   rust:
     env:
       CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+      CARGO_HTTP_MULTIPLEXING: "false"
+      CARGO_HTTP_TIMEOUT: "600"
+      CARGO_NET_RETRY: "10"
     strategy:
       fail-fast: false
       matrix:
@@ -38,8 +41,11 @@ jobs:
           rustc --version
           cargo --version
 
+      - name: Fetch Rust dependencies
+        run: cargo fetch --locked
+
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: Format
         if: runner.os == 'Linux'
