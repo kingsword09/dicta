@@ -1894,6 +1894,7 @@ dependencies = [
 name = "vo-audio"
 version = "0.10.1"
 dependencies = [
+ "cc",
  "cpal",
  "hound",
  "thiserror 2.0.18",
