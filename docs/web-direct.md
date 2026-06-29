@@ -64,3 +64,7 @@ Authorization: Bearer <api key>
 
 For public deployments, add a server-side gateway later and keep provider keys on
 the server.
+
+For a WASM-backed web shell, use `crates/vo-web`. It exposes the same direct
+provider contract plus browser microphone recording and browser-side config
+storage while sharing `vo-core` transcript data. See [web-wasm.md](web-wasm.md).
