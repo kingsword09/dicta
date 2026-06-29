@@ -882,13 +882,41 @@ fn random_hex_8() -> String {
 }
 
 pub fn default_credential_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(
-        PathBuf::from(home)
-            .join(".config")
-            .join("vo")
-            .join("doubao-credentials.json"),
+    default_config_dir_from_values(
+        cfg!(windows),
+        env_path("HOME"),
+        env_path("APPDATA"),
+        env_path("USERPROFILE"),
     )
+    .map(doubao_credential_path)
+}
+
+fn default_config_dir_from_values(
+    is_windows: bool,
+    home: Option<PathBuf>,
+    appdata: Option<PathBuf>,
+    userprofile: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if is_windows {
+        appdata
+            .or_else(|| userprofile.map(|path| path.join("AppData").join("Roaming")))
+            .or_else(|| home.map(|path| path.join(".config")))
+    } else {
+        home.map(|path| path.join(".config"))
+    }
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    let value = std::env::var_os(name)?;
+    if value.as_os_str().is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(value))
+    }
+}
+
+fn doubao_credential_path(config_dir: PathBuf) -> PathBuf {
+    config_dir.join("vo").join("doubao-credentials.json")
 }
 
 #[cfg(test)]
@@ -899,9 +927,43 @@ mod tests {
     fn defaults_to_cached_credentials_without_api_key() {
         let config = DoubaoConfig::default();
 
-        assert!(config.credential_path.is_some());
+        assert_eq!(config.credential_path, default_credential_path());
         assert!(config.device_id.is_none());
         assert!(config.token.is_none());
+    }
+
+    #[test]
+    fn uses_windows_appdata_for_default_config_dir() {
+        let config_dir = default_config_dir_from_values(
+            true,
+            None,
+            Some(PathBuf::from(r"C:\Users\runneradmin\AppData\Roaming")),
+            Some(PathBuf::from(r"C:\Users\runneradmin")),
+        );
+
+        assert_eq!(
+            config_dir,
+            Some(PathBuf::from(r"C:\Users\runneradmin\AppData\Roaming"))
+        );
+    }
+
+    #[test]
+    fn falls_back_to_windows_userprofile_for_default_config_dir() {
+        let config_dir = default_config_dir_from_values(
+            true,
+            None,
+            None,
+            Some(PathBuf::from(r"C:\Users\runneradmin")),
+        );
+
+        assert_eq!(
+            config_dir,
+            Some(
+                PathBuf::from(r"C:\Users\runneradmin")
+                    .join("AppData")
+                    .join("Roaming")
+            )
+        );
     }
 
     #[test]

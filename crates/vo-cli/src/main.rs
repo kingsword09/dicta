@@ -1680,8 +1680,13 @@ mod tests {
             input: Some(PathBuf::from("audio.wav")),
             ..test_cli()
         };
+        let support = AppleSupport {
+            version: Some("15.6.1".to_owned()),
+            supported: false,
+            reason: "macOS 15.6.1 is below 26".to_owned(),
+        };
 
-        assert!(resolve_backend(&cli).is_err());
+        assert!(resolve_backend_for(&cli, &support).is_err());
     }
 
     #[test]
