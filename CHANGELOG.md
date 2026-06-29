@@ -1,5 +1,11 @@
 # Changelog
 
+## [v0.10.1](https://github.com/kingsword09/vo/compare/v0.10.0...v0.10.1) - 2026-06-29
+
+### Other Changes
+- ci: harden cargo dependency fetch in workflows by @kingsword09 in https://github.com/kingsword09/vo/pull/7
+- ci: run tagpr after main tests pass by @kingsword09 in https://github.com/kingsword09/vo/pull/9
+
 ## [v0.10.0](https://github.com/kingsword09/vo/commits/v0.10.0) - 2026-06-29
 
 ### Other Changes
