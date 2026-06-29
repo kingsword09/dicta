@@ -998,28 +998,40 @@ async fn run_doubao_live(cli: &Cli) -> Result<()> {
     let mut seq = 0_u64;
     loop {
         let chunk_path = temp_recording_path();
-        let record_result = tokio::task::spawn_blocking({
+        let record_task = tokio::task::spawn_blocking({
             let chunk_path = chunk_path.clone();
             move || vo_audio::record_default_input_to_wav(&chunk_path, Duration::from_secs(5))
-        })
-        .await
-        .context("doubao live recorder task failed")?;
+        });
+        let record_result = tokio::select! {
+            result = record_task => result.context("doubao live recorder task failed")?,
+            result = tokio::signal::ctrl_c() => {
+                result.context("failed to listen for Ctrl-C")?;
+                let _ = std::fs::remove_file(&chunk_path);
+                break;
+            }
+        };
 
         if let Err(err) = record_result {
             let _ = std::fs::remove_file(&chunk_path);
             return Err(err).context("failed to record default microphone");
         }
 
-        match provider
-            .transcribe(
+        let transcribe_result = tokio::select! {
+            result = provider.transcribe(
                 AudioInput::File(chunk_path.clone()),
                 AsrOptions {
                     language: cli.src.clone(),
                     ..AsrOptions::default()
                 },
-            )
-            .await
-        {
+            ) => result,
+            result = tokio::signal::ctrl_c() => {
+                result.context("failed to listen for Ctrl-C")?;
+                let _ = std::fs::remove_file(&chunk_path);
+                break;
+            }
+        };
+
+        match transcribe_result {
             Ok(transcript) => {
                 let text = transcript.text.trim();
                 if !text.is_empty() {
@@ -1034,25 +1046,11 @@ async fn run_doubao_live(cli: &Cli) -> Result<()> {
         }
 
         let _ = std::fs::remove_file(&chunk_path);
-
-        if has_pending_ctrl_c().await? {
-            break;
-        }
     }
 
     renderer.finalize_session_log()?;
     renderer.print_summary();
     Ok(())
-}
-
-async fn has_pending_ctrl_c() -> Result<bool> {
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => {
-            result.context("failed to listen for Ctrl-C")?;
-            Ok(true)
-        }
-        _ = tokio::time::sleep(Duration::from_millis(1)) => Ok(false),
-    }
 }
 
 fn write_transcript(path: &PathBuf, payload: &OutputPayload, json: bool) -> Result<()> {
