@@ -12,8 +12,8 @@ OpenAI-compatible endpoints.
   ASR provider.
 - The Rust CLI can record the default microphone for a fixed duration and submit
   the captured WAV to the same provider path.
-- The Rust CLI has `--doctor` diagnostics for backend resolution, API config,
-  default input audio, and runtime mode.
+- The Rust CLI has `--doctor` diagnostics for backend resolution, provider
+  config, default input audio, and Apple on-device availability.
 - `--asr doubao` uses the Rust `vo-asr-doubao` provider. It implements the
   Doubao IME protocol directly, auto-registers device credentials, and does not
   use the old Python sidecar.
@@ -275,10 +275,16 @@ binary such as `adapters/apple-speech`. On systems below macOS 26, `--asr apple`
 reports that Apple on-device mode is unavailable and remote/provider mode should
 be used.
 
-`--doctor` does not call any ASR provider. It reports how the backend would be
-resolved, whether API base/key are configured, default microphone availability,
-whether Apple on-device mode is supported on the current OS, and confirms that
-the Rust path does not require a Python sidecar.
+`--doctor` does not call any ASR provider. The text output focuses on the
+resolved backend, relevant provider config, default microphone availability, and
+Apple on-device support. `--doctor --json` includes lower-level runtime fields
+for automation and debugging.
+
+On macOS, the terminal app appears under System Settings > Privacy & Security >
+Microphone only after it starts a microphone capture. If no terminal entry is
+listed yet, run a short capture from the terminal app you actually use, such as
+`vo --mic-duration 1 --asr doubao`, then allow the prompt and restart that
+terminal.
 
 ## Provider model
 

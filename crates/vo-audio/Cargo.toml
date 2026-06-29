@@ -9,3 +9,6 @@ version.workspace = true
 cpal.workspace = true
 hound.workspace = true
 thiserror.workspace = true
+
+[build-dependencies]
+cc = "1.2.65"

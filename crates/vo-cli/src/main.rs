@@ -1199,7 +1199,7 @@ fn gather_doctor_report_with_audio(cli: &Cli, audio: AudioReport) -> DoctorRepor
                 .map(|path| path.display().to_string()),
             doubao_device_id_configured: non_empty(&cli.doubao_device_id).is_some(),
             doubao_token_configured: non_empty(&cli.doubao_token).is_some(),
-            native_adapter: resolve_configured_native_adapter(cli)
+            native_adapter: resolve_native_adapter(cli)
                 .as_ref()
                 .map(|path| path.display().to_string()),
             error,
@@ -1298,29 +1298,7 @@ fn print_doctor_text(report: &DoctorReport) {
     if let Some(error) = &report.backend.error {
         println!("  Error: {error}");
     }
-    println!(
-        "  API base configured: {}",
-        yes_no(report.backend.api_base_configured)
-    );
-    println!(
-        "  API key configured: {}",
-        yes_no(report.backend.api_key_configured)
-    );
-    println!("  Model: {}", report.backend.model);
-    if let Some(path) = &report.backend.doubao_credential_path {
-        println!("  Doubao credential path: {path}");
-    }
-    println!(
-        "  Doubao device id configured: {}",
-        yes_no(report.backend.doubao_device_id_configured)
-    );
-    println!(
-        "  Doubao token configured: {}",
-        yes_no(report.backend.doubao_token_configured)
-    );
-    if let Some(adapter) = &report.backend.native_adapter {
-        println!("  Native adapter: {adapter}");
-    }
+    print_doctor_backend_details(report);
 
     println!("\nAudio");
     if report.audio.default_input_available {
@@ -1342,21 +1320,54 @@ fn print_doctor_text(report: &DoctorReport) {
         if let Some(error) = &report.audio.error {
             println!("  Error: {error}");
         }
+        if let Some(hint) = doctor_audio_hint(report) {
+            println!("  Hint: {hint}");
+        }
     }
+}
 
-    println!("\nRuntime");
-    println!(
-        "  Python sidecar required: {}",
-        yes_no(report.runtime.python_sidecar_required)
-    );
-    println!(
-        "  Web direct available: {}",
-        yes_no(report.runtime.web_direct_available)
-    );
-    println!(
-        "  Native adapter supported OS family: {}",
-        yes_no(report.runtime.native_adapter_supported_os)
-    );
+fn print_doctor_backend_details(report: &DoctorReport) {
+    match report.backend.resolved.as_deref() {
+        Some("doubao") => {
+            println!("  Model: {}", report.backend.model);
+            if let Some(path) = &report.backend.doubao_credential_path {
+                println!("  Credential cache: {path}");
+            }
+            if report.backend.doubao_device_id_configured || report.backend.doubao_token_configured
+            {
+                println!("  Credential overrides: yes");
+            }
+        }
+        Some("openai-compatible") => {
+            println!(
+                "  API base configured: {}",
+                yes_no(report.backend.api_base_configured)
+            );
+            println!(
+                "  API key configured: {}",
+                yes_no(report.backend.api_key_configured)
+            );
+            println!("  Model: {}", report.backend.model);
+        }
+        Some("apple") => {
+            if let Some(adapter) = &report.backend.native_adapter {
+                println!("  Native adapter: {adapter}");
+            }
+        }
+        _ => {
+            println!("  Model: {}", report.backend.model);
+        }
+    }
+}
+
+fn doctor_audio_hint(report: &DoctorReport) -> Option<&'static str> {
+    if report.system.os == "macos" {
+        Some(
+            "start a microphone capture from the terminal app you use, for example `vo --mic-duration 1 --asr doubao`, so macOS can show the permission prompt; then allow microphone access in System Settings > Privacy & Security > Microphone, restart the terminal, and check that a default input device is selected",
+        )
+    } else {
+        None
+    }
 }
 
 fn yes_no(value: bool) -> &'static str {

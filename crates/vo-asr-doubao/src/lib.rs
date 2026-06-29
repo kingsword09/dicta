@@ -348,9 +348,7 @@ impl DoubaoAsr {
         let text = final_text
             .map(|text| text.trim().to_owned())
             .filter(|text| !text.is_empty())
-            .ok_or_else(|| {
-                AsrError::InvalidResponse("doubao returned no final transcript text".to_owned())
-            })?;
+            .unwrap_or_default();
 
         Ok(Transcript {
             text,
