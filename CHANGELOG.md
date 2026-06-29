@@ -1,5 +1,13 @@
 # Changelog
 
+## [v0.10.0](https://github.com/kingsword09/vo/commits/v0.10.0) - 2026-06-29
+
+### Other Changes
+- ci: fix bundled Opus builds with CMake 4 by @kingsword09 in https://github.com/kingsword09/vo/pull/1
+- refactor: rename Apple legacy bridge to native adapter by @kingsword09 in https://github.com/kingsword09/vo/pull/2
+- fix: make tagpr sync adapter version after Cargo bump by @kingsword09 in https://github.com/kingsword09/vo/pull/4
+- chore: customize tagpr release PR template by @kingsword09 in https://github.com/kingsword09/vo/pull/5
+
 ## Unreleased
 
 - Reworked the project into a Rust-first workspace with pluggable ASR providers.
