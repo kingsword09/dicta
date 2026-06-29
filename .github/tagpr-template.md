@@ -1,4 +1,4 @@
-release: {{.NextVersion}}
+chore(release): {{.NextVersion}}
 
 This pull request is for the next release as {{.NextVersion}} created by [tagpr](https://github.com/Songmu/tagpr). Merging it will tag {{.NextVersion}} to the merge commit and create a GitHub release.
 
