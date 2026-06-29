@@ -23,6 +23,17 @@ fi
 
 echo "sync-version: $VERSION -> adapters/apple-speech"
 
+echo "sync-version: $VERSION -> Cargo.lock workspace packages"
+VERSION="$VERSION" perl -0pi -e '
+    my @parts = split /(?=^\[\[package\]\]\n)/m, $_;
+    for my $part (@parts) {
+        next unless $part =~ /^\[\[package\]\]\n/;
+        next if $part =~ /^source = /m;
+        $part =~ s/^version = "[^"]+"/version = "$ENV{VERSION}"/m;
+    }
+    $_ = join "", @parts;
+' Cargo.lock
+
 VERSION="$VERSION" perl -i -0pe '
     s|(version:\s*")[^"]+|${1}$ENV{VERSION}|;
 ' "$ADAPTER/Sources/vo/Vo.swift"
@@ -32,4 +43,4 @@ VERSION="$VERSION" perl -i -0pe '
     s|(<key>CFBundleVersion</key>\s*<string>)[^<]+|${1}$ENV{VERSION}|;
 ' "$ADAPTER/Resources/Info.plist"
 
-git add "$ADAPTER/Sources/vo/Vo.swift" "$ADAPTER/Resources/Info.plist"
+git add Cargo.lock "$ADAPTER/Sources/vo/Vo.swift" "$ADAPTER/Resources/Info.plist"
