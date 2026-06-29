@@ -1,13 +1,24 @@
 name: tagpr
 
 on:
-  push:
+  workflow_run:
+    workflows:
+      - test
     branches:
       - main
+    types:
+      - completed
   workflow_dispatch:
 
 jobs:
   tagpr:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main'
+      )
     runs-on: ubuntu-latest
     outputs:
       tagpr-tag: ${{ steps.run-tagpr.outputs.tag }}
@@ -17,6 +28,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: main
       - id: run-tagpr
         name: Run tagpr
         uses: Songmu/tagpr@e84001bd5dac8defa0c75b3913937d284a3b3660 # v1.20.0
