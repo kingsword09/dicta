@@ -32,13 +32,14 @@ crates/
   vo-core/                    shared transcript schema and audio input types
   vo-asr/                     ASR provider trait and common option/result types
   vo-asr-openai-compatible/   direct /v1/audio/transcriptions provider
-  vo-asr-apple-legacy/        bridge to the isolated Apple Swift adapter
   vo-asr-doubao/              Doubao provider entry point, no Python runtime
+  vo-asr-native-adapter/      bridge to platform-native adapter binaries
   vo-audio/                   cross-platform default microphone recording
   vo-cli/                     Rust command-line entry point
   web/direct/                 static browser direct-provider tool
 
-legacy/apple-swift-adapter/   isolated macOS 26 on-device adapter
+adapters/
+  apple-speech/               macOS 26 Apple Speech native adapter
 ```
 
 The Rust CLI calls remote providers directly. There is no Python runtime and no
@@ -61,9 +62,10 @@ $ curl -fsSL https://raw.githubusercontent.com/kingsword09/vo/main/install.sh \
 
 The installer downloads the matching GitHub Release archive for the current
 platform and installs `vo` into `~/.local/bin` by default. macOS arm64 release
-archives also include `vo-apple-adapter` next to `vo` so macOS 26 device-model
-capture works through the Rust CLI without extra flags. Prebuilt assets are
-published for macOS arm64, Linux x86_64/arm64, and Windows x86_64/arm64.
+archives also include `vo-adapter-apple-speech` next to `vo` so macOS 26
+device-model capture works through the Rust CLI without extra flags. Prebuilt
+assets are published for macOS arm64, Linux x86_64/arm64, and Windows
+x86_64/arm64.
 
 Validate the installer locally before publishing a release:
 
@@ -101,8 +103,8 @@ The isolated Apple on-device adapter is still available when you need the macOS
 26 device model path:
 
 ```console
-$ ./scripts/build-apple-swift-adapter.sh
-$ ./scripts/test-apple-swift-adapter.sh
+$ ./scripts/build-apple-speech-adapter.sh
+$ ./scripts/test-apple-speech-adapter.sh
 ```
 
 ## Usage
@@ -119,10 +121,11 @@ $ vo --json | jq                      # JSONL output for piping
 $ vo --doctor                         # Environment diagnostics
 ```
 
-This path is implemented by the Rust CLI launching the Apple adapter bundled as
-`vo-apple-adapter`, reading typed live events from it, then rendering and logging
-the session itself. You can still point to a custom adapter with
-`--apple-adapter` or `VO_APPLE_ADAPTER`.
+This path is implemented by the Rust CLI launching the Apple Speech native
+adapter bundled as `vo-adapter-apple-speech`, reading typed live events from it,
+then rendering and logging the session itself. You can point to a custom adapter
+with `--native-adapter` or `VO_NATIVE_ADAPTER`. The older `--apple-adapter` /
+`VO_APPLE_ADAPTER` names remain compatibility aliases.
 
 Use Doubao live ASR on systems without Apple on-device support, or explicitly
 with `--asr doubao`:
@@ -176,12 +179,12 @@ $ vo --mic-duration 5 \
     --src zh-CN
 ```
 
-Use the macOS 26 on-device Apple path through an Apple Swift adapter binary:
+Use the macOS 26 on-device Apple path through an Apple Speech adapter binary:
 
 ```console
 $ vo --input meeting.wav \
     --asr apple \
-    --apple-adapter legacy/apple-swift-adapter/.build/release/vo \
+    --native-adapter adapters/apple-speech/.build/release/vo \
     --src en-US
 ```
 
@@ -190,7 +193,7 @@ Run live macOS 26 on-device mic/speaker transcription explicitly:
 ```console
 $ vo --live \
     --asr apple \
-    --apple-adapter legacy/apple-swift-adapter/.build/release/vo \
+    --native-adapter adapters/apple-speech/.build/release/vo \
     --src en-US
 ```
 
@@ -199,7 +202,7 @@ Live Apple mode also supports the adapter's capture controls:
 ```console
 $ vo --live \
     --asr apple \
-    --apple-adapter legacy/apple-swift-adapter/.build/release/vo \
+    --native-adapter adapters/apple-speech/.build/release/vo \
     --no-speaker \
     --json \
     --transcript meeting.jsonl
@@ -253,7 +256,7 @@ VO_ASR_API_MODEL=...
 VO_DOUBAO_CREDENTIAL_PATH=~/.config/vo/doubao-credentials.json
 VO_DOUBAO_DEVICE_ID=...
 VO_DOUBAO_TOKEN=...
-VO_APPLE_ADAPTER=legacy/apple-swift-adapter/.build/release/vo
+VO_NATIVE_ADAPTER=adapters/apple-speech/.build/release/vo
 VO_SRC=en-US
 VO_DST=ja-JP
 ```
@@ -262,13 +265,13 @@ VO_DST=ja-JP
 and Doubao live where Apple on-device ASR is unavailable. In batch mode it
 resolves to Doubao on systems without Apple support, but keeps the generic
 `openai-compatible` HTTP path on macOS 26+ unless you explicitly choose
-`--asr apple --apple-adapter ...`. Supplying `--api-model doubaoime-asr` or the
-legacy alias `doubao-asr` also resolves to `doubao`; any other explicit model
+`--asr apple --native-adapter ...`. Supplying `--api-model doubaoime-asr` or the
+compatibility alias `doubao-asr` also resolves to `doubao`; any other explicit model
 resolves to `openai-compatible`.
 
 `--asr apple` is available only when the current OS supports Apple on-device ASR
-and `--apple-adapter` / `VO_APPLE_ADAPTER` points to a built
-`legacy/apple-swift-adapter` binary. On systems below macOS 26, `--asr apple`
+and `--native-adapter` / `VO_NATIVE_ADAPTER` points to a built native adapter
+binary such as `adapters/apple-speech`. On systems below macOS 26, `--asr apple`
 reports that Apple on-device mode is unavailable and remote/provider mode should
 be used.
 
@@ -298,8 +301,9 @@ implements the Doubao IME protocol in Rust, including device registration,
 credential caching, Opus frame encoding, and protobuf WebSocket requests. The
 protocol is unofficial and may change upstream.
 
-`vo-asr-apple-legacy` runs the Apple Swift binary as an external adapter. In
-live mode the adapter is headless from the user's perspective: it emits typed
+`vo-asr-native-adapter` runs platform-native binaries as external adapters. The
+current implementation is `adapters/apple-speech`, a Swift adapter for macOS 26.
+In live mode the adapter is headless from the user's perspective: it emits typed
 live events and the Rust CLI owns the command-line interaction.
 
 ## Web direct mode
@@ -330,15 +334,15 @@ See [docs/web-direct.md](docs/web-direct.md).
 - SOLID: ASR providers are isolated behind `AsrProvider`; audio capture, rendering,
   and model protocols can evolve independently.
 
-## Apple Adapter
+## Native Adapters
 
-The Swift code in `legacy/apple-swift-adapter` is the macOS 26+ Apple Silicon
+The Swift code in `adapters/apple-speech` is the macOS 26+ Apple Silicon native
 adapter. It performs on-device live transcription with Apple's
 `SpeechTranscriber`, optional on-device translation with `TranslationSession`,
 and macOS-specific mic/speaker capture, then emits typed live events for the Rust
 CLI.
 
-Use `--asr apple --apple-adapter <path>` from the Rust CLI for batch file
+Use `--asr apple --native-adapter <path>` from the Rust CLI for batch file
 transcription. Add `--live` when you want the Rust CLI to launch the adapter for
 live mic/speaker capture while keeping rendering in Rust.
 

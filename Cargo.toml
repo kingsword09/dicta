@@ -1,8 +1,8 @@
 [workspace]
 members = [
     "crates/vo-asr",
-    "crates/vo-asr-apple-legacy",
     "crates/vo-asr-doubao",
+    "crates/vo-asr-native-adapter",
     "crates/vo-asr-openai-compatible",
     "crates/vo-audio",
     "crates/vo-cli",
@@ -36,8 +36,8 @@ tokio = { version = "1.46.1", features = ["macros", "rt-multi-thread", "fs", "io
 tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots"] }
 uuid = { version = "1.17.0", features = ["v4"] }
 vo-asr = { path = "crates/vo-asr" }
-vo-asr-apple-legacy = { path = "crates/vo-asr-apple-legacy" }
 vo-asr-doubao = { path = "crates/vo-asr-doubao" }
+vo-asr-native-adapter = { path = "crates/vo-asr-native-adapter" }
 vo-asr-openai-compatible = { path = "crates/vo-asr-openai-compatible" }
 vo-audio = { path = "crates/vo-audio" }
 vo-core = { path = "crates/vo-core" }

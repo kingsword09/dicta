@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{cmp, env};
 use vo_asr::{AsrOptions, AsrProvider};
-use vo_asr_apple_legacy::{AppleLegacyAsr, AppleLegacyConfig, AppleLiveOptions};
 use vo_asr_doubao::{DoubaoAsr, DoubaoConfig};
+use vo_asr_native_adapter::{NativeAdapterAsr, NativeAdapterConfig, NativeLiveOptions};
 use vo_asr_openai_compatible::{OpenAiCompatibleAsr, OpenAiCompatibleConfig};
 use vo_core::{
     AudioChannel, AudioInput, LiveEvent, LiveMetaEvent, LiveTranslatedEvent, LiveVolatileEvent,
@@ -73,10 +73,13 @@ struct Cli {
     dst: Option<String>,
 
     #[arg(
-        long = "apple-adapter",
-        env = "VO_APPLE_ADAPTER",
-        help = "Path to the Apple Swift adapter binary used for --asr apple on macOS 26+"
+        long = "native-adapter",
+        env = "VO_NATIVE_ADAPTER",
+        help = "Path to the native adapter binary used for platform on-device ASR"
     )]
+    native_adapter: Option<PathBuf>,
+
+    #[arg(long = "apple-adapter", env = "VO_APPLE_ADAPTER", hide = true)]
     apple_adapter: Option<PathBuf>,
 
     #[arg(long, help = "Audio file to transcribe")]
@@ -270,7 +273,7 @@ fn resolve_live_backend_for(cli: &Cli, apple_support: &AppleSupport) -> Result<A
 }
 
 async fn run_apple_live(cli: &Cli) -> Result<()> {
-    let adapter = build_apple_legacy(cli)?;
+    let adapter = build_native_adapter(cli)?;
     let mut renderer = LiveRenderer::new(
         cli.json,
         cli.transcript.clone(),
@@ -281,7 +284,7 @@ async fn run_apple_live(cli: &Cli) -> Result<()> {
 
     adapter
         .run_live_events(
-            AppleLiveOptions {
+            NativeLiveOptions {
                 src: cli.src.clone(),
                 dst: cli.dst.clone(),
                 json: true,
@@ -1100,7 +1103,7 @@ struct BackendReport {
     doubao_credential_path: Option<String>,
     doubao_device_id_configured: bool,
     doubao_token_configured: bool,
-    apple_adapter: Option<String>,
+    native_adapter: Option<String>,
     error: Option<String>,
 }
 
@@ -1118,7 +1121,7 @@ struct AudioReport {
 struct RuntimeReport {
     python_sidecar_required: bool,
     web_direct_available: bool,
-    apple_adapter_supported_os: bool,
+    native_adapter_supported_os: bool,
 }
 
 fn run_doctor(cli: &Cli) -> Result<()> {
@@ -1196,8 +1199,7 @@ fn gather_doctor_report_with_audio(cli: &Cli, audio: AudioReport) -> DoctorRepor
                 .map(|path| path.display().to_string()),
             doubao_device_id_configured: non_empty(&cli.doubao_device_id).is_some(),
             doubao_token_configured: non_empty(&cli.doubao_token).is_some(),
-            apple_adapter: cli
-                .apple_adapter
+            native_adapter: resolve_configured_native_adapter(cli)
                 .as_ref()
                 .map(|path| path.display().to_string()),
             error,
@@ -1206,7 +1208,7 @@ fn gather_doctor_report_with_audio(cli: &Cli, audio: AudioReport) -> DoctorRepor
         runtime: RuntimeReport {
             python_sidecar_required: false,
             web_direct_available: true,
-            apple_adapter_supported_os: cfg!(target_os = "macos"),
+            native_adapter_supported_os: true,
         },
     }
 }
@@ -1237,7 +1239,8 @@ fn apple_support() -> AppleSupport {
         (Some(version), Some(major)) if major >= 26 => AppleSupport {
             version: Some(version),
             supported: true,
-            reason: "macOS 26+ detected; Apple Swift adapter can provide on-device mode".to_owned(),
+            reason: "macOS 26+ detected; Apple Speech adapter can provide on-device mode"
+                .to_owned(),
         },
         (Some(version), Some(_)) => AppleSupport {
             version: Some(version.clone()),
@@ -1315,8 +1318,8 @@ fn print_doctor_text(report: &DoctorReport) {
         "  Doubao token configured: {}",
         yes_no(report.backend.doubao_token_configured)
     );
-    if let Some(adapter) = &report.backend.apple_adapter {
-        println!("  Apple adapter: {adapter}");
+    if let Some(adapter) = &report.backend.native_adapter {
+        println!("  Native adapter: {adapter}");
     }
 
     println!("\nAudio");
@@ -1351,8 +1354,8 @@ fn print_doctor_text(report: &DoctorReport) {
         yes_no(report.runtime.web_direct_available)
     );
     println!(
-        "  Apple adapter supported OS family: {}",
-        yes_no(report.runtime.apple_adapter_supported_os)
+        "  Native adapter supported OS family: {}",
+        yes_no(report.runtime.native_adapter_supported_os)
     );
 }
 
@@ -1472,32 +1475,47 @@ fn build_provider(backend: AsrBackend, cli: &Cli) -> Result<Box<dyn AsrProvider>
             device_id: non_empty(&cli.doubao_device_id),
             token: non_empty(&cli.doubao_token),
         })?)),
-        AsrBackend::Apple => Ok(Box::new(build_apple_legacy(cli)?)),
+        AsrBackend::Apple => Ok(Box::new(build_native_adapter(cli)?)),
         AsrBackend::Auto => unreachable!("backend must be resolved first"),
     }
 }
 
-fn build_apple_legacy(cli: &Cli) -> Result<AppleLegacyAsr> {
-    let command = resolve_apple_adapter(cli).context(
-        "--asr apple requires --apple-adapter, VO_APPLE_ADAPTER, or a vo-apple-adapter binary next to vo",
+fn build_native_adapter(cli: &Cli) -> Result<NativeAdapterAsr> {
+    let command = resolve_native_adapter(cli).context(
+        "--asr apple requires --native-adapter, VO_NATIVE_ADAPTER, or a bundled native adapter binary next to vo",
     )?;
-    Ok(AppleLegacyAsr::new(AppleLegacyConfig { command })?)
+    Ok(NativeAdapterAsr::new(NativeAdapterConfig { command })?)
 }
 
-fn resolve_apple_adapter(cli: &Cli) -> Option<PathBuf> {
-    if let Some(command) = &cli.apple_adapter {
+fn resolve_native_adapter(cli: &Cli) -> Option<PathBuf> {
+    if let Some(command) = resolve_configured_native_adapter(cli) {
         return Some(command.clone());
     }
 
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    let name = if cfg!(windows) {
-        "vo-apple-adapter.exe"
+    bundled_native_adapter_names()
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.exists())
+}
+
+fn resolve_configured_native_adapter(cli: &Cli) -> Option<PathBuf> {
+    cli.native_adapter
+        .clone()
+        .or_else(|| cli.apple_adapter.clone())
+}
+
+fn bundled_native_adapter_names() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &[
+            "vo-adapter-apple-speech.exe",
+            "vo-adapter-windows-speech.exe",
+            "vo-apple-adapter.exe",
+        ]
     } else {
-        "vo-apple-adapter"
-    };
-    let bundled = dir.join(name);
-    bundled.exists().then_some(bundled)
+        &["vo-adapter-apple-speech", "vo-apple-adapter"]
+    }
 }
 
 fn default_openai_api_base() -> &'static str {
@@ -1514,8 +1532,8 @@ fn non_empty(value: &Option<String>) -> Option<String> {
 
 fn validate_backend_config(backend: AsrBackend, cli: &Cli) -> Option<String> {
     match backend {
-        AsrBackend::Apple if resolve_apple_adapter(cli).is_none() => Some(
-            "--asr apple requires --apple-adapter, VO_APPLE_ADAPTER, or a vo-apple-adapter binary next to vo"
+        AsrBackend::Apple if resolve_native_adapter(cli).is_none() => Some(
+            "--asr apple requires --native-adapter, VO_NATIVE_ADAPTER, or a bundled native adapter binary next to vo"
                 .to_owned(),
         ),
         AsrBackend::OpenaiCompatible | AsrBackend::Doubao | AsrBackend::Apple => None,
@@ -1556,6 +1574,7 @@ mod tests {
             doubao_device_id: None,
             doubao_token: None,
             dst: None,
+            native_adapter: None,
             apple_adapter: None,
             input: None,
             mic_duration: None,
@@ -1600,7 +1619,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_keeps_http_provider_until_rust_apple_adapter_is_connected() {
+    fn auto_keeps_http_provider_until_native_adapter_is_connected() {
         let cli = Cli {
             input: Some(PathBuf::from("audio.wav")),
             ..test_cli()
@@ -1657,7 +1676,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_uses_doubao_when_model_is_legacy_doubao_alias() {
+    fn auto_uses_doubao_when_model_is_compatibility_doubao_alias() {
         let cli = Cli {
             api_model: Some("doubao-asr".to_owned()),
             input: Some(PathBuf::from("audio.wav")),
@@ -1711,7 +1730,7 @@ mod tests {
     fn apple_backend_resolves_when_platform_support_is_available() {
         let cli = Cli {
             asr: AsrBackend::Apple,
-            apple_adapter: Some(PathBuf::from("legacy-vo")),
+            native_adapter: Some(PathBuf::from("vo-adapter-apple-speech")),
             input: Some(PathBuf::from("audio.wav")),
             ..test_cli()
         };
@@ -1729,7 +1748,7 @@ mod tests {
     }
 
     #[test]
-    fn doctor_reports_missing_apple_adapter() {
+    fn doctor_reports_missing_native_adapter() {
         let cli = Cli {
             asr: AsrBackend::Apple,
             json: true,
@@ -1746,7 +1765,7 @@ mod tests {
         assert_eq!(backend, AsrBackend::Apple);
         assert!(validate_backend_config(backend, &cli)
             .as_deref()
-            .is_some_and(|error| error.contains("--apple-adapter")));
+            .is_some_and(|error| error.contains("--native-adapter")));
     }
 
     #[test]

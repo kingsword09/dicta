@@ -243,7 +243,7 @@ final class RebindBox: @unchecked Sendable {
 /// the session timeline, an emitted region with `unionEnd <= incoming.audioStart`
 /// can never overlap a future chunk and is safe to drop.
 ///
-/// `nLocales == 1` is the legacy single-source mode; the reconciler short-circuits
+/// `nLocales == 1` is the single-source fast path; the reconciler short-circuits
 /// straight to `onEmit` with no buffering or timer, so output latency is unchanged.
 actor ChunkReconciler {
     struct Candidate: Sendable {

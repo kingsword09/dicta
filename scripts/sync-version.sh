@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Sync the Rust workspace release version into isolated Apple adapter metadata.
+# Sync the Rust workspace release version into Apple Speech adapter metadata.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-ADAPTER="$ROOT/legacy/apple-swift-adapter"
+ADAPTER="$ROOT/adapters/apple-speech"
 cd "$ROOT"
 
 if [[ -n "${TAGPR_NEXT_VERSION:-}" ]]; then
@@ -25,7 +25,7 @@ if [[ -z "$VERSION" ]]; then
     exit 1
 fi
 
-echo "sync-version: $VERSION -> legacy/apple-swift-adapter"
+echo "sync-version: $VERSION -> adapters/apple-speech"
 
 VERSION="$VERSION" perl -i -0pe '
     s|(version:\s*")[^"]+|${1}$ENV{VERSION}|;
