@@ -6,7 +6,7 @@ struct Vo: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "vo",
         abstract: "On-device live transcription and translation for macOS 26+",
-        version: "0.10.2"
+        version: "0.10.3"
     )
 
     // MARK: - Capture options
