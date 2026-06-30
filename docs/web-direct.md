@@ -1,31 +1,32 @@
 # Web direct mode
 
-`web/direct/index.html` is a browser-only transcription tool. It does not run a
-backend and does not require WASM. It can submit either a selected audio file or
-a short browser microphone recording.
+`web/direct` is a dependency-free browser integration layer for direct
+transcription calls. It does not run a backend and does not require WASM.
 
-Open it directly:
-
-```console
-$ open web/direct/index.html
-```
-
-Or serve the repository with any static file server. This is only for loading the
-HTML file; it is not a `vo` backend and it does not proxy or store API keys.
-
-```console
-$ static-server-command 8080
-```
-
-Then open:
+The important file is:
 
 ```text
-http://127.0.0.1:8080/web/direct/
+web/direct/vo-transcriber.js
 ```
 
-## How it works
+`web/direct/index.html` is a static demo that shows the same module used as a
+Web Component, a plain JavaScript function, and a React-style
+`onAudioRecorded` handler.
 
-The page sends a browser `fetch` request with `FormData` to:
+Serve the repository with any static file server, then open the demo:
+
+```console
+$ python3 -m http.server 8765
+$ open http://127.0.0.1:8765/web/direct/
+```
+
+This is only for loading browser assets; it is not a `vo` backend and it does
+not proxy or store API keys. A local server also avoids browser-specific
+`file://` restrictions for ES module loading.
+
+## Provider contract
+
+The module sends a browser `fetch` request with `FormData` to:
 
 ```text
 POST {api_base}/v1/audio/transcriptions
@@ -34,7 +35,7 @@ POST {api_base}/v1/audio/transcriptions
 Fields sent to the provider:
 
 ```text
-file=<selected audio file>
+file=<audio file or recorded blob>
 model=<model id>
 response_format=json
 language=<optional language hint>
@@ -47,6 +48,101 @@ If an API key is provided, it is sent as:
 Authorization: Bearer <api key>
 ```
 
+## Plain JavaScript
+
+Use `transcribeAudio` when your app already has a `Blob` or `File`.
+
+```js
+import { transcribeAudio } from "./vo-transcriber.js";
+
+const result = await transcribeAudio(audioBlob, {
+  apiBase: "https://api.example.com",
+  apiKey: "...",
+  model: "doubao-asr",
+  language: "zh-CN",
+});
+
+console.log(result.text);
+```
+
+## AI Elements SpeechInput
+
+AI Elements `SpeechInput` records audio with `MediaRecorder` in browsers where
+Web Speech API is unavailable. Its extension point is:
+
+```ts
+onAudioRecorded?: (audioBlob: Blob) => Promise<string>
+```
+
+`createVoAudioRecordedHandler` matches that shape directly:
+
+```tsx
+import { SpeechInput } from "@/components/ai-elements/speech-input";
+import { createVoAudioRecordedHandler } from "./vo-transcriber.js";
+
+const transcribeWithVo = createVoAudioRecordedHandler({
+  apiBase: "https://api.example.com",
+  apiKey: "...",
+  model: "doubao-asr",
+  language: "zh-CN",
+});
+
+export function Composer() {
+  return (
+    <SpeechInput
+      lang="zh-CN"
+      onAudioRecorded={transcribeWithVo}
+      onTranscriptionChange={(text) => setInput(text)}
+    />
+  );
+}
+```
+
+In React, create the handler outside the component when config is static, or
+memoize it when config comes from state:
+
+```tsx
+const onAudioRecorded = useMemo(
+  () => createVoAudioRecordedHandler({ apiBase, apiKey, model, language }),
+  [apiBase, apiKey, model, language]
+);
+```
+
+## Web Component
+
+Importing the module registers `<vo-speech-recorder>` automatically.
+
+```html
+<script type="module" src="./vo-transcriber.js"></script>
+
+<vo-speech-recorder
+  api-base="https://api.example.com"
+  api-key="..."
+  model="doubao-asr"
+  language="zh-CN"
+></vo-speech-recorder>
+
+<script>
+  document.querySelector("vo-speech-recorder").addEventListener(
+    "vo-transcription",
+    (event) => {
+      console.log(event.detail.text);
+    }
+  );
+</script>
+```
+
+The custom element emits:
+
+```text
+vo-recording-start
+vo-audio-recorded
+vo-transcription-start
+vo-transcription
+vo-error
+vo-state-change
+```
+
 ## Constraints
 
 - The target provider must allow browser CORS requests.
@@ -54,16 +150,14 @@ Authorization: Bearer <api key>
   personal tool, but not for a public hosted site.
 - Doubao direct mode expects a Doubao endpoint that speaks the same
   OpenAI-compatible transcription contract.
-- Microphone mode uses the browser's `MediaRecorder` API. It records a local
-  blob, then uploads it as the `file` field. It is not a live streaming protocol.
 - Browser microphone access usually requires a secure context. `file://` and
   `http://localhost` are accepted by modern desktop browsers; arbitrary
   non-local HTTP origins are not.
 - The provider must accept the browser's recorded format, commonly WebM/Opus on
   Chromium-based browsers.
 
-For public deployments, add a server-side gateway later and keep provider keys on
-the server.
+For public deployments, add a server-side gateway later and keep provider keys
+on the server.
 
 For a WASM-backed web shell, use `crates/vo-web`. It exposes the same direct
 provider contract plus browser microphone recording and browser-side config

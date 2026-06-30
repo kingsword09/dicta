@@ -30,7 +30,7 @@ The Rust code is organized as:
 | `crates/vo-asr-native-adapter` | Provider-neutral bridge that invokes platform-native adapter binaries and parses JSONL output/events. |
 | `crates/vo-audio` | Cross-platform default microphone capture. It currently records fixed-duration WAV files through CPAL/Hound. |
 | `crates/vo-cli` | CLI argument parsing, provider orchestration, live rendering, transcript logging, and exit prompts. |
-| `web/direct` | Static browser tool for no-backend direct provider calls. |
+| `web/direct` | Dependency-free browser transcription module and integration demo for no-backend direct provider calls. |
 
 ## Current Rust CLI Surface
 
@@ -121,15 +121,17 @@ crate so OpenAI-compatible and Apple providers do not inherit that risk.
 
 ## Web Direct Mode
 
-`web/direct/index.html` is intentionally static. It exists to support local
-browser use without a backend or WASM. It sends `FormData` directly to an
-OpenAI-compatible transcription endpoint. It supports selected audio files and
-short browser microphone recordings through `MediaRecorder`. Keep it
-dependency-free unless there is a concrete product requirement for a built
-frontend.
+`web/direct` is intentionally static and dependency-free. Its primary API is
+`vo-transcriber.js`, which exposes Blob/File-to-transcript helpers for UI
+components such as Web Components, plain JavaScript controls, or React voice
+inputs. `index.html` is only an integration demo. The module sends `FormData`
+directly to an OpenAI-compatible transcription endpoint and can also provide a
+small `<vo-speech-recorder>` custom element for simple browser use.
 
 Do not use this mode for public hosted deployments that need secret protection.
-Provider keys are visible inside the browser process.
+Provider keys are visible inside the browser process. Keep provider calling
+logic separate from UI widgets so framework integrations can reuse the same
+transcription adapter.
 
 ## Design Principles
 

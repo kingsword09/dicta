@@ -87,16 +87,18 @@ enters live mode. Environment variables mirror the provider flags; run
 
 ## Web
 
-For local browser use without a backend:
+For browser integration without a backend:
 
 ```console
-$ open web/direct/index.html
+$ python3 -m http.server 8765
+$ open http://127.0.0.1:8765/web/direct/
 ```
 
-`web/direct` is a static page for CORS-enabled OpenAI-compatible endpoints.
-`crates/vo-web` is the browser WASM boundary for provider, microphone, and
-storage APIs. See [docs/web-direct.md](docs/web-direct.md) and
-[docs/web-wasm.md](docs/web-wasm.md).
+`web/direct` provides a dependency-free browser transcription module plus a
+static integration demo for Web Components, plain JavaScript, and React voice UI
+components such as AI Elements `SpeechInput`. `crates/vo-web` is the browser
+WASM boundary for provider, microphone, and storage APIs. See
+[docs/web-direct.md](docs/web-direct.md) and [docs/web-wasm.md](docs/web-wasm.md).
 
 ## Development
 

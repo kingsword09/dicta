@@ -3,20 +3,21 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>vo direct transcription</title>
+  <title>vo speech integration</title>
+  <link rel="icon" href="data:,">
   <style>
     :root {
       color-scheme: light;
       --bg: oklch(0.975 0.008 205);
-      --panel: oklch(0.995 0.004 205);
-      --ink: oklch(0.21 0.018 230);
-      --muted: oklch(0.48 0.018 230);
-      --line: oklch(0.86 0.012 220);
+      --surface: oklch(0.995 0.004 205);
+      --ink: oklch(0.2 0.018 230);
+      --muted: oklch(0.46 0.018 230);
+      --line: oklch(0.84 0.012 220);
       --field: oklch(0.985 0.006 205);
-      --accent: oklch(0.56 0.12 172);
-      --accent-strong: oklch(0.42 0.11 174);
-      --danger: oklch(0.53 0.16 28);
-      --shadow: 0 18px 50px color-mix(in oklch, var(--ink) 12%, transparent);
+      --accent: oklch(0.55 0.12 172);
+      --accent-strong: oklch(0.4 0.11 174);
+      --danger: oklch(0.52 0.16 28);
+      --shadow: 0 16px 46px color-mix(in oklch, var(--ink) 10%, transparent);
       --space-xs: 4px;
       --space-sm: 8px;
       --space-md: 12px;
@@ -50,59 +51,53 @@
 
     header {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: var(--space-xl);
-      align-items: end;
+      gap: var(--space-md);
       margin-bottom: var(--space-2xl);
     }
 
     h1 {
-      margin: 0;
       max-width: 760px;
-      font-size: clamp(2rem, 5vw, 4.5rem);
-      line-height: 0.95;
+      margin: 0;
+      font-size: clamp(2rem, 5vw, 4rem);
+      line-height: 0.98;
       letter-spacing: 0;
       font-weight: 760;
     }
 
+    header p {
+      max-width: 68ch;
+      margin: 0;
+      color: var(--muted);
+      font-size: 1.04rem;
+      line-height: 1.65;
+    }
+
     .eyebrow {
-      margin: 0 0 var(--space-md);
       color: var(--accent-strong);
       font-size: 0.78rem;
-      font-weight: 760;
+      font-weight: 800;
       letter-spacing: 0.08em;
       text-transform: uppercase;
-    }
-
-    .status {
-      min-width: 190px;
-      padding: var(--space-md) var(--space-lg);
-      border: 1px solid var(--line);
-      background: color-mix(in oklch, var(--panel) 86%, transparent);
-      box-shadow: var(--shadow);
-      font-size: 0.95rem;
-    }
-
-    .status strong {
-      display: block;
-      margin-bottom: var(--space-xs);
-      font-size: 0.78rem;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: var(--muted);
     }
 
     .workspace {
       display: grid;
-      grid-template-columns: minmax(280px, 380px) minmax(0, 1fr);
+      grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
       gap: var(--space-xl);
       align-items: start;
     }
 
+    .workspace > *,
+    .panel,
+    details,
+    pre {
+      min-width: 0;
+    }
+
     form,
-    .output {
+    .panel {
       border: 1px solid var(--line);
-      background: color-mix(in oklch, var(--panel) 94%, transparent);
+      background: color-mix(in oklch, var(--surface) 94%, transparent);
       box-shadow: var(--shadow);
     }
 
@@ -120,11 +115,10 @@
     label {
       color: var(--muted);
       font-size: 0.82rem;
-      font-weight: 700;
+      font-weight: 760;
     }
 
     input,
-    select,
     textarea {
       width: 100%;
       border: 1px solid var(--line);
@@ -134,173 +128,136 @@
       font: inherit;
     }
 
-    input,
-    select {
+    input {
       min-height: 44px;
       padding: 0 var(--space-md);
     }
 
-    input[type="file"] {
-      padding: 10px var(--space-md);
-    }
-
     textarea {
-      min-height: 120px;
-      resize: vertical;
+      min-height: 96px;
       padding: var(--space-md);
+      resize: vertical;
       line-height: 1.5;
     }
 
     input:focus-visible,
-    select:focus-visible,
     textarea:focus-visible,
-    button:focus-visible {
+    button:focus-visible,
+    vo-speech-recorder:focus-visible {
       outline: 3px solid color-mix(in oklch, var(--accent) 34%, transparent);
       outline-offset: 2px;
     }
 
-    .advanced {
+    .panel {
       display: grid;
-      gap: var(--space-lg);
-      padding-top: var(--space-sm);
-      border-top: 1px solid var(--line);
+      gap: var(--space-xl);
+      padding: var(--space-xl);
     }
 
-    .segmented {
+    .component-host {
       display: grid;
-      grid-template-columns: 1fr 1fr;
+      gap: var(--space-lg);
+      align-content: start;
+      min-height: 220px;
+      padding: var(--space-xl);
       border: 1px solid var(--line);
-      background: var(--field);
+      background: var(--surface);
     }
 
-    .segmented label {
-      min-height: 44px;
-      display: grid;
-      place-items: center;
-      color: var(--ink);
-      cursor: pointer;
-      font-size: 0.92rem;
-      font-weight: 800;
-    }
-
-    .segmented label + label {
-      border-left: 1px solid var(--line);
-    }
-
-    .segmented input {
-      position: absolute;
-      opacity: 0;
-      pointer-events: none;
-    }
-
-    .segmented label:has(input:checked) {
-      background: var(--accent);
-      color: oklch(0.985 0.006 172);
-    }
-
-    .source-panel {
-      display: grid;
-      gap: var(--space-lg);
-    }
-
-    .source-panel[hidden] {
-      display: none;
-    }
-
-    .record-actions {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: var(--space-sm);
-    }
-
-    button {
-      min-height: 48px;
-      border: 0;
-      border-radius: 0;
-      background: var(--accent);
-      color: oklch(0.985 0.006 172);
-      cursor: pointer;
-      font: inherit;
-      font-weight: 800;
-    }
-
-    button:hover {
-      background: var(--accent-strong);
-    }
-
-    button:disabled {
-      cursor: not-allowed;
-      opacity: 0.58;
-    }
-
-    .output {
-      min-height: 540px;
-      display: grid;
-      grid-template-rows: auto 1fr auto;
-    }
-
-    .output-head {
+    .component-row {
       display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-md);
       align-items: center;
       justify-content: space-between;
-      gap: var(--space-md);
-      padding: var(--space-lg) var(--space-xl);
-      border-bottom: 1px solid var(--line);
     }
 
-    .output-head h2 {
-      margin: 0;
-      font-size: 1rem;
-      line-height: 1.2;
+    vo-speech-recorder {
+      --vo-bg: var(--field);
+      --vo-ink: var(--ink);
+      --vo-muted: var(--muted);
+      --vo-line: var(--line);
+      --vo-accent: var(--accent);
+      --vo-danger: var(--danger);
     }
 
-    .meta {
+    .status {
+      min-height: 24px;
       color: var(--muted);
-      font-size: 0.84rem;
+      font-size: 0.92rem;
     }
 
-    pre {
+    .result {
+      min-height: 84px;
       margin: 0;
-      min-height: 0;
-      padding: var(--space-xl);
+      padding: var(--space-lg);
       overflow: auto;
+      border: 1px solid var(--line);
+      background: var(--field);
+      color: var(--ink);
       white-space: pre-wrap;
       word-break: break-word;
-      font: 1rem/1.65 ui-serif, Georgia, "Times New Roman", serif;
+      font: 1rem/1.6 ui-serif, Georgia, "Times New Roman", serif;
     }
 
     .error {
       color: var(--danger);
     }
 
-    .copy-row {
-      display: flex;
-      justify-content: flex-end;
-      padding: var(--space-lg) var(--space-xl);
-      border-top: 1px solid var(--line);
+    .code-grid {
+      display: grid;
+      gap: var(--space-lg);
     }
 
-    .secondary {
-      width: auto;
+    details {
+      border: 1px solid var(--line);
+      background: var(--surface);
+    }
+
+    summary {
+      min-height: 44px;
+      display: flex;
+      align-items: center;
+      padding: 0 var(--space-lg);
+      cursor: pointer;
+      color: var(--ink);
+      font-weight: 760;
+    }
+
+    pre {
+      margin: 0;
+      overflow: auto;
+      padding: var(--space-lg);
+      border-top: 1px solid var(--line);
+      background: oklch(0.24 0.018 230);
+      color: oklch(0.96 0.006 205);
+      font: 0.88rem/1.55 ui-monospace, "SFMono-Regular", Consolas, monospace;
+    }
+
+    .actions {
+      display: flex;
+      justify-content: flex-end;
+    }
+
+    button {
       min-height: 40px;
       padding: 0 var(--space-lg);
       border: 1px solid var(--line);
+      border-radius: 0;
       background: transparent;
       color: var(--ink);
+      cursor: pointer;
+      font: inherit;
+      font-weight: 760;
     }
 
-    .secondary:hover {
-      background: color-mix(in oklch, var(--accent) 10%, var(--panel));
+    button:hover {
+      background: color-mix(in oklch, var(--accent) 10%, var(--surface));
     }
 
-    @media (max-width: 820px) {
-      header,
+    @media (max-width: 840px) {
       .workspace {
         grid-template-columns: 1fr;
-      }
-
-      .status {
-        min-width: 0;
       }
     }
   </style>
@@ -308,21 +265,19 @@
 <body>
   <main>
     <header>
-      <div>
-        <p class="eyebrow">vo direct provider</p>
-        <h1>Transcribe without running a backend.</h1>
-      </div>
-      <div class="status" id="status" role="status" aria-live="polite">
-        <strong>Status</strong>
-        Idle
-      </div>
+      <span class="eyebrow">vo web integration</span>
+      <h1>Recorder UI outside, transcription adapter inside.</h1>
+      <p>
+        Use the same browser module as a Web Component, a React handler for
+        AI Elements SpeechInput, or a plain Blob-to-text function.
+      </p>
     </header>
 
     <section class="workspace">
-      <form id="form">
+      <form id="configForm">
         <div class="field">
-          <label for="endpoint">API base</label>
-          <input id="endpoint" name="endpoint" type="url" autocomplete="url" placeholder="https://api.example.com" required>
+          <label for="apiBase">API base</label>
+          <input id="apiBase" name="apiBase" type="url" autocomplete="url" placeholder="https://api.example.com" required>
         </div>
 
         <div class="field">
@@ -336,275 +291,156 @@
         </div>
 
         <div class="field">
-          <label>Audio source</label>
-          <div class="segmented" role="radiogroup" aria-label="Audio source">
-            <label>
-              <input type="radio" name="source" value="file" checked>
-              File
-            </label>
-            <label>
-              <input type="radio" name="source" value="mic">
-              Microphone
-            </label>
-          </div>
+          <label for="language">Language hint</label>
+          <input id="language" name="language" type="text" placeholder="zh-CN">
         </div>
 
-        <div class="source-panel" id="filePanel">
-          <div class="field">
-            <label for="audio">Audio file</label>
-            <input id="audio" name="audio" type="file" accept="audio/*,.m4a,.mp3,.wav,.webm,.ogg,.flac,.aac">
-          </div>
+        <div class="field">
+          <label for="prompt">Prompt</label>
+          <textarea id="prompt" name="prompt" placeholder="Optional vocabulary or context"></textarea>
         </div>
-
-        <div class="source-panel" id="micPanel" hidden>
-          <div class="field">
-            <label for="recordSeconds">Record seconds</label>
-            <input id="recordSeconds" name="recordSeconds" type="number" min="1" max="300" step="1" value="8">
-          </div>
-          <div class="record-actions">
-            <button class="secondary" id="record" type="button">Record</button>
-            <button class="secondary" id="stop" type="button" disabled>Stop</button>
-          </div>
-        </div>
-
-        <div class="advanced">
-          <div class="field">
-            <label for="language">Language hint</label>
-            <input id="language" name="language" type="text" placeholder="en-US">
-          </div>
-
-          <div class="field">
-            <label for="prompt">Prompt</label>
-            <textarea id="prompt" name="prompt" placeholder="Optional vocabulary or context"></textarea>
-          </div>
-        </div>
-
-        <button id="submit" type="submit">Transcribe file</button>
       </form>
 
-      <article class="output">
-        <div class="output-head">
-          <h2>Transcript</h2>
-          <span class="meta" id="meta">No file submitted</span>
+      <article class="panel">
+        <div class="component-host">
+          <div class="component-row">
+            <vo-speech-recorder id="recorder" max-seconds="60"></vo-speech-recorder>
+            <button id="copy" type="button">Copy transcript</button>
+          </div>
+          <div id="status" class="status" role="status" aria-live="polite">Ready</div>
+          <pre id="result" class="result">Record audio to test the embeddable transcription flow.</pre>
         </div>
-        <pre id="result">Choose a file or record from the microphone, then send audio to an OpenAI-compatible transcription endpoint.</pre>
-        <div class="copy-row">
-          <button class="secondary" id="copy" type="button">Copy</button>
+
+        <div class="code-grid">
+          <details open>
+            <summary>AI Elements SpeechInput</summary>
+            <pre><code>import { SpeechInput } from "@/components/ai-elements/speech-input";
+import { createVoAudioRecordedHandler } from "./vo-transcriber.js";
+
+const transcribeWithVo = createVoAudioRecordedHandler({
+  apiBase: "https://api.example.com",
+  apiKey: "...",
+  model: "doubao-asr",
+  language: "zh-CN",
+});
+
+export function Composer() {
+  return (
+    &lt;SpeechInput
+      onAudioRecorded={transcribeWithVo}
+      onTranscriptionChange={(text) =&gt; setInput(text)}
+    /&gt;
+  );
+}</code></pre>
+          </details>
+
+          <details>
+            <summary>Web Component</summary>
+            <pre><code>&lt;script type="module" src="./vo-transcriber.js"&gt;&lt;/script&gt;
+
+&lt;vo-speech-recorder
+  api-base="https://api.example.com"
+  api-key="..."
+  model="doubao-asr"
+  language="zh-CN"
+&gt;&lt;/vo-speech-recorder&gt;
+
+&lt;script&gt;
+  document.querySelector("vo-speech-recorder")
+    .addEventListener("vo-transcription", (event) =&gt; {
+      console.log(event.detail.text);
+    });
+&lt;/script&gt;</code></pre>
+          </details>
+
+          <details>
+            <summary>Plain JavaScript</summary>
+            <pre><code>import { transcribeAudio } from "./vo-transcriber.js";
+
+const result = await transcribeAudio(audioBlob, {
+  apiBase: "https://api.example.com",
+  apiKey: "...",
+  model: "doubao-asr",
+});
+
+console.log(result.text);</code></pre>
+          </details>
         </div>
       </article>
     </section>
   </main>
 
-  <script>
-    const form = document.querySelector("#form");
-    const statusBox = document.querySelector("#status");
+  <script type="module">
+    import { transcribeAudio } from "./vo-transcriber.js";
+
+    const form = document.querySelector("#configForm");
+    const recorder = document.querySelector("#recorder");
+    const status = document.querySelector("#status");
     const result = document.querySelector("#result");
-    const meta = document.querySelector("#meta");
-    const submit = document.querySelector("#submit");
     const copy = document.querySelector("#copy");
-    const filePanel = document.querySelector("#filePanel");
-    const micPanel = document.querySelector("#micPanel");
-    const audioInput = document.querySelector("#audio");
-    const recordSeconds = document.querySelector("#recordSeconds");
-    const record = document.querySelector("#record");
-    const stop = document.querySelector("#stop");
-    let recordedFile = null;
-    let recorder = null;
-    let recordTimer = null;
-    let mediaStream = null;
 
-    function transcriptionUrl(base) {
-      const trimmed = base.replace(/\/+$/, "");
-      return trimmed.endsWith("/v1")
-        ? `${trimmed}/audio/transcriptions`
-        : `${trimmed}/v1/audio/transcriptions`;
-    }
-
-    function setStatus(text) {
-      statusBox.innerHTML = `<strong>Status</strong>${text}`;
-    }
-
-    function showError(message) {
-      result.classList.add("error");
-      result.textContent = message;
-    }
-
-    function showText(text) {
-      result.classList.remove("error");
-      result.textContent = text || "(empty transcript)";
-    }
-
-    function selectedSource() {
-      return document.querySelector("input[name='source']:checked")?.value || "file";
-    }
-
-    function setSource(source) {
-      const isMic = source === "mic";
-      const selected = isMic ? "mic" : "file";
-      document.querySelectorAll("input[name='source']").forEach((input) => {
-        input.checked = input.value === selected;
-      });
-      filePanel.hidden = isMic;
-      micPanel.hidden = !isMic;
-      submit.textContent = isMic ? "Transcribe recording" : "Transcribe file";
-      meta.textContent = isMic
-        ? (recordedFile ? `${recordedFile.name} · ${(recordedFile.size / 1024 / 1024).toFixed(2)} MB` : "No recording")
-        : "No file submitted";
-    }
-
-    function stopRecording() {
-      if (recordTimer) {
-        clearTimeout(recordTimer);
-        recordTimer = null;
-      }
-      if (recorder && recorder.state !== "inactive") {
-        recorder.stop();
-      }
-    }
-
-    async function sendAudio(file, data) {
-      const endpoint = String(data.get("endpoint") || "").trim();
-      if (!endpoint || !(file instanceof File) || file.size === 0) {
-        showError("Choose an API base and a non-empty audio source.");
-        return;
-      }
-
-      const body = new FormData();
-      body.set("file", file, file.name);
-      body.set("model", String(data.get("model") || "doubao-asr"));
-      body.set("response_format", "json");
-
-      const language = String(data.get("language") || "").trim();
-      const prompt = String(data.get("prompt") || "").trim();
-      if (language) body.set("language", language);
-      if (prompt) body.set("prompt", prompt);
-
-      const headers = new Headers();
-      const apiKey = String(data.get("apiKey") || "").trim();
-      if (apiKey) headers.set("Authorization", `Bearer ${apiKey}`);
-
-      submit.disabled = true;
-      record.disabled = true;
-      setStatus("Sending");
-      meta.textContent = `${file.name} · ${(file.size / 1024 / 1024).toFixed(2)} MB`;
-      showText("Waiting for transcription...");
-
-      try {
-        const started = performance.now();
-        const response = await fetch(transcriptionUrl(endpoint), {
-          method: "POST",
-          headers,
-          body,
-        });
-        const raw = await response.text();
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}: ${raw}`);
-        }
-
-        let parsed;
-        try {
-          parsed = JSON.parse(raw);
-        } catch {
-          parsed = { text: raw };
-        }
-
-        showText(parsed.text || raw);
-        setStatus("Complete");
-        meta.textContent = `${file.name} · ${((performance.now() - started) / 1000).toFixed(1)}s`;
-      } catch (error) {
-        setStatus("Failed");
-        showError(error instanceof Error ? error.message : String(error));
-      } finally {
-        submit.disabled = false;
-        record.disabled = false;
-      }
-    }
-
-    form.addEventListener("submit", async (event) => {
-      event.preventDefault();
+    function currentConfig() {
       const data = new FormData(form);
-      if (selectedSource() === "mic") {
-        if (!recordedFile) {
-          showError("Record microphone audio before transcribing.");
-          return;
-        }
-        await sendAudio(recordedFile, data);
+      return {
+        apiBase: String(data.get("apiBase") || ""),
+        apiKey: String(data.get("apiKey") || ""),
+        model: String(data.get("model") || "doubao-asr"),
+        language: String(data.get("language") || ""),
+        prompt: String(data.get("prompt") || ""),
+      };
+    }
+
+    function syncRecorderAttributes() {
+      const config = currentConfig();
+      recorder.setAttribute("api-base", config.apiBase);
+      recorder.setAttribute("model", config.model);
+      setOptionalAttribute("api-key", config.apiKey);
+      setOptionalAttribute("language", config.language);
+      setOptionalAttribute("prompt", config.prompt);
+    }
+
+    function setOptionalAttribute(name, value) {
+      if (value) {
+        recorder.setAttribute(name, value);
       } else {
-        await sendAudio(data.get("audio"), data);
+        recorder.removeAttribute(name);
       }
+    }
+
+    recorder.transcriber = (file) => transcribeAudio(file, currentConfig());
+
+    form.addEventListener("input", syncRecorderAttributes);
+    form.addEventListener("submit", (event) => event.preventDefault());
+    syncRecorderAttributes();
+
+    recorder.addEventListener("vo-state-change", (event) => {
+      const state = event.detail.state;
+      const labels = {
+        idle: "Ready",
+        recording: "Recording",
+        stopping: "Saving recording",
+        transcribing: "Transcribing",
+        complete: "Complete",
+        error: "Failed",
+      };
+      status.textContent = labels[state] || state;
     });
 
-    document.querySelectorAll("input[name='source']").forEach((input) => {
-      input.addEventListener("change", () => setSource(selectedSource()));
+    recorder.addEventListener("vo-transcription", (event) => {
+      result.classList.remove("error");
+      result.textContent = event.detail.text || "(empty transcript)";
+      status.textContent = `${event.detail.audio?.name || "audio"} · ${((event.detail.durationMs || 0) / 1000).toFixed(1)}s`;
     });
 
-    record.addEventListener("click", async () => {
-      if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
-        showError("This browser does not support microphone recording.");
-        return;
-      }
-
-      const seconds = Number(recordSeconds.value || 0);
-      if (!Number.isFinite(seconds) || seconds <= 0) {
-        showError("Record seconds must be greater than zero.");
-        return;
-      }
-
-      try {
-        recordedFile = null;
-        const chunks = [];
-        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        recorder = new MediaRecorder(mediaStream);
-
-        recorder.addEventListener("dataavailable", (event) => {
-          if (event.data.size > 0) chunks.push(event.data);
-        });
-        recorder.addEventListener("stop", () => {
-          mediaStream?.getTracks().forEach((track) => track.stop());
-          mediaStream = null;
-          const type = recorder.mimeType || "audio/webm";
-          const blob = new Blob(chunks, { type });
-          const ext = type.includes("mp4") ? "m4a" : "webm";
-          recordedFile = new File([blob], `vo-recording.${ext}`, { type });
-          record.disabled = false;
-          stop.disabled = true;
-          submit.disabled = false;
-          setStatus("Recorded");
-          meta.textContent = `${recordedFile.name} · ${(recordedFile.size / 1024 / 1024).toFixed(2)} MB`;
-          showText("Recording is ready. Submit it when you want transcription.");
-        });
-
-        recorder.start();
-        record.disabled = true;
-        stop.disabled = false;
-        submit.disabled = true;
-        setStatus("Recording");
-        showText(`Recording microphone for ${seconds.toFixed(0)}s...`);
-        recordTimer = setTimeout(stopRecording, seconds * 1000);
-      } catch (error) {
-        setStatus("Failed");
-        record.disabled = false;
-        stop.disabled = true;
-        submit.disabled = false;
-        showError(error instanceof Error ? error.message : String(error));
-      }
-    });
-
-    stop.addEventListener("click", stopRecording);
-
-    audioInput.addEventListener("change", () => {
-      const file = audioInput.files?.[0];
-      if (file) {
-        meta.textContent = `${file.name} · ${(file.size / 1024 / 1024).toFixed(2)} MB`;
-      }
+    recorder.addEventListener("vo-error", (event) => {
+      result.classList.add("error");
+      result.textContent = event.detail.message;
     });
 
     copy.addEventListener("click", async () => {
       await navigator.clipboard.writeText(result.textContent || "");
-      setStatus("Copied");
+      status.textContent = "Copied";
     });
-
-    setSource("file");
   </script>
 </body>
 </html>
