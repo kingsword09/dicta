@@ -6,7 +6,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use vo_asr::{
     AsrCapabilities, AsrError, AsrOptions, AsrProvider, AsrResult, LiveAsrOptions, LiveAsrProvider,
-    LiveCapabilities, LiveEventCallback, LiveModeKind, Transcript,
+    LiveCapabilities, LiveEventCallback, LiveModeKind, ProviderCapabilities, Transcript,
 };
 use vo_core::{AudioInput, LiveEvent, TranscriptEvent};
 
@@ -232,11 +232,11 @@ impl AsrProvider for NativeAdapterAsr {
     }
 
     fn capabilities(&self) -> AsrCapabilities {
-        AsrCapabilities {
-            batch_file: true,
-            streaming: false,
-            requires_network: false,
-        }
+        native_adapter_capabilities().batch
+    }
+
+    fn provider_capabilities(&self) -> ProviderCapabilities {
+        native_adapter_capabilities()
     }
 }
 
@@ -257,6 +257,22 @@ impl LiveAsrProvider for NativeAdapterAsr {
 
     fn live_capabilities(&self) -> LiveCapabilities {
         native_adapter_live_capabilities()
+    }
+}
+
+pub fn native_adapter_capabilities() -> ProviderCapabilities {
+    ProviderCapabilities {
+        batch: AsrCapabilities {
+            batch_file: true,
+            streaming: false,
+            requires_network: false,
+        },
+        live: Some(native_adapter_live_capabilities()),
+        notes: vec![
+            "Native adapter capabilities depend on the configured adapter binary.".to_owned(),
+            "The bundled Apple Speech adapter requires supported macOS on-device ASR APIs."
+                .to_owned(),
+        ],
     }
 }
 

@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
 use tokio::fs;
-use vo_asr::{AsrCapabilities, AsrError, AsrOptions, AsrProvider, AsrResult, Transcript};
+use vo_asr::{
+    AsrCapabilities, AsrError, AsrOptions, AsrProvider, AsrResult, ProviderCapabilities, Transcript,
+};
 use vo_core::AudioInput;
 
 #[derive(Debug, Clone)]
@@ -154,10 +156,25 @@ impl AsrProvider for OpenAiCompatibleAsr {
     }
 
     fn capabilities(&self) -> AsrCapabilities {
-        AsrCapabilities {
+        openai_compatible_capabilities().batch
+    }
+
+    fn provider_capabilities(&self) -> ProviderCapabilities {
+        openai_compatible_capabilities()
+    }
+}
+
+pub fn openai_compatible_capabilities() -> ProviderCapabilities {
+    ProviderCapabilities {
+        batch: AsrCapabilities {
             batch_file: true,
             streaming: false,
             requires_network: true,
-        }
+        },
+        live: None,
+        notes: vec![
+            "OpenAI-compatible transcription is batch file based.".to_owned(),
+            "Remote capability discovery is not standardized across compatible APIs.".to_owned(),
+        ],
     }
 }

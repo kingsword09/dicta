@@ -103,7 +103,77 @@ owns the top-level command surface and delegates Apple-only system capture/event
 to that adapter. `--apple-adapter` and `VO_APPLE_ADAPTER` are still accepted as
 compatibility aliases for older scripts.
 
-## Live provider capabilities
+## Provider capabilities
+
+Every ASR provider exposes a single provider-level capability declaration through
+`vo_asr::ProviderCapabilities`. This is the source of truth for CLI validation,
+`vo --capabilities`, and the capability section in `vo --doctor`.
+
+When adding a provider, keep the declaration in the provider crate and include:
+
+- `batch`: file transcription support, batch streaming support, and whether the
+  provider requires network access.
+- `live`: optional live-mode support and flags for mic, speaker, streaming
+  audio, partial results, finalized results, translation, voice processing,
+  device selection, network access, and expected latency.
+- `notes`: short operator-facing caveats, such as adapter requirements or
+  non-standard remote capability discovery.
+
+Only add Rust provider code when the protocol or runtime integration is new. For
+another service that already speaks an existing protocol, add a provider profile
+instead. Profiles describe a configured service instance while reusing the
+implementation capability ceiling from its `kind`.
+
+Built-in profiles can be selected directly:
+
+```console
+$ vo --input audio.wav --provider openai
+$ vo --capabilities --provider openai --json
+```
+
+Custom profiles are loaded from `~/.config/vo/providers.toml`, or from an
+explicit `--provider-config` path:
+
+```toml
+[providers.siliconflow]
+kind = "openai-compatible"
+api_base = "https://api.siliconflow.cn"
+default_model = "FunAudioLLM/SenseVoiceSmall"
+api_key_env = "SILICONFLOW_API_KEY"
+# api_key = "sk-..." # optional direct key for local/private configs
+notes = ["SiliconFlow OpenAI-compatible profile."]
+batch_file = true
+streaming = false
+requires_network = true
+live_enabled = false
+```
+
+```console
+$ vo --input audio.wav --provider siliconflow
+$ vo --capabilities --provider siliconflow --json
+```
+
+Effective capabilities are the provider implementation's maximum capabilities
+intersected with the profile declaration. A profile cannot enable functionality
+that the implementation does not support; for example, an `openai-compatible`
+profile that sets `live_enabled = true` reports a local configuration error.
+For API keys, `--api-key` / `VO_ASR_API_KEY` wins over profile settings; profile
+`api_key` wins over `api_key_env`.
+
+Capability diagnostics are local and explicit. `vo --capabilities` resolves the
+selected backend, checks local configuration requirements such as a native
+adapter path, and prints the declared capability flags. It does not contact
+remote ASR services by default because OpenAI-compatible providers do not share a
+standard capability-discovery API.
+
+```console
+$ vo --capabilities
+$ vo --capabilities --asr doubao --json
+$ vo --capabilities --asr apple --native-adapter ./vo-adapter-apple-speech
+$ vo --capabilities --provider siliconflow --provider-config ./providers.toml
+```
+
+## Live provider events
 
 Live providers use the shared `vo-core::LiveEvent` stream:
 
@@ -114,5 +184,4 @@ Meta -> Status? -> Volatile? -> Finalized -> Translated? -> Eof
 Apple live is a streaming provider: it supports mic/speaker capture, partial
 results, finalized results, translation, voice processing, and device selection.
 Doubao live is a chunked provider: it supports microphone capture and finalized
-results only, with status events for the current chunk phase. `vo --doctor`
-reports the resolved live backend and its capability flags.
+results only, with status events for the current chunk phase.
