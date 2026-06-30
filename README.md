@@ -28,6 +28,7 @@ $ vo --no-speaker                     # Mic only
 $ vo --no-mic --src en-US --dst ja-JP # Speaker only on Apple mode
 $ vo --select-device                  # Pick and pin mic / speaker at startup
 $ vo --json | jq                      # JSONL output for piping
+$ vo --capabilities                   # ASR capability diagnostics
 $ vo --doctor                         # Environment diagnostics
 ```
 
@@ -56,7 +57,13 @@ $ vo --mic-duration 5 \
     --api-base https://api.openai.com \
     --api-key "$VO_ASR_API_KEY" \
     --api-model whisper-1
+$ vo --input meeting.wav --provider openai
 ```
+
+Named provider profiles let OpenAI-compatible services share the same Rust
+implementation without adding a new backend. Built-in profiles can be selected
+with `--provider`; custom profiles are loaded from `~/.config/vo/providers.toml`
+or `--provider-config` and may use either `api_key_env` or direct `api_key`.
 
 Apple on-device mode requires macOS 26 and an Apple Speech adapter:
 
@@ -79,11 +86,14 @@ $ vo --input meeting.wav --transcript meeting.txt
 $ vo --input meeting.wav --json --transcript meeting.jsonl
 $ vo --doctor
 $ vo --doctor --json
+$ vo --capabilities
+$ vo --capabilities --asr doubao --json
+$ vo --capabilities --provider openai --json
 ```
 
 `--input` and `--mic-duration` are mutually exclusive. Without either flag, `vo`
 enters live mode. Environment variables mirror the provider flags; run
-`vo --help` and `vo --doctor` for local details.
+`vo --help`, `vo --capabilities`, and `vo --doctor` for local details.
 
 ## Web
 
@@ -126,10 +136,12 @@ The primary runtime path is Rust. There is no Python sidecar or local FastAPI
 service. Browser direct mode requires provider CORS support, and browser-visible
 API keys are only appropriate for personal/local workflows.
 
-Live providers declare their capabilities. Apple live is streaming and can emit
-partial/final/translation events. Doubao live is chunked microphone transcription
-with chunk status and finalized text only; use `--doctor` to inspect the active
-backend.
+Provider implementations declare their maximum batch and live capabilities.
+Named profiles can narrow those capabilities for OpenAI-compatible services
+without new Rust code. Apple live is streaming and can emit
+partial/final/translation events. Doubao live is chunked microphone
+transcription with chunk status and finalized text only; use `--capabilities` to
+inspect the resolved provider and `--doctor` for full environment diagnostics.
 
 ## License
 

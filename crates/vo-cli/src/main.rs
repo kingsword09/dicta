@@ -1,19 +1,24 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{cmp, env};
 use vo_asr::{
-    AsrOptions, AsrProvider, LiveAsrOptions, LiveAsrProvider, LiveCapabilities, LiveModeKind,
+    AsrCapabilities, AsrOptions, AsrProvider, LiveAsrOptions, LiveAsrProvider, LiveCapabilities,
+    LiveModeKind, ProviderCapabilities,
 };
-use vo_asr_doubao::{doubao_live_capabilities, DoubaoAsr, DoubaoConfig};
+use vo_asr_doubao::{doubao_capabilities, doubao_live_capabilities, DoubaoAsr, DoubaoConfig};
 use vo_asr_native_adapter::{
-    native_adapter_live_capabilities, NativeAdapterAsr, NativeAdapterConfig,
+    native_adapter_capabilities, native_adapter_live_capabilities, NativeAdapterAsr,
+    NativeAdapterConfig,
 };
-use vo_asr_openai_compatible::{OpenAiCompatibleAsr, OpenAiCompatibleConfig};
+use vo_asr_openai_compatible::{
+    openai_compatible_capabilities, OpenAiCompatibleAsr, OpenAiCompatibleConfig,
+};
 use vo_core::{
     AudioChannel, AudioInput, EventTimestamp, LiveEvent, LiveMetaEvent, LiveStatusEvent,
     LiveStatusPhase, LiveTranslatedEvent, LiveVolatileEvent, TranscriptEvent, TranscriptSource,
@@ -44,6 +49,20 @@ struct Cli {
         help = "Provider model id"
     )]
     api_model: Option<String>,
+
+    #[arg(
+        long,
+        env = "VO_PROVIDER",
+        help = "Named provider profile from built-ins or provider config"
+    )]
+    provider: Option<String>,
+
+    #[arg(
+        long = "provider-config",
+        env = "VO_PROVIDER_CONFIG",
+        help = "Path to provider profiles TOML"
+    )]
+    provider_config: Option<PathBuf>,
 
     #[arg(long, env = "VO_SRC", help = "Source language/locale hint")]
     src: Option<String>,
@@ -137,6 +156,9 @@ struct Cli {
 
     #[arg(long, help = "Print environment and backend diagnostics")]
     doctor: bool,
+
+    #[arg(long, help = "Print ASR provider capability diagnostics")]
+    capabilities: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -158,9 +180,89 @@ impl AsrBackend {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct ProviderProfilesFile {
+    #[serde(default)]
+    providers: BTreeMap<String, ProviderProfile>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ProviderProfile {
+    kind: ProfileProviderKind,
+    #[serde(default)]
+    api_base: Option<String>,
+    #[serde(default)]
+    default_model: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    api_key_env: Option<String>,
+    #[serde(default)]
+    batch_file: Option<bool>,
+    #[serde(default)]
+    streaming: Option<bool>,
+    #[serde(default)]
+    requires_network: Option<bool>,
+    #[serde(default)]
+    live_enabled: Option<bool>,
+    #[serde(default)]
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ProfileProviderKind {
+    OpenaiCompatible,
+}
+
+impl ProfileProviderKind {
+    fn backend(self) -> AsrBackend {
+        match self {
+            Self::OpenaiCompatible => AsrBackend::OpenaiCompatible,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenaiCompatible => "openai-compatible",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedProviderProfile {
+    name: String,
+    profile: ProviderProfile,
+}
+
+#[derive(Debug, Clone)]
+struct EffectiveProvider {
+    backend: AsrBackend,
+    profile: Option<ResolvedProviderProfile>,
+    capabilities: ProviderCapabilities,
+    config_error: Option<String>,
+}
+
+impl EffectiveProvider {
+    fn profile_name(&self) -> Option<&str> {
+        self.profile.as_ref().map(|profile| profile.name.as_str())
+    }
+
+    fn profile_kind(&self) -> Option<&'static str> {
+        self.profile
+            .as_ref()
+            .map(|profile| profile.profile.kind.as_str())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.capabilities {
+        run_capabilities(&cli)?;
+        return Ok(());
+    }
+
     if cli.doctor {
         run_doctor(&cli)?;
         return Ok(());
@@ -287,6 +389,18 @@ fn resolve_live_backend(cli: &Cli) -> Result<AsrBackend> {
 }
 
 fn resolve_live_backend_for(cli: &Cli, apple_support: &AppleSupport) -> Result<AsrBackend> {
+    if let Some(profile) = resolve_provider_profile(cli)? {
+        let effective = effective_provider_for(cli, apple_support, true)?;
+        if effective.capabilities.live.is_some() {
+            return Ok(effective.backend);
+        }
+        bail!(
+            "provider profile '{}' ({}) does not support live mode; use --input or --mic-duration for batch transcription",
+            profile.name,
+            profile.profile.kind.as_str()
+        );
+    }
+
     match cli.asr {
         AsrBackend::Auto | AsrBackend::Apple => {
             if apple_support.supported {
@@ -1059,6 +1173,7 @@ fn validate_transcript_path(path: &PathBuf) -> Result<()> {
 struct DoctorReport {
     system: SystemReport,
     backend: BackendReport,
+    capabilities: CapabilitiesReport,
     live: LiveReport,
     audio: AudioReport,
     runtime: RuntimeReport,
@@ -1077,6 +1192,9 @@ struct SystemReport {
 struct BackendReport {
     requested: String,
     resolved: Option<String>,
+    provider: Option<String>,
+    provider_kind: Option<String>,
+    provider_config: Option<String>,
     api_base_configured: bool,
     api_key_configured: bool,
     model: String,
@@ -1105,6 +1223,44 @@ struct LiveReport {
 }
 
 #[derive(Debug, Serialize)]
+struct CapabilitiesReport {
+    requested: String,
+    resolved: Option<String>,
+    provider: Option<String>,
+    provider_kind: Option<String>,
+    provider_config: Option<String>,
+    model: String,
+    local_config_ok: bool,
+    local_config_error: Option<String>,
+    resolution_error: Option<String>,
+    batch: Option<BatchCapabilitiesReport>,
+    live: Option<LiveCapabilitiesReport>,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchCapabilitiesReport {
+    batch_file: bool,
+    streaming: bool,
+    requires_network: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct LiveCapabilitiesReport {
+    mode: String,
+    mic: bool,
+    speaker: bool,
+    streaming_audio: bool,
+    partial_results: bool,
+    finalized_results: bool,
+    translation: bool,
+    voice_processing: bool,
+    device_selection: bool,
+    requires_network: bool,
+    expected_latency: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct AudioReport {
     default_input_available: bool,
     name: Option<String>,
@@ -1127,6 +1283,16 @@ fn run_doctor(cli: &Cli) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print_doctor_text(&report);
+    }
+    Ok(())
+}
+
+fn run_capabilities(cli: &Cli) -> Result<()> {
+    let report = gather_capabilities_report(cli);
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_capabilities_text(&report);
     }
     Ok(())
 }
@@ -1158,23 +1324,42 @@ fn default_audio_report() -> AudioReport {
 
 fn gather_doctor_report_with_audio(cli: &Cli, audio: AudioReport) -> DoctorReport {
     let apple_support = apple_support();
-    let backend_result = resolve_backend_for(cli, &apple_support);
+    let effective_result = effective_provider_for(cli, &apple_support, false);
+    let backend_result = effective_result.as_ref().map(|provider| provider.backend);
     let resolved = backend_result
         .as_ref()
         .ok()
         .map(|backend| backend.as_str().to_owned());
-    let error = match &backend_result {
-        Ok(backend) => validate_backend_config(*backend, cli),
+    let error = match &effective_result {
+        Ok(provider) => provider.config_error.clone(),
         Err(err) => Some(err.to_string()),
     };
     let model = non_empty(&cli.api_model).unwrap_or_else(|| {
-        resolved
-            .as_deref()
-            .map(default_model_for_name)
-            .unwrap_or("whisper-1")
-            .to_owned()
+        effective_result
+            .as_ref()
+            .ok()
+            .and_then(|provider| {
+                if provider.backend == AsrBackend::OpenaiCompatible {
+                    Some(openai_compatible_model(cli, provider.profile.as_ref()))
+                } else {
+                    resolved
+                        .as_deref()
+                        .map(default_model_for_name)
+                        .map(ToOwned::to_owned)
+                }
+            })
+            .unwrap_or_else(|| "whisper-1".to_owned())
     });
+    let provider_name = effective_result
+        .as_ref()
+        .ok()
+        .and_then(|provider| provider.profile_name().map(ToOwned::to_owned));
+    let provider_kind = effective_result
+        .as_ref()
+        .ok()
+        .and_then(|provider| provider.profile_kind().map(ToOwned::to_owned));
     let live = gather_live_report(cli, &apple_support);
+    let capabilities = gather_capabilities_report_with_support(cli, &apple_support);
 
     DoctorReport {
         system: SystemReport {
@@ -1187,8 +1372,11 @@ fn gather_doctor_report_with_audio(cli: &Cli, audio: AudioReport) -> DoctorRepor
         backend: BackendReport {
             requested: cli.asr.as_str().to_owned(),
             resolved,
-            api_base_configured: non_empty(&cli.api_base).is_some(),
-            api_key_configured: non_empty(&cli.api_key).is_some(),
+            provider: provider_name,
+            provider_kind,
+            provider_config: provider_config_path(cli).map(|path| path.display().to_string()),
+            api_base_configured: configured_api_base(cli, effective_result.as_ref().ok()).is_some(),
+            api_key_configured: configured_api_key(cli, effective_result.as_ref().ok()).is_some(),
             model,
             doubao_credential_path: cli
                 .doubao_credential_path
@@ -1202,6 +1390,7 @@ fn gather_doctor_report_with_audio(cli: &Cli, audio: AudioReport) -> DoctorRepor
                 .map(|path| path.display().to_string()),
             error,
         },
+        capabilities,
         live,
         audio,
         runtime: RuntimeReport {
@@ -1209,6 +1398,181 @@ fn gather_doctor_report_with_audio(cli: &Cli, audio: AudioReport) -> DoctorRepor
             web_direct_available: true,
             native_adapter_supported_os: true,
         },
+    }
+}
+
+fn gather_capabilities_report(cli: &Cli) -> CapabilitiesReport {
+    let apple_support = apple_support();
+    gather_capabilities_report_with_support(cli, &apple_support)
+}
+
+fn gather_capabilities_report_with_support(
+    cli: &Cli,
+    apple_support: &AppleSupport,
+) -> CapabilitiesReport {
+    let effective_result = effective_provider_for(cli, apple_support, true);
+    let backend_result = effective_result.as_ref().map(|provider| provider.backend);
+    let resolved = backend_result
+        .as_ref()
+        .ok()
+        .map(|backend| backend.as_str().to_owned());
+    let resolution_error = effective_result.as_ref().err().map(ToString::to_string);
+    let local_config_error = effective_result
+        .as_ref()
+        .ok()
+        .and_then(|provider| provider.config_error.clone());
+    let model = non_empty(&cli.api_model).unwrap_or_else(|| {
+        effective_result
+            .as_ref()
+            .ok()
+            .and_then(|provider| {
+                if provider.backend == AsrBackend::OpenaiCompatible {
+                    Some(openai_compatible_model(cli, provider.profile.as_ref()))
+                } else {
+                    resolved
+                        .as_deref()
+                        .map(default_model_for_name)
+                        .map(ToOwned::to_owned)
+                }
+            })
+            .unwrap_or_else(|| "whisper-1".to_owned())
+    });
+
+    let profile = effective_result
+        .as_ref()
+        .ok()
+        .and_then(|provider| provider.profile_name().map(ToOwned::to_owned));
+    let provider_kind = effective_result
+        .as_ref()
+        .ok()
+        .and_then(|provider| provider.profile_kind().map(ToOwned::to_owned));
+    let (batch, live, notes) = effective_result
+        .as_ref()
+        .ok()
+        .map(|capabilities| {
+            (
+                Some(batch_capabilities_report(
+                    capabilities.capabilities.batch.clone(),
+                )),
+                capabilities
+                    .capabilities
+                    .live
+                    .clone()
+                    .map(live_capabilities_report),
+                capabilities.capabilities.notes.clone(),
+            )
+        })
+        .unwrap_or((None, None, Vec::new()));
+
+    CapabilitiesReport {
+        requested: cli.asr.as_str().to_owned(),
+        resolved,
+        provider: profile,
+        provider_kind,
+        provider_config: provider_config_path(cli).map(|path| path.display().to_string()),
+        model,
+        local_config_ok: resolution_error.is_none() && local_config_error.is_none(),
+        local_config_error,
+        resolution_error,
+        batch,
+        live,
+        notes,
+    }
+}
+
+fn provider_capabilities_for_backend(backend: AsrBackend) -> ProviderCapabilities {
+    match backend {
+        AsrBackend::OpenaiCompatible => openai_compatible_capabilities(),
+        AsrBackend::Doubao => doubao_capabilities(),
+        AsrBackend::Apple => native_adapter_capabilities(),
+        AsrBackend::Auto => unreachable!("backend must be resolved first"),
+    }
+}
+
+fn effective_provider_for(
+    cli: &Cli,
+    apple_support: &AppleSupport,
+    capability_mode: bool,
+) -> Result<EffectiveProvider> {
+    let profile = resolve_provider_profile(cli)?;
+    let backend = if let Some(profile) = &profile {
+        profile.profile.kind.backend()
+    } else if capability_mode {
+        match cli.asr {
+            AsrBackend::Auto => resolve_backend_for(cli, apple_support)?,
+            AsrBackend::OpenaiCompatible | AsrBackend::Doubao | AsrBackend::Apple => cli.asr,
+        }
+    } else {
+        resolve_backend_for(cli, apple_support)?
+    };
+    let capabilities = provider_capabilities_for_backend(backend);
+    let (capabilities, profile_error) = if let Some(profile) = &profile {
+        effective_capabilities_for_profile(capabilities, profile)
+    } else {
+        (capabilities, None)
+    };
+    let config_error =
+        profile_error.or_else(|| validate_capability_config(backend, cli, apple_support));
+
+    Ok(EffectiveProvider {
+        backend,
+        profile,
+        capabilities,
+        config_error,
+    })
+}
+
+fn effective_capabilities_for_profile(
+    mut capabilities: ProviderCapabilities,
+    profile: &ResolvedProviderProfile,
+) -> (ProviderCapabilities, Option<String>) {
+    if let Some(value) = profile.profile.batch_file {
+        capabilities.batch.batch_file = capabilities.batch.batch_file && value;
+    }
+    if let Some(value) = profile.profile.streaming {
+        capabilities.batch.streaming = capabilities.batch.streaming && value;
+    }
+    if let Some(value) = profile.profile.requires_network {
+        capabilities.batch.requires_network = capabilities.batch.requires_network || value;
+    }
+
+    let mut error = None;
+    if profile.profile.live_enabled == Some(true) && capabilities.live.is_none() {
+        error = Some(format!(
+            "provider profile '{}' enables live mode, but {} does not support live mode",
+            profile.name,
+            profile.profile.kind.as_str()
+        ));
+    }
+    if profile.profile.live_enabled == Some(false) {
+        capabilities.live = None;
+    }
+
+    capabilities.notes.extend(profile.profile.notes.clone());
+    (capabilities, error)
+}
+
+fn batch_capabilities_report(capabilities: AsrCapabilities) -> BatchCapabilitiesReport {
+    BatchCapabilitiesReport {
+        batch_file: capabilities.batch_file,
+        streaming: capabilities.streaming,
+        requires_network: capabilities.requires_network,
+    }
+}
+
+fn live_capabilities_report(capabilities: LiveCapabilities) -> LiveCapabilitiesReport {
+    LiveCapabilitiesReport {
+        mode: live_mode_name(capabilities.mode).to_owned(),
+        mic: capabilities.mic,
+        speaker: capabilities.speaker,
+        streaming_audio: capabilities.streaming_audio,
+        partial_results: capabilities.partial_results,
+        finalized_results: capabilities.finalized_results,
+        translation: capabilities.translation,
+        voice_processing: capabilities.voice_processing,
+        device_selection: capabilities.device_selection,
+        requires_network: capabilities.requires_network,
+        expected_latency: capabilities.expected_latency.map(format_duration),
     }
 }
 
@@ -1374,38 +1738,22 @@ fn print_doctor_text(report: &DoctorReport) {
     if let Some(resolved) = &report.backend.resolved {
         println!("  Resolved: {resolved}");
     }
+    if let Some(provider) = &report.backend.provider {
+        println!("  Provider profile: {provider}");
+    }
+    if let Some(kind) = &report.backend.provider_kind {
+        println!("  Provider kind: {kind}");
+    }
+    if let Some(config) = &report.backend.provider_config {
+        println!("  Provider config: {config}");
+    }
     if let Some(error) = &report.backend.error {
         println!("  Error: {error}");
     }
     print_doctor_backend_details(report);
 
-    println!("\nLive capabilities");
-    if let Some(error) = &report.live.error {
-        println!("  Error: {error}");
-    } else {
-        if let Some(backend) = &report.live.backend {
-            println!("  Backend: {backend}");
-        }
-        if let Some(mode) = &report.live.mode {
-            println!("  Mode: {mode}");
-        }
-        println!("  Mic: {}", yes_no(report.live.mic));
-        println!("  Speaker: {}", yes_no(report.live.speaker));
-        println!("  Streaming audio: {}", yes_no(report.live.streaming_audio));
-        println!("  Partial results: {}", yes_no(report.live.partial_results));
-        println!(
-            "  Finalized results: {}",
-            yes_no(report.live.finalized_results)
-        );
-        println!("  Translation: {}", yes_no(report.live.translation));
-        println!(
-            "  Device selection: {}",
-            yes_no(report.live.device_selection)
-        );
-        if let Some(latency) = &report.live.expected_latency {
-            println!("  Expected latency: {latency}");
-        }
-    }
+    println!();
+    print_capabilities_text(&report.capabilities);
 
     println!("\nAudio");
     if report.audio.default_input_available {
@@ -1430,6 +1778,62 @@ fn print_doctor_text(report: &DoctorReport) {
         if let Some(hint) = doctor_audio_hint(report) {
             println!("  Hint: {hint}");
         }
+    }
+}
+
+fn print_capabilities_text(report: &CapabilitiesReport) {
+    println!("Capabilities");
+    println!("  Requested: {}", report.requested);
+    if let Some(resolved) = &report.resolved {
+        println!("  Resolved: {resolved}");
+    }
+    if let Some(provider) = &report.provider {
+        println!("  Provider profile: {provider}");
+    }
+    if let Some(kind) = &report.provider_kind {
+        println!("  Provider kind: {kind}");
+    }
+    if let Some(config) = &report.provider_config {
+        println!("  Provider config: {config}");
+    }
+    println!("  Model: {}", report.model);
+    println!("  Local config ok: {}", yes_no(report.local_config_ok));
+    if let Some(error) = &report.resolution_error {
+        println!("  Resolution error: {error}");
+    }
+    if let Some(error) = &report.local_config_error {
+        println!("  Local config error: {error}");
+    }
+    if let Some(batch) = &report.batch {
+        println!("  Batch file: {}", yes_no(batch.batch_file));
+        println!("  Batch streaming: {}", yes_no(batch.streaming));
+        println!(
+            "  Batch requires network: {}",
+            yes_no(batch.requires_network)
+        );
+    }
+    if let Some(live) = &report.live {
+        println!("  Live mode: {}", live.mode);
+        println!("  Live mic: {}", yes_no(live.mic));
+        println!("  Live speaker: {}", yes_no(live.speaker));
+        println!("  Live streaming audio: {}", yes_no(live.streaming_audio));
+        println!("  Live partial results: {}", yes_no(live.partial_results));
+        println!(
+            "  Live finalized results: {}",
+            yes_no(live.finalized_results)
+        );
+        println!("  Live translation: {}", yes_no(live.translation));
+        println!("  Live voice processing: {}", yes_no(live.voice_processing));
+        println!("  Live device selection: {}", yes_no(live.device_selection));
+        println!("  Live requires network: {}", yes_no(live.requires_network));
+        if let Some(latency) = &live.expected_latency {
+            println!("  Live expected latency: {latency}");
+        }
+    } else {
+        println!("  Live: no");
+    }
+    for note in &report.notes {
+        println!("  Note: {note}");
     }
 }
 
@@ -1547,6 +1951,10 @@ fn resolve_backend(cli: &Cli) -> Result<AsrBackend> {
 }
 
 fn resolve_backend_for(cli: &Cli, apple_support: &AppleSupport) -> Result<AsrBackend> {
+    if let Some(profile) = resolve_provider_profile(cli)? {
+        return Ok(profile.profile.kind.backend());
+    }
+
     match cli.asr {
         AsrBackend::Auto => {
             if let Some(model) = non_empty(&cli.api_model) {
@@ -1576,14 +1984,13 @@ fn resolve_backend_for(cli: &Cli, apple_support: &AppleSupport) -> Result<AsrBac
 fn build_provider(backend: AsrBackend, cli: &Cli) -> Result<Box<dyn AsrProvider>> {
     match backend {
         AsrBackend::OpenaiCompatible => {
-            let base_url =
-                non_empty(&cli.api_base).unwrap_or_else(|| default_openai_api_base().to_owned());
-            let model =
-                non_empty(&cli.api_model).unwrap_or_else(|| default_model(backend).to_owned());
+            let profile = resolve_provider_profile(cli)?;
+            let base_url = openai_compatible_api_base(cli, profile.as_ref());
+            let model = openai_compatible_model(cli, profile.as_ref());
             Ok(Box::new(OpenAiCompatibleAsr::new(
                 OpenAiCompatibleConfig {
                     base_url,
-                    api_key: non_empty(&cli.api_key),
+                    api_key: openai_compatible_api_key(cli, profile.as_ref()),
                     model,
                 },
             )?))
@@ -1596,6 +2003,135 @@ fn build_provider(backend: AsrBackend, cli: &Cli) -> Result<Box<dyn AsrProvider>
         AsrBackend::Apple => Ok(Box::new(build_native_adapter(cli)?)),
         AsrBackend::Auto => unreachable!("backend must be resolved first"),
     }
+}
+
+fn resolve_provider_profile(cli: &Cli) -> Result<Option<ResolvedProviderProfile>> {
+    let Some(name) = non_empty(&cli.provider) else {
+        return Ok(None);
+    };
+
+    if let Some(profile) = builtin_provider_profile(&name) {
+        return Ok(Some(ResolvedProviderProfile { name, profile }));
+    }
+
+    let Some(config_path) = provider_config_path(cli) else {
+        bail!(
+            "provider profile '{name}' was not found in built-ins and no provider config file was found"
+        );
+    };
+    let content = std::fs::read_to_string(&config_path).with_context(|| {
+        format!(
+            "failed to read provider config from {}",
+            config_path.display()
+        )
+    })?;
+    let parsed: ProviderProfilesFile = toml::from_str(&content).with_context(|| {
+        format!(
+            "failed to parse provider config from {}",
+            config_path.display()
+        )
+    })?;
+    let profile = parsed.providers.get(&name).cloned().with_context(|| {
+        format!(
+            "provider profile '{name}' was not found in {}",
+            config_path.display()
+        )
+    })?;
+
+    Ok(Some(ResolvedProviderProfile { name, profile }))
+}
+
+fn builtin_provider_profile(name: &str) -> Option<ProviderProfile> {
+    match name {
+        "openai" => Some(ProviderProfile {
+            kind: ProfileProviderKind::OpenaiCompatible,
+            api_base: Some(default_openai_api_base().to_owned()),
+            default_model: Some("whisper-1".to_owned()),
+            api_key: None,
+            api_key_env: Some("VO_ASR_API_KEY".to_owned()),
+            batch_file: None,
+            streaming: None,
+            requires_network: None,
+            live_enabled: Some(false),
+            notes: vec!["Built-in OpenAI-compatible profile.".to_owned()],
+        }),
+        _ => None,
+    }
+}
+
+fn provider_config_path(cli: &Cli) -> Option<PathBuf> {
+    cli.provider_config
+        .clone()
+        .or_else(default_provider_config_path)
+        .filter(|path| path.exists())
+}
+
+fn default_provider_config_path() -> Option<PathBuf> {
+    let base = if cfg!(windows) {
+        env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".config")))
+    } else {
+        env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+    }?;
+    Some(base.join("vo").join("providers.toml"))
+}
+
+fn openai_compatible_api_base(cli: &Cli, profile: Option<&ResolvedProviderProfile>) -> String {
+    non_empty(&cli.api_base)
+        .or_else(|| {
+            profile.and_then(|profile| {
+                non_empty_string(profile.profile.api_base.as_deref()).map(ToOwned::to_owned)
+            })
+        })
+        .unwrap_or_else(|| default_openai_api_base().to_owned())
+}
+
+fn openai_compatible_model(cli: &Cli, profile: Option<&ResolvedProviderProfile>) -> String {
+    non_empty(&cli.api_model)
+        .or_else(|| {
+            profile.and_then(|profile| {
+                non_empty_string(profile.profile.default_model.as_deref()).map(ToOwned::to_owned)
+            })
+        })
+        .unwrap_or_else(|| default_model(AsrBackend::OpenaiCompatible).to_owned())
+}
+
+fn openai_compatible_api_key(
+    cli: &Cli,
+    profile: Option<&ResolvedProviderProfile>,
+) -> Option<String> {
+    non_empty(&cli.api_key).or_else(|| profile.and_then(profile_api_key))
+}
+
+fn configured_api_key(cli: &Cli, provider: Option<&EffectiveProvider>) -> Option<String> {
+    non_empty(&cli.api_key).or_else(|| {
+        provider
+            .and_then(|provider| provider.profile.as_ref())
+            .and_then(profile_api_key)
+    })
+}
+
+fn profile_api_key(profile: &ResolvedProviderProfile) -> Option<String> {
+    non_empty_string(profile.profile.api_key.as_deref())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            non_empty_string(profile.profile.api_key_env.as_deref())
+                .and_then(|env_name| env::var(env_name).ok())
+                .and_then(|value| non_empty_string(Some(&value)).map(ToOwned::to_owned))
+        })
+}
+
+fn configured_api_base(cli: &Cli, provider: Option<&EffectiveProvider>) -> Option<String> {
+    non_empty(&cli.api_base).or_else(|| {
+        provider
+            .filter(|provider| provider.backend == AsrBackend::OpenaiCompatible)
+            .and_then(|provider| provider.profile.as_ref())
+            .and_then(|profile| non_empty_string(profile.profile.api_base.as_deref()))
+            .map(ToOwned::to_owned)
+    })
 }
 
 fn build_native_adapter(cli: &Cli) -> Result<NativeAdapterAsr> {
@@ -1648,6 +2184,10 @@ fn non_empty(value: &Option<String>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn non_empty_string(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
 fn validate_backend_config(backend: AsrBackend, cli: &Cli) -> Option<String> {
     match backend {
         AsrBackend::Apple if resolve_native_adapter(cli).is_none() => Some(
@@ -1655,6 +2195,22 @@ fn validate_backend_config(backend: AsrBackend, cli: &Cli) -> Option<String> {
                 .to_owned(),
         ),
         AsrBackend::OpenaiCompatible | AsrBackend::Doubao | AsrBackend::Apple => None,
+        AsrBackend::Auto => None,
+    }
+}
+
+fn validate_capability_config(
+    backend: AsrBackend,
+    cli: &Cli,
+    apple_support: &AppleSupport,
+) -> Option<String> {
+    match backend {
+        AsrBackend::Apple if !apple_support.supported => Some(format!(
+            "apple ASR is unavailable: {}",
+            apple_support.reason
+        )),
+        AsrBackend::Apple => validate_backend_config(backend, cli),
+        AsrBackend::OpenaiCompatible | AsrBackend::Doubao => None,
         AsrBackend::Auto => None,
     }
 }
@@ -1686,6 +2242,8 @@ mod tests {
             api_base: None,
             api_key: None,
             api_model: None,
+            provider: None,
+            provider_config: None,
             src: None,
             doubao_credential_path: None,
             doubao_device_id: None,
@@ -1704,6 +2262,7 @@ mod tests {
             json: false,
             transcript: None,
             doctor: false,
+            capabilities: false,
         }
     }
 
@@ -1716,6 +2275,18 @@ mod tests {
             sample_format: None,
             error: Some("not probed during tests".to_owned()),
         }
+    }
+
+    fn write_temp_provider_config(contents: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "vo-test-providers-{}.toml",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path
     }
 
     #[test]
@@ -1945,6 +2516,25 @@ mod tests {
     }
 
     #[test]
+    fn live_mode_rejects_batch_only_provider_profile() {
+        let cli = Cli {
+            live: true,
+            provider: Some("openai".to_owned()),
+            ..test_cli()
+        };
+        let support = AppleSupport {
+            version: Some("15.6.1".to_owned()),
+            supported: false,
+            reason: "macOS 15.6.1 is below 26".to_owned(),
+        };
+
+        assert!(resolve_live_backend_for(&cli, &support)
+            .unwrap_err()
+            .to_string()
+            .contains("does not support live mode"));
+    }
+
+    #[test]
     fn missing_batch_input_defaults_to_live_mode() {
         let cli = test_cli();
 
@@ -2071,6 +2661,238 @@ mod tests {
         assert!(!report.live.partial_results);
         assert!(report.live.finalized_results);
         assert_eq!(report.live.expected_latency.as_deref(), Some("~5s"));
+    }
+
+    #[test]
+    fn capabilities_report_includes_doubao_batch_and_live_flags() {
+        let cli = Cli {
+            asr: AsrBackend::Doubao,
+            capabilities: true,
+            ..test_cli()
+        };
+        let support = AppleSupport {
+            version: Some("15.6.1".to_owned()),
+            supported: false,
+            reason: "macOS 15.6.1 is below 26".to_owned(),
+        };
+
+        let report = gather_capabilities_report_with_support(&cli, &support);
+
+        assert_eq!(report.resolved.as_deref(), Some("doubao"));
+        assert!(report.local_config_ok);
+        assert!(report.batch.as_ref().is_some_and(|batch| batch.batch_file));
+        let live = report.live.as_ref().expect("doubao live capabilities");
+        assert_eq!(live.mode, "chunked");
+        assert!(live.mic);
+        assert!(!live.speaker);
+        assert!(!live.partial_results);
+        assert!(live.finalized_results);
+        assert_eq!(live.expected_latency.as_deref(), Some("~5s"));
+    }
+
+    #[test]
+    fn capabilities_report_marks_openai_compatible_as_batch_only() {
+        let cli = Cli {
+            asr: AsrBackend::OpenaiCompatible,
+            capabilities: true,
+            ..test_cli()
+        };
+        let support = AppleSupport {
+            version: Some("15.6.1".to_owned()),
+            supported: false,
+            reason: "macOS 15.6.1 is below 26".to_owned(),
+        };
+
+        let report = gather_capabilities_report_with_support(&cli, &support);
+
+        assert_eq!(report.resolved.as_deref(), Some("openai-compatible"));
+        assert!(report.local_config_ok);
+        assert!(report.batch.as_ref().is_some_and(|batch| {
+            batch.batch_file && !batch.streaming && batch.requires_network
+        }));
+        assert!(report.live.is_none());
+    }
+
+    #[test]
+    fn provider_profile_resolves_openai_compatible_from_config() {
+        let config = write_temp_provider_config(
+            r#"
+[providers.siliconflow]
+kind = "openai-compatible"
+api_base = "https://api.siliconflow.cn"
+default_model = "FunAudioLLM/SenseVoiceSmall"
+api_key_env = "SILICONFLOW_API_KEY"
+notes = ["SiliconFlow OpenAI-compatible profile."]
+batch_file = true
+streaming = false
+requires_network = true
+live_enabled = false
+"#,
+        );
+        let cli = Cli {
+            provider: Some("siliconflow".to_owned()),
+            provider_config: Some(config.clone()),
+            capabilities: true,
+            ..test_cli()
+        };
+        let support = AppleSupport {
+            version: Some("15.6.1".to_owned()),
+            supported: false,
+            reason: "macOS 15.6.1 is below 26".to_owned(),
+        };
+
+        let backend = resolve_backend_for(&cli, &support).unwrap();
+        let report = gather_capabilities_report_with_support(&cli, &support);
+        let _ = std::fs::remove_file(config);
+
+        assert_eq!(backend, AsrBackend::OpenaiCompatible);
+        assert_eq!(report.provider.as_deref(), Some("siliconflow"));
+        assert_eq!(report.provider_kind.as_deref(), Some("openai-compatible"));
+        assert_eq!(report.model, "FunAudioLLM/SenseVoiceSmall");
+        assert!(report.local_config_ok);
+        assert!(report.batch.as_ref().is_some_and(|batch| {
+            batch.batch_file && !batch.streaming && batch.requires_network
+        }));
+        assert!(report.live.is_none());
+        assert!(report.notes.iter().any(|note| note.contains("SiliconFlow")));
+    }
+
+    #[test]
+    fn provider_profile_cannot_enable_live_beyond_implementation() {
+        let config = write_temp_provider_config(
+            r#"
+[providers.bad-live]
+kind = "openai-compatible"
+api_base = "https://example.com"
+default_model = "model"
+live_enabled = true
+"#,
+        );
+        let cli = Cli {
+            provider: Some("bad-live".to_owned()),
+            provider_config: Some(config.clone()),
+            capabilities: true,
+            ..test_cli()
+        };
+        let support = AppleSupport {
+            version: Some("15.6.1".to_owned()),
+            supported: false,
+            reason: "macOS 15.6.1 is below 26".to_owned(),
+        };
+
+        let report = gather_capabilities_report_with_support(&cli, &support);
+        let _ = std::fs::remove_file(config);
+
+        assert_eq!(report.resolved.as_deref(), Some("openai-compatible"));
+        assert_eq!(report.provider.as_deref(), Some("bad-live"));
+        assert!(!report.local_config_ok);
+        assert!(report
+            .local_config_error
+            .as_deref()
+            .is_some_and(|error| error.contains("does not support live mode")));
+        assert!(report.live.is_none());
+    }
+
+    #[test]
+    fn provider_profile_accepts_direct_api_key() {
+        let config = write_temp_provider_config(
+            r#"
+[providers.local-key]
+kind = "openai-compatible"
+api_base = "https://example.com"
+default_model = "model"
+api_key = "profile-secret"
+live_enabled = false
+"#,
+        );
+        let cli = Cli {
+            provider: Some("local-key".to_owned()),
+            provider_config: Some(config.clone()),
+            doctor: true,
+            ..test_cli()
+        };
+
+        let report = gather_doctor_report_with_audio(&cli, test_audio_report());
+        let _ = std::fs::remove_file(config);
+
+        assert_eq!(
+            report.backend.resolved.as_deref(),
+            Some("openai-compatible")
+        );
+        assert_eq!(report.backend.provider.as_deref(), Some("local-key"));
+        assert!(report.backend.api_key_configured);
+        assert!(report.backend.api_base_configured);
+    }
+
+    #[test]
+    fn builtin_openai_profile_uses_openai_compatible_defaults() {
+        let cli = Cli {
+            provider: Some("openai".to_owned()),
+            capabilities: true,
+            ..test_cli()
+        };
+        let support = AppleSupport {
+            version: Some("15.6.1".to_owned()),
+            supported: false,
+            reason: "macOS 15.6.1 is below 26".to_owned(),
+        };
+
+        let report = gather_capabilities_report_with_support(&cli, &support);
+
+        assert_eq!(report.resolved.as_deref(), Some("openai-compatible"));
+        assert_eq!(report.provider.as_deref(), Some("openai"));
+        assert_eq!(report.model, "whisper-1");
+        assert!(report.local_config_ok);
+    }
+
+    #[test]
+    fn capabilities_report_surfaces_apple_adapter_config_error() {
+        let cli = Cli {
+            asr: AsrBackend::Apple,
+            capabilities: true,
+            ..test_cli()
+        };
+        let support = AppleSupport {
+            version: Some("26.0.0".to_owned()),
+            supported: true,
+            reason: "macOS 26+ detected".to_owned(),
+        };
+
+        let report = gather_capabilities_report_with_support(&cli, &support);
+
+        assert_eq!(report.resolved.as_deref(), Some("apple"));
+        assert!(!report.local_config_ok);
+        assert!(report
+            .local_config_error
+            .as_deref()
+            .is_some_and(|error| error.contains("--native-adapter")));
+        assert!(report.live.as_ref().is_some_and(|live| live.translation));
+    }
+
+    #[test]
+    fn capabilities_report_keeps_apple_capabilities_when_platform_is_unavailable() {
+        let cli = Cli {
+            asr: AsrBackend::Apple,
+            capabilities: true,
+            ..test_cli()
+        };
+        let support = AppleSupport {
+            version: Some("15.6.1".to_owned()),
+            supported: false,
+            reason: "macOS 15.6.1 is below 26".to_owned(),
+        };
+
+        let report = gather_capabilities_report_with_support(&cli, &support);
+
+        assert_eq!(report.resolved.as_deref(), Some("apple"));
+        assert!(!report.local_config_ok);
+        assert!(report.resolution_error.is_none());
+        assert!(report
+            .local_config_error
+            .as_deref()
+            .is_some_and(|error| error.contains("unavailable")));
+        assert!(report.batch.as_ref().is_some_and(|batch| batch.batch_file));
+        assert!(report.live.as_ref().is_some_and(|live| live.translation));
     }
 
     #[test]

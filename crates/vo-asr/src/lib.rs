@@ -61,6 +61,13 @@ pub struct LiveCapabilities {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCapabilities {
+    pub batch: AsrCapabilities,
+    pub live: Option<LiveCapabilities>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveAsrOptions {
     pub src: Option<String>,
     pub dst: Option<String>,
@@ -104,6 +111,13 @@ pub trait AsrProvider: Send + Sync {
     async fn transcribe(&self, input: AudioInput, options: AsrOptions) -> AsrResult<Transcript>;
     fn name(&self) -> &'static str;
     fn capabilities(&self) -> AsrCapabilities;
+    fn provider_capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            batch: self.capabilities(),
+            live: None,
+            notes: Vec::new(),
+        }
+    }
 }
 
 pub type LiveEventCallback<'a> = &'a mut (dyn FnMut(LiveEvent) -> AsrResult<()> + Send);

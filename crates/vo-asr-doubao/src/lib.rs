@@ -15,7 +15,7 @@ use tokio_tungstenite::{
 use uuid::Uuid;
 use vo_asr::{
     AsrCapabilities, AsrError, AsrOptions, AsrProvider, AsrResult, LiveAsrOptions, LiveAsrProvider,
-    LiveCapabilities, LiveEventCallback, LiveModeKind, Transcript,
+    LiveCapabilities, LiveEventCallback, LiveModeKind, ProviderCapabilities, Transcript,
 };
 use vo_core::{
     AudioChannel, AudioInput, EventTimestamp, LiveEvent, LiveMetaEvent, LiveStatusEvent,
@@ -380,11 +380,11 @@ impl AsrProvider for DoubaoAsr {
     }
 
     fn capabilities(&self) -> AsrCapabilities {
-        AsrCapabilities {
-            batch_file: true,
-            streaming: false,
-            requires_network: true,
-        }
+        doubao_capabilities().batch
+    }
+
+    fn provider_capabilities(&self) -> ProviderCapabilities {
+        doubao_capabilities()
     }
 }
 
@@ -505,6 +505,21 @@ impl LiveAsrProvider for DoubaoAsr {
 
     fn live_capabilities(&self) -> LiveCapabilities {
         doubao_live_capabilities()
+    }
+}
+
+pub fn doubao_capabilities() -> ProviderCapabilities {
+    ProviderCapabilities {
+        batch: AsrCapabilities {
+            batch_file: true,
+            streaming: false,
+            requires_network: true,
+        },
+        live: Some(doubao_live_capabilities()),
+        notes: vec![
+            "Doubao credentials can be auto-registered and cached locally.".to_owned(),
+            "Doubao live mode is chunked and emits finalized text only.".to_owned(),
+        ],
     }
 }
 
