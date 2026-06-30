@@ -36,6 +36,7 @@ Doubao does not require an API key:
 ```console
 $ vo --asr doubao --src zh-CN
 $ vo --asr doubao --json
+$ vo --asr doubao --src zh-CN --live-chunk 3
 $ vo --input meeting.wav --asr doubao --src zh-CN
 $ vo --mic-duration 5 \
     --asr doubao \
@@ -122,6 +123,11 @@ adapters/apple-speech/        macOS 26 Apple Speech adapter
 The primary runtime path is Rust. There is no Python sidecar or local FastAPI
 service. Browser direct mode requires provider CORS support, and browser-visible
 API keys are only appropriate for personal/local workflows.
+
+Live providers declare their capabilities. Apple live is streaming and can emit
+partial/final/translation events. Doubao live is chunked microphone transcription
+with chunk status and finalized text only; use `--doctor` to inspect the active
+backend.
 
 ## License
 

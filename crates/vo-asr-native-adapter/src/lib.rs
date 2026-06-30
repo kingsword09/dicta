@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use vo_asr::{AsrCapabilities, AsrError, AsrOptions, AsrProvider, AsrResult, Transcript};
+use vo_asr::{
+    AsrCapabilities, AsrError, AsrOptions, AsrProvider, AsrResult, LiveAsrOptions, LiveAsrProvider,
+    LiveCapabilities, LiveEventCallback, LiveModeKind, Transcript,
+};
 use vo_core::{AudioInput, LiveEvent, TranscriptEvent};
 
 #[derive(Debug, Clone)]
@@ -237,6 +240,57 @@ impl AsrProvider for NativeAdapterAsr {
     }
 }
 
+#[async_trait]
+impl LiveAsrProvider for NativeAdapterAsr {
+    async fn run_live(
+        &self,
+        options: LiveAsrOptions,
+        on_event: LiveEventCallback<'_>,
+    ) -> AsrResult<()> {
+        self.run_live_events(NativeLiveOptions::from(options), |event| on_event(event))
+            .await
+    }
+
+    fn live_name(&self) -> &'static str {
+        "apple"
+    }
+
+    fn live_capabilities(&self) -> LiveCapabilities {
+        native_adapter_live_capabilities()
+    }
+}
+
+pub fn native_adapter_live_capabilities() -> LiveCapabilities {
+    LiveCapabilities {
+        mode: LiveModeKind::Streaming,
+        mic: true,
+        speaker: true,
+        streaming_audio: true,
+        partial_results: true,
+        finalized_results: true,
+        translation: true,
+        voice_processing: true,
+        device_selection: true,
+        requires_network: false,
+        expected_latency: None,
+    }
+}
+
+impl From<LiveAsrOptions> for NativeLiveOptions {
+    fn from(options: LiveAsrOptions) -> Self {
+        Self {
+            src: options.src,
+            dst: options.dst,
+            json: true,
+            transcript: None,
+            mic: options.mic,
+            speaker: options.speaker,
+            voice_processing: options.voice_processing,
+            select_device: options.select_device,
+        }
+    }
+}
+
 fn parse_adapter_jsonl(stdout: &str) -> AsrResult<Transcript> {
     let mut text = Vec::new();
     let mut language = None;
@@ -277,6 +331,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_adapter_live_capabilities_are_streaming() {
+        let capabilities = native_adapter_live_capabilities();
+
+        assert_eq!(capabilities.mode, LiveModeKind::Streaming);
+        assert!(capabilities.mic);
+        assert!(capabilities.speaker);
+        assert!(capabilities.streaming_audio);
+        assert!(capabilities.partial_results);
+        assert!(capabilities.finalized_results);
+        assert!(capabilities.translation);
+        assert!(capabilities.voice_processing);
+        assert!(capabilities.device_selection);
+        assert!(!capabilities.requires_network);
+    }
+
+    #[test]
     fn parses_adapter_jsonl_source_text() {
         let transcript = parse_adapter_jsonl(
             r#"{"seq":0,"channel":"file","timestamp":"2026-01-01T00:00:00+00:00","src":{"lang":"en-US","text":"hello"}}
@@ -301,6 +371,16 @@ mod tests {
             parse_live_event(r#"{"type":"volatile","channel":"mic","text":"hel"}"#).unwrap();
 
         assert!(matches!(event, LiveEvent::Volatile(_)));
+    }
+
+    #[test]
+    fn parses_typed_status_live_event() {
+        let event = parse_live_event(
+            r#"{"type":"status","phase":"recording","message":"recording 3s chunk"}"#,
+        )
+        .unwrap();
+
+        assert!(matches!(event, LiveEvent::Status(_)));
     }
 
     #[test]

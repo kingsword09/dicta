@@ -1,5 +1,4 @@
 use anyhow::{bail, Context, Result};
-use chrono::Local;
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use std::fs::OpenOptions;
@@ -7,13 +6,18 @@ use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{cmp, env};
-use vo_asr::{AsrOptions, AsrProvider};
-use vo_asr_doubao::{DoubaoAsr, DoubaoConfig};
-use vo_asr_native_adapter::{NativeAdapterAsr, NativeAdapterConfig, NativeLiveOptions};
+use vo_asr::{
+    AsrOptions, AsrProvider, LiveAsrOptions, LiveAsrProvider, LiveCapabilities, LiveModeKind,
+};
+use vo_asr_doubao::{doubao_live_capabilities, DoubaoAsr, DoubaoConfig};
+use vo_asr_native_adapter::{
+    native_adapter_live_capabilities, NativeAdapterAsr, NativeAdapterConfig,
+};
 use vo_asr_openai_compatible::{OpenAiCompatibleAsr, OpenAiCompatibleConfig};
 use vo_core::{
-    AudioChannel, AudioInput, LiveEvent, LiveMetaEvent, LiveTranslatedEvent, LiveVolatileEvent,
-    TranscriptEvent, TranscriptSource, TranscriptTarget,
+    AudioChannel, AudioInput, EventTimestamp, LiveEvent, LiveMetaEvent, LiveStatusEvent,
+    LiveStatusPhase, LiveTranslatedEvent, LiveVolatileEvent, TranscriptEvent, TranscriptSource,
+    TranscriptTarget,
 };
 
 #[derive(Debug, Parser)]
@@ -96,6 +100,13 @@ struct Cli {
         help = "Run live transcription; default when no --input or --mic-duration is given"
     )]
     live: bool,
+
+    #[arg(
+        long = "live-chunk",
+        env = "VO_LIVE_CHUNK",
+        help = "Chunk duration in seconds for chunked live providers"
+    )]
+    live_chunk: Option<f64>,
 
     #[arg(long = "no-mic", help = "Disable microphone capture in live mode")]
     no_mic: bool,
@@ -211,37 +222,61 @@ fn validate_batch_options(cli: &Cli) -> Result<()> {
 
 async fn run_live(cli: &Cli) -> Result<()> {
     let backend = resolve_live_backend(cli)?;
-    validate_live_options(cli, backend)?;
 
     match backend {
-        AsrBackend::Apple => run_apple_live(cli).await,
-        AsrBackend::Doubao => run_doubao_live(cli).await,
+        AsrBackend::Apple => {
+            let provider = build_native_adapter(cli)?;
+            run_live_provider(cli, &provider).await
+        }
+        AsrBackend::Doubao => {
+            let provider = DoubaoAsr::new(DoubaoConfig {
+                credential_path: cli.doubao_credential_path.clone(),
+                device_id: non_empty(&cli.doubao_device_id),
+                token: non_empty(&cli.doubao_token),
+            })?;
+            run_live_provider(cli, &provider).await
+        }
         AsrBackend::OpenaiCompatible | AsrBackend::Auto => {
             bail!("interactive live mode currently supports apple and doubao")
         }
     }
 }
 
-fn validate_live_options(cli: &Cli, backend: AsrBackend) -> Result<()> {
+fn validate_live_options(
+    cli: &Cli,
+    provider_name: &str,
+    capabilities: &LiveCapabilities,
+) -> Result<()> {
     if cli.input.is_some() || cli.mic_duration.is_some() {
         bail!("--live cannot be combined with --input or --mic-duration");
     }
     if cli.no_mic && cli.no_speaker {
         bail!("--live cannot disable both --no-mic and --no-speaker");
     }
+    if let Some(seconds) = cli.live_chunk {
+        if !seconds.is_finite() || seconds <= 0.0 {
+            bail!("--live-chunk must be greater than zero seconds");
+        }
+        if capabilities.mode != LiveModeKind::Chunked {
+            bail!("--live-chunk requires a chunked live provider");
+        }
+    }
     if let Some(path) = &cli.transcript {
         validate_transcript_path(path)?;
     }
-    if backend == AsrBackend::Doubao {
-        if cli.dst.is_some() {
-            bail!("--dst is only supported with Apple live mode");
-        }
-        if cli.no_mic {
-            bail!("doubao live mode requires microphone input");
-        }
-        if cli.voice_processing || cli.select_device {
-            bail!("--voice-processing and --select-device are only supported with Apple live mode");
-        }
+    if cli.dst.is_some() && !capabilities.translation {
+        bail!("--dst requires a live provider with translation support");
+    }
+    if cli.no_mic && !capabilities.speaker {
+        bail!(
+            "{provider_name} live mode requires microphone input; speaker capture is not supported"
+        );
+    }
+    if cli.voice_processing && !capabilities.voice_processing {
+        bail!("--voice-processing is not supported by {provider_name} live mode");
+    }
+    if cli.select_device && !capabilities.device_selection {
+        bail!("--select-device is not supported by {provider_name} live mode");
     }
     Ok(())
 }
@@ -272,40 +307,52 @@ fn resolve_live_backend_for(cli: &Cli, apple_support: &AppleSupport) -> Result<A
     }
 }
 
-async fn run_apple_live(cli: &Cli) -> Result<()> {
-    let adapter = build_native_adapter(cli)?;
+async fn run_live_provider<P>(cli: &Cli, provider: &P) -> Result<()>
+where
+    P: LiveAsrProvider,
+{
+    let capabilities = provider.live_capabilities();
+    let provider_name = provider.live_name();
+    validate_live_options(cli, provider_name, &capabilities)?;
+    let options = live_options_from_cli(cli, &capabilities);
     let mut renderer = LiveRenderer::new(
         cli.json,
         cli.transcript.clone(),
-        !cli.no_mic && !cli.no_speaker,
+        options.mic && options.speaker,
         cli.src.clone(),
         cli.dst.clone(),
     )?;
 
-    adapter
-        .run_live_events(
-            NativeLiveOptions {
-                src: cli.src.clone(),
-                dst: cli.dst.clone(),
-                json: true,
-                transcript: None,
-                mic: !cli.no_mic,
-                speaker: !cli.no_speaker,
-                voice_processing: cli.voice_processing,
-                select_device: cli.select_device,
-            },
-            |event| {
-                renderer.handle_live_event(event).map_err(|err| {
-                    vo_asr::AsrError::Request(format!("failed to render apple live event: {err}"))
-                })
-            },
-        )
+    provider
+        .run_live(options, &mut |event| {
+            renderer.handle_live_event(event).map_err(|err| {
+                vo_asr::AsrError::Request(format!(
+                    "failed to render {provider_name} live event: {err}"
+                ))
+            })
+        })
         .await
-        .context("apple live transcription failed")?;
+        .with_context(|| format!("{provider_name} live transcription failed"))?;
 
     renderer.finalize_session_log()?;
     renderer.print_summary();
     Ok(())
+}
+
+fn live_options_from_cli(cli: &Cli, capabilities: &LiveCapabilities) -> LiveAsrOptions {
+    LiveAsrOptions {
+        src: cli.src.clone(),
+        dst: cli.dst.clone().filter(|_| capabilities.translation),
+        mic: !cli.no_mic && capabilities.mic,
+        speaker: !cli.no_speaker && capabilities.speaker,
+        voice_processing: cli.voice_processing && capabilities.voice_processing,
+        select_device: cli.select_device && capabilities.device_selection,
+        chunk_duration: cli
+            .live_chunk
+            .map(Duration::from_secs_f64)
+            .or(capabilities.expected_latency)
+            .unwrap_or_else(|| Duration::from_secs(5)),
+    }
 }
 
 struct OutputPayload {
@@ -328,30 +375,7 @@ impl OutputPayload {
         let event = TranscriptEvent {
             seq: 0,
             channel,
-            timestamp: Local::now(),
-            audio: None,
-            src: TranscriptSource {
-                lang,
-                text: text.clone(),
-                confidence: None,
-            },
-            dst: None,
-        };
-
-        Self { text, event }
-    }
-
-    fn new_live(seq: u64, transcript: vo_asr::Transcript, src_hint: Option<String>) -> Self {
-        let lang = transcript
-            .language
-            .clone()
-            .or(src_hint)
-            .unwrap_or_else(|| "und".to_owned());
-        let text = transcript.text;
-        let event = TranscriptEvent {
-            seq,
-            channel: AudioChannel::Mic,
-            timestamp: Local::now(),
+            timestamp: EventTimestamp::now(),
             audio: None,
             src: TranscriptSource {
                 lang,
@@ -380,6 +404,7 @@ struct LiveRenderer {
     count: u64,
     started_at: SystemTime,
     pending: Vec<TranscriptEvent>,
+    status: Option<LiveStatusEvent>,
     volatile: Vec<LiveVolatileEvent>,
     live_region_lines: usize,
 }
@@ -405,17 +430,10 @@ impl LiveRenderer {
             count: 0,
             started_at: SystemTime::now(),
             pending: Vec::new(),
+            status: None,
             volatile: Vec::new(),
             live_region_lines: 0,
         })
-    }
-
-    fn print_banner(&mut self, backend: &str, mic: bool, speaker: bool, translating: bool) {
-        if self.json_mode || self.banner_printed {
-            return;
-        }
-        self.print_banner_header(backend, mic, speaker, translating);
-        println!();
     }
 
     fn print_banner_header(&mut self, backend: &str, mic: bool, speaker: bool, translating: bool) {
@@ -476,6 +494,7 @@ impl LiveRenderer {
         println!();
     }
 
+    #[cfg(test)]
     fn emit_event(&mut self, event: &TranscriptEvent) -> Result<()> {
         self.handle_live_event(LiveEvent::Finalized(event.clone()))
     }
@@ -486,12 +505,21 @@ impl LiveRenderer {
                 self.apply_meta(meta);
                 Ok(())
             }
+            LiveEvent::Status(status) => {
+                if self.json_mode && matches!(status.phase, LiveStatusPhase::Recovering) {
+                    eprintln!("vo: {}", status_text(&status));
+                }
+                self.set_status(status);
+                self.redraw_live_region();
+                Ok(())
+            }
             LiveEvent::Volatile(volatile) => {
                 self.set_volatile(volatile);
                 self.redraw_live_region();
                 Ok(())
             }
             LiveEvent::Finalized(event) => {
+                self.status = None;
                 self.clear_volatile(event.channel);
                 if event.dst.is_some() || self.dst_lang.is_none() {
                     self.commit_event(event)
@@ -501,8 +529,12 @@ impl LiveRenderer {
                     Ok(())
                 }
             }
-            LiveEvent::Translated(translated) => self.apply_translation(translated),
+            LiveEvent::Translated(translated) => {
+                self.status = None;
+                self.apply_translation(translated)
+            }
             LiveEvent::Eof => {
+                self.status = None;
                 self.drain_pending_without_translation()?;
                 self.clear_live_region();
                 Ok(())
@@ -553,6 +585,10 @@ impl LiveRenderer {
         self.volatile.retain(|entry| entry.channel != channel);
     }
 
+    fn set_status(&mut self, status: LiveStatusEvent) {
+        self.status = Some(status);
+    }
+
     fn apply_translation(&mut self, translated: LiveTranslatedEvent) -> Result<()> {
         if let Some(index) = self
             .pending
@@ -594,9 +630,9 @@ impl LiveRenderer {
     }
 
     fn tty_header(&self, event: &TranscriptEvent) -> String {
-        let timestamp = event.timestamp.format("%H:%M:%S");
+        let timestamp = event.timestamp.format_local("%H:%M:%S");
         let color = channel_color(event.channel);
-        let timestamp = ansi256(color, &timestamp.to_string());
+        let timestamp = ansi256(color, &timestamp);
         if self.show_channel_label {
             format!(
                 "{timestamp} {}  ",
@@ -619,6 +655,15 @@ impl LiveRenderer {
                 "{:pad$}{}",
                 "",
                 ansi256(240, "(translating...)"),
+                pad = pad
+            ));
+        }
+        if let Some(status) = &self.status {
+            let pad = self.source_column_pad();
+            lines.push(format!(
+                "{:pad$}{}",
+                "",
+                ansi256(244, &status_text(status)),
                 pad = pad
             ));
         }
@@ -851,7 +896,7 @@ impl LiveSessionLog {
 }
 
 fn transcript_stamp() -> String {
-    Local::now().format("%Y-%m-%d-%H%M%S").to_string()
+    EventTimestamp::local_stamp_now()
 }
 
 fn can_prompt_for_log() -> bool {
@@ -964,6 +1009,15 @@ fn channel_label(channel: AudioChannel) -> &'static str {
     }
 }
 
+fn status_text(status: &LiveStatusEvent) -> String {
+    match &status.detail {
+        Some(detail) if !detail.trim().is_empty() => {
+            format!("{}: {}", status.message, detail.trim())
+        }
+        _ => status.message.clone(),
+    }
+}
+
 fn is_passthrough_translation(
     src_lang: &str,
     dst_lang: &str,
@@ -978,79 +1032,6 @@ fn primary_language_subtag(lang: &str) -> &str {
         .next()
         .filter(|part| !part.is_empty())
         .unwrap_or(lang)
-}
-
-async fn run_doubao_live(cli: &Cli) -> Result<()> {
-    let provider = DoubaoAsr::new(DoubaoConfig {
-        credential_path: cli.doubao_credential_path.clone(),
-        device_id: non_empty(&cli.doubao_device_id),
-        token: non_empty(&cli.doubao_token),
-    })?;
-    let mut renderer = LiveRenderer::new(
-        cli.json,
-        cli.transcript.clone(),
-        false,
-        cli.src.clone(),
-        None,
-    )?;
-    renderer.print_banner("doubao", true, false, false);
-
-    let mut seq = 0_u64;
-    loop {
-        let chunk_path = temp_recording_path();
-        let record_task = tokio::task::spawn_blocking({
-            let chunk_path = chunk_path.clone();
-            move || vo_audio::record_default_input_to_wav(&chunk_path, Duration::from_secs(5))
-        });
-        let record_result = tokio::select! {
-            result = record_task => result.context("doubao live recorder task failed")?,
-            result = tokio::signal::ctrl_c() => {
-                result.context("failed to listen for Ctrl-C")?;
-                let _ = std::fs::remove_file(&chunk_path);
-                break;
-            }
-        };
-
-        if let Err(err) = record_result {
-            let _ = std::fs::remove_file(&chunk_path);
-            return Err(err).context("failed to record default microphone");
-        }
-
-        let transcribe_result = tokio::select! {
-            result = provider.transcribe(
-                AudioInput::File(chunk_path.clone()),
-                AsrOptions {
-                    language: cli.src.clone(),
-                    ..AsrOptions::default()
-                },
-            ) => result,
-            result = tokio::signal::ctrl_c() => {
-                result.context("failed to listen for Ctrl-C")?;
-                let _ = std::fs::remove_file(&chunk_path);
-                break;
-            }
-        };
-
-        match transcribe_result {
-            Ok(transcript) => {
-                let text = transcript.text.trim();
-                if !text.is_empty() {
-                    let payload = OutputPayload::new_live(seq, transcript, cli.src.clone());
-                    renderer.emit_event(&payload.event)?;
-                    seq += 1;
-                }
-            }
-            Err(err) => {
-                eprintln!("vo: doubao live chunk failed: {err}");
-            }
-        }
-
-        let _ = std::fs::remove_file(&chunk_path);
-    }
-
-    renderer.finalize_session_log()?;
-    renderer.print_summary();
-    Ok(())
 }
 
 fn write_transcript(path: &PathBuf, payload: &OutputPayload, json: bool) -> Result<()> {
@@ -1078,6 +1059,7 @@ fn validate_transcript_path(path: &PathBuf) -> Result<()> {
 struct DoctorReport {
     system: SystemReport,
     backend: BackendReport,
+    live: LiveReport,
     audio: AudioReport,
     runtime: RuntimeReport,
 }
@@ -1102,6 +1084,23 @@ struct BackendReport {
     doubao_device_id_configured: bool,
     doubao_token_configured: bool,
     native_adapter: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct LiveReport {
+    backend: Option<String>,
+    mode: Option<String>,
+    mic: bool,
+    speaker: bool,
+    streaming_audio: bool,
+    partial_results: bool,
+    finalized_results: bool,
+    translation: bool,
+    voice_processing: bool,
+    device_selection: bool,
+    requires_network: bool,
+    expected_latency: Option<String>,
     error: Option<String>,
 }
 
@@ -1175,6 +1174,7 @@ fn gather_doctor_report_with_audio(cli: &Cli, audio: AudioReport) -> DoctorRepor
             .unwrap_or("whisper-1")
             .to_owned()
     });
+    let live = gather_live_report(cli, &apple_support);
 
     DoctorReport {
         system: SystemReport {
@@ -1202,12 +1202,93 @@ fn gather_doctor_report_with_audio(cli: &Cli, audio: AudioReport) -> DoctorRepor
                 .map(|path| path.display().to_string()),
             error,
         },
+        live,
         audio,
         runtime: RuntimeReport {
             python_sidecar_required: false,
             web_direct_available: true,
             native_adapter_supported_os: true,
         },
+    }
+}
+
+fn gather_live_report(cli: &Cli, apple_support: &AppleSupport) -> LiveReport {
+    match resolve_live_backend_for(cli, apple_support) {
+        Ok(backend) => {
+            let capabilities = live_capabilities_for_backend(backend);
+            LiveReport {
+                backend: Some(backend.as_str().to_owned()),
+                mode: Some(live_mode_name(capabilities.mode).to_owned()),
+                mic: capabilities.mic,
+                speaker: capabilities.speaker,
+                streaming_audio: capabilities.streaming_audio,
+                partial_results: capabilities.partial_results,
+                finalized_results: capabilities.finalized_results,
+                translation: capabilities.translation,
+                voice_processing: capabilities.voice_processing,
+                device_selection: capabilities.device_selection,
+                requires_network: capabilities.requires_network,
+                expected_latency: live_expected_latency(cli, &capabilities).map(format_duration),
+                error: None,
+            }
+        }
+        Err(err) => LiveReport {
+            backend: None,
+            mode: None,
+            mic: false,
+            speaker: false,
+            streaming_audio: false,
+            partial_results: false,
+            finalized_results: false,
+            translation: false,
+            voice_processing: false,
+            device_selection: false,
+            requires_network: false,
+            expected_latency: None,
+            error: Some(err.to_string()),
+        },
+    }
+}
+
+fn live_expected_latency(cli: &Cli, capabilities: &LiveCapabilities) -> Option<Duration> {
+    cli.live_chunk
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        .map(Duration::from_secs_f64)
+        .or(capabilities.expected_latency)
+}
+
+fn live_capabilities_for_backend(backend: AsrBackend) -> LiveCapabilities {
+    match backend {
+        AsrBackend::Apple => native_adapter_live_capabilities(),
+        AsrBackend::Doubao => doubao_live_capabilities(),
+        AsrBackend::Auto | AsrBackend::OpenaiCompatible => LiveCapabilities {
+            mode: LiveModeKind::Chunked,
+            mic: false,
+            speaker: false,
+            streaming_audio: false,
+            partial_results: false,
+            finalized_results: false,
+            translation: false,
+            voice_processing: false,
+            device_selection: false,
+            requires_network: false,
+            expected_latency: None,
+        },
+    }
+}
+
+fn live_mode_name(mode: LiveModeKind) -> &'static str {
+    match mode {
+        LiveModeKind::Streaming => "streaming",
+        LiveModeKind::Chunked => "chunked",
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    if duration.subsec_millis() == 0 {
+        format!("~{}s", duration.as_secs())
+    } else {
+        format!("~{:.1}s", duration.as_secs_f64())
     }
 }
 
@@ -1297,6 +1378,34 @@ fn print_doctor_text(report: &DoctorReport) {
         println!("  Error: {error}");
     }
     print_doctor_backend_details(report);
+
+    println!("\nLive capabilities");
+    if let Some(error) = &report.live.error {
+        println!("  Error: {error}");
+    } else {
+        if let Some(backend) = &report.live.backend {
+            println!("  Backend: {backend}");
+        }
+        if let Some(mode) = &report.live.mode {
+            println!("  Mode: {mode}");
+        }
+        println!("  Mic: {}", yes_no(report.live.mic));
+        println!("  Speaker: {}", yes_no(report.live.speaker));
+        println!("  Streaming audio: {}", yes_no(report.live.streaming_audio));
+        println!("  Partial results: {}", yes_no(report.live.partial_results));
+        println!(
+            "  Finalized results: {}",
+            yes_no(report.live.finalized_results)
+        );
+        println!("  Translation: {}", yes_no(report.live.translation));
+        println!(
+            "  Device selection: {}",
+            yes_no(report.live.device_selection)
+        );
+        if let Some(latency) = &report.live.expected_latency {
+            println!("  Expected latency: {latency}");
+        }
+    }
 
     println!("\nAudio");
     if report.audio.default_input_available {
@@ -1571,7 +1680,6 @@ fn is_doubao_model_alias(model: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
     fn test_cli() -> Cli {
         Cli {
             asr: AsrBackend::Auto,
@@ -1588,6 +1696,7 @@ mod tests {
             input: None,
             mic_duration: None,
             live: false,
+            live_chunk: None,
             no_mic: false,
             no_speaker: false,
             voice_processing: false,
@@ -1862,10 +1971,12 @@ mod tests {
             ..test_cli()
         };
 
-        assert!(validate_live_options(&cli, AsrBackend::Apple)
-            .unwrap_err()
-            .to_string()
-            .contains("--no-mic"));
+        assert!(
+            validate_live_options(&cli, "apple", &native_adapter_live_capabilities())
+                .unwrap_err()
+                .to_string()
+                .contains("--no-mic")
+        );
     }
 
     #[test]
@@ -1877,10 +1988,45 @@ mod tests {
             ..test_cli()
         };
 
-        assert!(validate_live_options(&cli, AsrBackend::Doubao)
-            .unwrap_err()
-            .to_string()
-            .contains("--select-device"));
+        assert!(
+            validate_live_options(&cli, "doubao", &doubao_live_capabilities())
+                .unwrap_err()
+                .to_string()
+                .contains("--select-device")
+        );
+    }
+
+    #[test]
+    fn doubao_live_uses_configured_chunk_duration() {
+        let cli = Cli {
+            live: true,
+            asr: AsrBackend::Doubao,
+            live_chunk: Some(3.0),
+            ..test_cli()
+        };
+        let capabilities = doubao_live_capabilities();
+
+        validate_live_options(&cli, "doubao", &capabilities).unwrap();
+        let options = live_options_from_cli(&cli, &capabilities);
+
+        assert_eq!(options.chunk_duration, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn streaming_live_rejects_chunk_duration() {
+        let cli = Cli {
+            live: true,
+            asr: AsrBackend::Apple,
+            live_chunk: Some(3.0),
+            ..test_cli()
+        };
+
+        assert!(
+            validate_live_options(&cli, "apple", &native_adapter_live_capabilities())
+                .unwrap_err()
+                .to_string()
+                .contains("--live-chunk")
+        );
     }
 
     #[test]
@@ -1894,6 +2040,7 @@ mod tests {
         let report = gather_doctor_report_with_audio(&cli, test_audio_report());
         assert!(!report.runtime.python_sidecar_required);
         assert!(report.runtime.web_direct_available);
+        assert!(report.live.mode.is_some() || report.live.error.is_some());
         assert_eq!(report.system.os, std::env::consts::OS);
         if std::env::consts::OS == "macos" {
             assert!(report.system.apple_on_device_reason.contains("macOS"));
@@ -1917,6 +2064,13 @@ mod tests {
         assert!(!report.backend.api_key_configured);
         assert!(report.backend.doubao_credential_path.is_some());
         assert!(report.backend.error.is_none());
+        assert_eq!(report.live.backend.as_deref(), Some("doubao"));
+        assert_eq!(report.live.mode.as_deref(), Some("chunked"));
+        assert!(report.live.mic);
+        assert!(!report.live.speaker);
+        assert!(!report.live.partial_results);
+        assert!(report.live.finalized_results);
+        assert_eq!(report.live.expected_latency.as_deref(), Some("~5s"));
     }
 
     #[test]
@@ -1986,7 +2140,7 @@ mod tests {
         TranscriptEvent {
             seq: 7,
             channel,
-            timestamp: Local.timestamp_opt(1_700_000_000, 0).single().unwrap(),
+            timestamp: EventTimestamp::from_unix_second(1_700_000_000).unwrap(),
             audio: None,
             src: TranscriptSource {
                 lang: src_lang.to_owned(),
@@ -2080,6 +2234,57 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert!(written.contains(r#""seq":7"#));
         assert!(written.contains(r#""text":"hello""#));
+    }
+
+    #[test]
+    fn live_renderer_keeps_status_out_of_transcript_log() {
+        let path = std::env::temp_dir().join(format!(
+            "vo-live-renderer-status-{}.jsonl",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut renderer = LiveRenderer::new(
+            true,
+            Some(path.clone()),
+            false,
+            Some("en-US".to_owned()),
+            None,
+        )
+        .unwrap();
+
+        renderer
+            .handle_live_event(LiveEvent::Status(LiveStatusEvent {
+                phase: vo_core::LiveStatusPhase::Recording,
+                message: "recording 3s chunk".to_owned(),
+                detail: None,
+            }))
+            .unwrap();
+        renderer
+            .emit_event(&test_event(AudioChannel::Mic, "hello", None))
+            .unwrap();
+        drop(renderer);
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(!written.contains(r#""type":"status""#));
+        assert!(!written.contains("recording 3s chunk"));
+        assert!(written.contains(r#""text":"hello""#));
+    }
+
+    #[test]
+    fn status_text_includes_non_empty_detail() {
+        let status = LiveStatusEvent {
+            phase: vo_core::LiveStatusPhase::Recovering,
+            message: "chunk failed; continuing".to_owned(),
+            detail: Some("network timeout".to_owned()),
+        };
+
+        assert_eq!(
+            status_text(&status),
+            "chunk failed; continuing: network timeout"
+        );
     }
 
     #[test]

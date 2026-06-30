@@ -13,8 +13,14 @@ use tokio_tungstenite::{
     tungstenite::{client::IntoClientRequest, protocol::Message as WsMessage},
 };
 use uuid::Uuid;
-use vo_asr::{AsrCapabilities, AsrError, AsrOptions, AsrProvider, AsrResult, Transcript};
-use vo_core::AudioInput;
+use vo_asr::{
+    AsrCapabilities, AsrError, AsrOptions, AsrProvider, AsrResult, LiveAsrOptions, LiveAsrProvider,
+    LiveCapabilities, LiveEventCallback, LiveModeKind, Transcript,
+};
+use vo_core::{
+    AudioChannel, AudioInput, EventTimestamp, LiveEvent, LiveMetaEvent, LiveStatusEvent,
+    LiveStatusPhase, TranscriptEvent, TranscriptSource,
+};
 
 pub const DEFAULT_MODEL: &str = "doubaoime-asr";
 
@@ -379,6 +385,179 @@ impl AsrProvider for DoubaoAsr {
             streaming: false,
             requires_network: true,
         }
+    }
+}
+
+#[async_trait]
+impl LiveAsrProvider for DoubaoAsr {
+    async fn run_live(
+        &self,
+        options: LiveAsrOptions,
+        on_event: LiveEventCallback<'_>,
+    ) -> AsrResult<()> {
+        validate_live_options(&options)?;
+        let src = options.src.clone().unwrap_or_else(|| "und".to_owned());
+        on_event(LiveEvent::Meta(LiveMetaEvent {
+            backend: self.live_name().to_owned(),
+            src: src.clone(),
+            dst: None,
+            mic: true,
+            speaker: false,
+            devices: Vec::new(),
+        }))?;
+
+        let mut seq = 0_u64;
+        loop {
+            let chunk_path = temp_recording_path();
+            on_event(LiveEvent::Status(LiveStatusEvent {
+                phase: LiveStatusPhase::Recording,
+                message: format!(
+                    "recording {} chunk",
+                    format_status_duration(options.chunk_duration)
+                ),
+                detail: None,
+            }))?;
+            let record_task = tokio::task::spawn_blocking({
+                let chunk_path = chunk_path.clone();
+                let chunk_duration = options.chunk_duration;
+                move || vo_audio::record_default_input_to_wav(&chunk_path, chunk_duration)
+            });
+            let record_result = tokio::select! {
+                result = record_task => result.map_err(|err| {
+                    AsrError::Request(format!("doubao live recorder task failed: {err}"))
+                })?,
+                result = tokio::signal::ctrl_c() => {
+                    result.map_err(|err| {
+                        AsrError::Request(format!("failed to listen for Ctrl-C: {err}"))
+                    })?;
+                    let _ = std::fs::remove_file(&chunk_path);
+                    break;
+                }
+            };
+
+            if let Err(err) = record_result {
+                let _ = std::fs::remove_file(&chunk_path);
+                return Err(AsrError::Input(format!(
+                    "failed to record default microphone: {err}"
+                )));
+            }
+
+            on_event(LiveEvent::Status(LiveStatusEvent {
+                phase: LiveStatusPhase::Transcribing,
+                message: "transcribing chunk".to_owned(),
+                detail: None,
+            }))?;
+            let transcribe_result = tokio::select! {
+                result = self.transcribe(
+                    AudioInput::File(chunk_path.clone()),
+                    AsrOptions {
+                        language: options.src.clone(),
+                        ..AsrOptions::default()
+                    },
+                ) => result,
+                result = tokio::signal::ctrl_c() => {
+                    result.map_err(|err| {
+                        AsrError::Request(format!("failed to listen for Ctrl-C: {err}"))
+                    })?;
+                    let _ = std::fs::remove_file(&chunk_path);
+                    break;
+                }
+            };
+
+            match transcribe_result {
+                Ok(transcript) => {
+                    let text = transcript.text.trim();
+                    if !text.is_empty() {
+                        on_event(LiveEvent::Finalized(TranscriptEvent {
+                            seq,
+                            channel: AudioChannel::Mic,
+                            timestamp: EventTimestamp::now(),
+                            audio: None,
+                            src: TranscriptSource {
+                                lang: transcript.language.unwrap_or_else(|| src.clone()),
+                                text: text.to_owned(),
+                                confidence: None,
+                            },
+                            dst: None,
+                        }))?;
+                        seq += 1;
+                    }
+                }
+                Err(err) => {
+                    on_event(LiveEvent::Status(LiveStatusEvent {
+                        phase: LiveStatusPhase::Recovering,
+                        message: "chunk failed; continuing".to_owned(),
+                        detail: Some(err.to_string()),
+                    }))?;
+                }
+            }
+
+            let _ = std::fs::remove_file(&chunk_path);
+        }
+
+        on_event(LiveEvent::Eof)?;
+        Ok(())
+    }
+
+    fn live_name(&self) -> &'static str {
+        "doubao"
+    }
+
+    fn live_capabilities(&self) -> LiveCapabilities {
+        doubao_live_capabilities()
+    }
+}
+
+pub fn doubao_live_capabilities() -> LiveCapabilities {
+    LiveCapabilities {
+        mode: LiveModeKind::Chunked,
+        mic: true,
+        speaker: false,
+        streaming_audio: false,
+        partial_results: false,
+        finalized_results: true,
+        translation: false,
+        voice_processing: false,
+        device_selection: false,
+        requires_network: true,
+        expected_latency: Some(Duration::from_secs(5)),
+    }
+}
+
+fn validate_live_options(options: &LiveAsrOptions) -> AsrResult<()> {
+    if !options.mic {
+        return Err(AsrError::Config(
+            "doubao live mode requires microphone input".to_owned(),
+        ));
+    }
+    if options.speaker {
+        return Err(AsrError::Config(
+            "doubao live mode does not support speaker capture".to_owned(),
+        ));
+    }
+    if options.dst.is_some() {
+        return Err(AsrError::Config(
+            "doubao live mode does not support translation".to_owned(),
+        ));
+    }
+    if options.voice_processing || options.select_device {
+        return Err(AsrError::Config(
+            "doubao live mode does not support Apple-only capture controls".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn temp_recording_path() -> PathBuf {
+    let millis = now_millis();
+    std::env::temp_dir().join(format!("vo-doubao-live-{millis}.wav"))
+}
+
+fn format_status_duration(duration: Duration) -> String {
+    if duration.subsec_millis() == 0 {
+        format!("{}s", duration.as_secs())
+    } else {
+        format!("{:.1}s", duration.as_secs_f64())
     }
 }
 
@@ -920,6 +1099,26 @@ fn doubao_credential_path(config_dir: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doubao_live_capabilities_are_chunked_final_only() {
+        let capabilities = doubao_live_capabilities();
+
+        assert_eq!(capabilities.mode, LiveModeKind::Chunked);
+        assert!(capabilities.mic);
+        assert!(!capabilities.speaker);
+        assert!(!capabilities.streaming_audio);
+        assert!(!capabilities.partial_results);
+        assert!(capabilities.finalized_results);
+        assert!(!capabilities.translation);
+        assert!(capabilities.requires_network);
+    }
+
+    #[test]
+    fn formats_live_status_duration_for_chunk_prompt() {
+        assert_eq!(format_status_duration(Duration::from_secs(3)), "3s");
+        assert_eq!(format_status_duration(Duration::from_millis(1500)), "1.5s");
+    }
 
     #[test]
     fn defaults_to_cached_credentials_without_api_key() {

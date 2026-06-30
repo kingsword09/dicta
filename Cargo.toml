@@ -21,11 +21,11 @@ version = "0.10.2"
 anyhow = "1.0.98"
 async-trait = "0.1.88"
 bytes = "1.10.1"
-chrono = { version = "0.4.41", features = ["serde"] }
 clap = { version = "4.5.40", features = ["derive", "env"] }
 cpal = "0.16.0"
 futures-util = "0.3.31"
 hound = "3.5.1"
+jiff = { version = "0.2.31", default-features = false, features = ["std", "serde", "tz-system"] }
 md5 = "0.7.0"
 opus = "0.3.1"
 prost = "0.14.1"

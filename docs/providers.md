@@ -62,6 +62,17 @@ service. The current Rust provider accepts 16-bit PCM WAV input and resamples it
 to 16 kHz mono before Opus encoding. `--mic-duration` works because the Rust
 audio path records WAV.
 
+Doubao live mode is a chunked live provider: the CLI records short microphone
+chunks, sends each chunk to Doubao, and renders finalized text when a response is
+available. While a chunk is active, the live event stream reports status updates
+such as recording, transcribing, and recoverable chunk failures. It does not
+expose partial results, speaker capture, or translation. Tune chunk size with
+`--live-chunk`, for example:
+
+```console
+$ vo --asr doubao --src zh-CN --live-chunk 3
+```
+
 ## Native adapter / Apple Speech
 
 `--asr apple` uses `vo-asr-native-adapter`. The provider is intentionally a
@@ -91,3 +102,17 @@ Live capture remains implemented inside `adapters/apple-speech`; the Rust CLI
 owns the top-level command surface and delegates Apple-only system capture/events
 to that adapter. `--apple-adapter` and `VO_APPLE_ADAPTER` are still accepted as
 compatibility aliases for older scripts.
+
+## Live provider capabilities
+
+Live providers use the shared `vo-core::LiveEvent` stream:
+
+```text
+Meta -> Status? -> Volatile? -> Finalized -> Translated? -> Eof
+```
+
+Apple live is a streaming provider: it supports mic/speaker capture, partial
+results, finalized results, translation, voice processing, and device selection.
+Doubao live is a chunked provider: it supports microphone capture and finalized
+results only, with status events for the current chunk phase. `vo --doctor`
+reports the resolved live backend and its capability flags.
