@@ -1,8 +1,8 @@
 # vo
 
-`vo` is a Rust-first transcription toolkit inspired by
-[k1LoW/vo](https://github.com/k1LoW/vo). It keeps the original macOS live command
-shape while adding Doubao, OpenAI-compatible providers, and a browser WASM path.
+`vo` is a Rust-first transcription toolkit for live and file-based speech
+transcription. It supports Doubao, OpenAI-compatible providers, Apple on-device
+speech on supported macOS systems, and browser integration paths.
 
 ## Install
 
@@ -135,6 +135,9 @@ backend.
 
 [MIT License](LICENSE)
 
-This project keeps the MIT license. Thanks to
-[k1LoW/vo](https://github.com/k1LoW/vo) for the original macOS on-device
-transcription and translation CLI design.
+This project is MIT licensed.
+
+## Acknowledgements
+
+`vo` takes inspiration from [k1LoW/vo](https://github.com/k1LoW/vo), especially
+its focused macOS on-device transcription CLI experience.
