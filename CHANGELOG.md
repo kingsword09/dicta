@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.10.3](https://github.com/kingsword09/vo/compare/v0.10.2...v0.10.3) - 2026-06-30
+
+### Other Changes
+- feat: add live provider capabilities by @kingsword09 in https://github.com/kingsword09/vo/pull/16
+
 ## [v0.10.2](https://github.com/kingsword09/vo/compare/v0.10.1...v0.10.2) - 2026-06-29
 
 ### Other Changes
