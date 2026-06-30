@@ -1,6 +1,7 @@
 use async_trait::async_trait;
+use std::time::Duration;
 use thiserror::Error;
-use vo_core::AudioInput;
+use vo_core::{AudioInput, LiveEvent};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AsrOptions {
@@ -38,6 +39,52 @@ pub struct AsrCapabilities {
     pub requires_network: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveModeKind {
+    Streaming,
+    Chunked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveCapabilities {
+    pub mode: LiveModeKind,
+    pub mic: bool,
+    pub speaker: bool,
+    pub streaming_audio: bool,
+    pub partial_results: bool,
+    pub finalized_results: bool,
+    pub translation: bool,
+    pub voice_processing: bool,
+    pub device_selection: bool,
+    pub requires_network: bool,
+    pub expected_latency: Option<Duration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveAsrOptions {
+    pub src: Option<String>,
+    pub dst: Option<String>,
+    pub mic: bool,
+    pub speaker: bool,
+    pub voice_processing: bool,
+    pub select_device: bool,
+    pub chunk_duration: Duration,
+}
+
+impl Default for LiveAsrOptions {
+    fn default() -> Self {
+        Self {
+            src: None,
+            dst: None,
+            mic: true,
+            speaker: false,
+            voice_processing: false,
+            select_device: false,
+            chunk_duration: Duration::from_secs(5),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum AsrError {
     #[error("ASR configuration error: {0}")]
@@ -57,4 +104,18 @@ pub trait AsrProvider: Send + Sync {
     async fn transcribe(&self, input: AudioInput, options: AsrOptions) -> AsrResult<Transcript>;
     fn name(&self) -> &'static str;
     fn capabilities(&self) -> AsrCapabilities;
+}
+
+pub type LiveEventCallback<'a> = &'a mut (dyn FnMut(LiveEvent) -> AsrResult<()> + Send);
+
+#[async_trait]
+pub trait LiveAsrProvider: Send + Sync {
+    async fn run_live(
+        &self,
+        options: LiveAsrOptions,
+        on_event: LiveEventCallback<'_>,
+    ) -> AsrResult<()>;
+
+    fn live_name(&self) -> &'static str;
+    fn live_capabilities(&self) -> LiveCapabilities;
 }
