@@ -1,5 +1,15 @@
 # Changelog
 
+## [v0.10.4](https://github.com/kingsword09/vo/compare/v0.10.3...v0.10.4) - 2026-07-01
+
+### Other Changes
+- chore: Update license copyright owner by @kingsword09 in https://github.com/kingsword09/vo/pull/18
+- ci: skip tests for docs-only changes by @kingsword09 in https://github.com/kingsword09/vo/pull/19
+- feat(web): add embeddable speech transcription adapter by @kingsword09 in https://github.com/kingsword09/vo/pull/20
+- docs: streamline README acknowledgements by @kingsword09 in https://github.com/kingsword09/vo/pull/21
+- feat: support configurable ASR provider profiles by @kingsword09 in https://github.com/kingsword09/vo/pull/22
+- feat: add rust tray provider switcher by @kingsword09 in https://github.com/kingsword09/vo/pull/23
+
 ## [v0.10.3](https://github.com/kingsword09/vo/compare/v0.10.2...v0.10.3) - 2026-06-30
 
 ### Other Changes
