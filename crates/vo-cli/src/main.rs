@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -209,6 +209,40 @@ impl Cli {
 enum Command {
     #[command(about = "Manage named ASR provider selections")]
     Provider(ProviderCommand),
+    #[command(about = "Update installed vo binaries from GitHub Releases")]
+    Update(UpdateCommand),
+    #[command(about = "Uninstall installed vo binaries")]
+    Uninstall(UninstallCommand),
+}
+
+#[derive(Debug, Clone, Args)]
+struct UpdateCommand {
+    #[arg(
+        long,
+        env = "VO_VERSION",
+        help = "Release version or tag, default: latest"
+    )]
+    version: Option<String>,
+
+    #[arg(
+        long = "install-dir",
+        env = "VO_INSTALL_DIR",
+        help = "Install directory, default: directory containing the current vo binary"
+    )]
+    install_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct UninstallCommand {
+    #[arg(
+        long = "install-dir",
+        env = "VO_INSTALL_DIR",
+        help = "Install directory, default: directory containing the current vo binary"
+    )]
+    install_dir: Option<PathBuf>,
+
+    #[arg(short = 'y', long, help = "Do not ask for confirmation")]
+    yes: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -433,6 +467,8 @@ async fn main() -> Result<()> {
 async fn run_command(cli: &Cli, command: &Command) -> Result<()> {
     match command {
         Command::Provider(command) => run_provider_command(cli, command).await,
+        Command::Update(command) => run_update_command(command).await,
+        Command::Uninstall(command) => run_uninstall_command(command),
     }
 }
 
@@ -1660,6 +1696,103 @@ fn run_provider_set(cli: &Cli, name: &str) -> Result<()> {
         println!("Active provider: {name}");
     }
     Ok(())
+}
+
+async fn run_update_command(command: &UpdateCommand) -> Result<()> {
+    let install_dir = command_install_dir(command.install_dir.as_ref())?;
+    let mut process = tokio::process::Command::new("sh");
+    process
+        .arg("-c")
+        .arg(update_installer_command())
+        .env("VO_INSTALL_DIR", &install_dir);
+    if let Some(version) = non_empty(&command.version) {
+        process.env("VO_VERSION", version);
+    }
+    let status = process.status().await.with_context(
+        || "failed to run installer; install curl or update manually with install.sh",
+    )?;
+    if !status.success() {
+        bail!("vo update failed with status {status}");
+    }
+    Ok(())
+}
+
+fn update_installer_command() -> &'static str {
+    r#"tmp="${TMPDIR:-/tmp}/vo-install.$$"; trap 'rm -f "$tmp"' EXIT; if command -v curl >/dev/null 2>&1; then curl -fsSL https://raw.githubusercontent.com/kingsword09/vo/main/install.sh -o "$tmp"; elif command -v wget >/dev/null 2>&1; then wget -qO "$tmp" https://raw.githubusercontent.com/kingsword09/vo/main/install.sh; else echo 'vo update: required command not found: curl or wget' >&2; exit 1; fi && sh "$tmp""#
+}
+
+fn run_uninstall_command(command: &UninstallCommand) -> Result<()> {
+    let install_dir = command_install_dir(command.install_dir.as_ref())?;
+    if !command.yes && !confirm_uninstall(&install_dir)? {
+        println!("vo uninstall: cancelled");
+        return Ok(());
+    }
+
+    let mut removed_any = false;
+    for name in installed_binary_names() {
+        let path = install_dir.join(name);
+        if path.exists() {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+            println!("vo uninstall: removed {}", path.display());
+            removed_any = true;
+        } else {
+            println!("vo uninstall: {} is not installed", path.display());
+        }
+    }
+    if !removed_any {
+        println!(
+            "vo uninstall: no installed vo binaries found in {}",
+            install_dir.display()
+        );
+    }
+    println!("vo uninstall: configuration files were left in place");
+    Ok(())
+}
+
+fn command_install_dir(explicit: Option<&PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path.clone());
+    }
+    let exe = env::current_exe().context("failed to resolve current vo executable")?;
+    exe.parent()
+        .map(std::path::Path::to_path_buf)
+        .context("failed to determine install directory from current executable")
+}
+
+fn installed_binary_names() -> [&'static str; 4] {
+    if cfg!(windows) {
+        [
+            "vo.exe",
+            "vo-tray.exe",
+            "vo-adapter-apple-speech.exe",
+            "vo-apple-adapter.exe",
+        ]
+    } else {
+        [
+            "vo",
+            "vo-tray",
+            "vo-adapter-apple-speech",
+            "vo-apple-adapter",
+        ]
+    }
+}
+
+fn confirm_uninstall(install_dir: &std::path::Path) -> Result<bool> {
+    if !io::stdin().is_terminal() {
+        bail!("refusing to uninstall without confirmation on non-interactive stdin; pass --yes");
+    }
+    eprint!("Remove vo binaries from {}? [y/N] ", install_dir.display());
+    io::stderr().flush().ok();
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("failed to read uninstall confirmation")?;
+    Ok(is_uninstall_confirmation(&input))
+}
+
+fn is_uninstall_confirmation(input: &str) -> bool {
+    matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
 fn gather_provider_list_report(cli: &Cli) -> Result<ProviderListReport> {
@@ -2944,6 +3077,40 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn installed_binary_names_include_cli_tray_and_adapter() {
+        let names = installed_binary_names();
+        if cfg!(windows) {
+            assert!(names.contains(&"vo.exe"));
+            assert!(names.contains(&"vo-tray.exe"));
+            assert!(names.contains(&"vo-adapter-apple-speech.exe"));
+        } else {
+            assert!(names.contains(&"vo"));
+            assert!(names.contains(&"vo-tray"));
+            assert!(names.contains(&"vo-adapter-apple-speech"));
+        }
+    }
+
+    #[test]
+    fn update_installer_command_has_fetch_fallbacks() {
+        let command = update_installer_command();
+        assert!(command.contains("curl"));
+        assert!(command.contains("wget"));
+        assert!(command.contains("install.sh"));
+        assert!(command.contains("sh \"$tmp\""));
+    }
+
+    #[test]
+    fn uninstall_confirmation_accepts_y_or_yes_only() {
+        assert!(is_uninstall_confirmation("y"));
+        assert!(is_uninstall_confirmation("Y"));
+        assert!(is_uninstall_confirmation("yes"));
+        assert!(is_uninstall_confirmation(" yes\n"));
+        assert!(!is_uninstall_confirmation(""));
+        assert!(!is_uninstall_confirmation("n"));
+        assert!(!is_uninstall_confirmation("no"));
     }
 
     #[test]
