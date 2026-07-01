@@ -1,5 +1,11 @@
 # Changelog
 
+## [v0.10.5](https://github.com/kingsword09/vo/compare/v0.10.4...v0.10.5) - 2026-07-01
+
+### Other Changes
+- feat: Add update and uninstall CLI commands by @kingsword09 in https://github.com/kingsword09/vo/pull/25
+- chore: Hide batch-only providers from tray by @kingsword09 in https://github.com/kingsword09/vo/pull/26
+
 ## [v0.10.4](https://github.com/kingsword09/vo/compare/v0.10.3...v0.10.4) - 2026-07-01
 
 ### Other Changes
