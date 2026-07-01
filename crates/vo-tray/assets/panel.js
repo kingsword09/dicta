@@ -73,7 +73,7 @@
       if (!state.providers.length) {
         const empty = document.createElement('div');
         empty.className = 'empty';
-        empty.textContent = 'No providers found';
+        empty.textContent = 'No live providers found';
         providers.append(empty);
         return;
       }

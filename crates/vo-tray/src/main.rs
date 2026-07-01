@@ -247,7 +247,9 @@ impl TrayApp {
         if !output.status.success() {
             bail!("{}", command_error(&output.stderr));
         }
-        serde_json::from_slice(&output.stdout).context("failed to parse provider list JSON")
+        let report: ProviderListReport =
+            serde_json::from_slice(&output.stdout).context("failed to parse provider list JSON")?;
+        Ok(filter_provider_report_for_tray(report))
     }
 
     fn load_provider_report_with_live_default(&self) -> Result<(ProviderListReport, String)> {
@@ -409,7 +411,7 @@ impl TrayApp {
 
         if let Some(report) = &self.provider_report {
             if report.providers.is_empty() {
-                let item = MenuItem::new("No providers found", false, None);
+                let item = MenuItem::new("No live providers found", false, None);
                 menu.append(&item)?;
             } else {
                 for (index, provider) in report.providers.iter().enumerate() {
@@ -926,6 +928,15 @@ fn provider_switchable(provider: &ProviderListEntry) -> bool {
     provider.live && provider.local_config_ok
 }
 
+fn provider_visible_in_tray(provider: &ProviderListEntry) -> bool {
+    provider.live
+}
+
+fn filter_provider_report_for_tray(mut report: ProviderListReport) -> ProviderListReport {
+    report.providers.retain(provider_visible_in_tray);
+    report
+}
+
 fn report_current_switchable(report: &ProviderListReport) -> bool {
     let Some(current) = report.current.as_deref() else {
         return false;
@@ -994,6 +1005,31 @@ mod tests {
         let report = provider_report(None);
 
         assert!(!report_current_switchable(&report));
+        assert_eq!(first_switchable_provider(&report), Some("doubao"));
+    }
+
+    #[test]
+    fn tray_hides_batch_only_providers() {
+        let report = filter_provider_report_for_tray(provider_report(Some("openai")));
+
+        assert!(
+            report
+                .providers
+                .iter()
+                .any(|provider| provider.name == "apple")
+        );
+        assert!(
+            report
+                .providers
+                .iter()
+                .any(|provider| provider.name == "doubao")
+        );
+        assert!(
+            !report
+                .providers
+                .iter()
+                .any(|provider| provider.name == "openai")
+        );
         assert_eq!(first_switchable_provider(&report), Some("doubao"));
     }
 
