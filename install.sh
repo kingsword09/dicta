@@ -40,10 +40,11 @@ case "${1:-}" in
       *) exe_name="vo" ;;
     esac
     case "$exe_name" in
-      *.exe) adapter_name="vo-adapter-apple-speech.exe"; compat_adapter_name="vo-apple-adapter.exe" ;;
-      *) adapter_name="vo-adapter-apple-speech"; compat_adapter_name="vo-apple-adapter" ;;
+      *.exe) tray_name="vo-tray.exe"; adapter_name="vo-adapter-apple-speech.exe"; compat_adapter_name="vo-apple-adapter.exe" ;;
+      *) tray_name="vo-tray"; adapter_name="vo-adapter-apple-speech"; compat_adapter_name="vo-apple-adapter" ;;
     esac
     target="$install_dir/$exe_name"
+    tray_target="$install_dir/$tray_name"
     adapter_target="$install_dir/$adapter_name"
     compat_adapter_target="$install_dir/$compat_adapter_name"
     if [ -e "$target" ]; then
@@ -55,6 +56,10 @@ case "${1:-}" in
     if [ -e "$adapter_target" ]; then
       rm -f "$adapter_target"
       echo "vo install: removed $adapter_target"
+    fi
+    if [ -e "$tray_target" ]; then
+      rm -f "$tray_target"
+      echo "vo install: removed $tray_target"
     fi
     if [ -e "$compat_adapter_target" ]; then
       rm -f "$compat_adapter_target"
@@ -104,11 +109,13 @@ esac
 if [ "$os" = "windows" ]; then
   archive_ext="zip"
   exe_name="vo.exe"
+  tray_name="vo-tray.exe"
   adapter_name="vo-adapter-apple-speech.exe"
   compat_adapter_name="vo-apple-adapter.exe"
 else
   archive_ext="tar.gz"
   exe_name="vo"
+  tray_name="vo-tray"
   adapter_name="vo-adapter-apple-speech"
   compat_adapter_name="vo-apple-adapter"
 fi
@@ -250,16 +257,32 @@ if [ -n "$adapter_path" ]; then
   chmod 755 "$adapter_target"
 fi
 
+tray_path="$(find "$tmp/extract" -type f -name "$tray_name" -perm -u+x | head -n 1)"
+if [ -z "$tray_path" ]; then
+  tray_path="$(find "$tmp/extract" -type f -name "$tray_name" | head -n 1)"
+fi
+if [ -n "$tray_path" ]; then
+  tray_target="$install_dir/$tray_name"
+  cp "$tray_path" "$tray_target"
+  chmod 755 "$tray_target"
+fi
+
 if [ "$os" = "darwin" ] && command -v xattr >/dev/null 2>&1; then
   xattr -cr "$target" >/dev/null 2>&1 || true
   if [ -n "${adapter_target:-}" ]; then
     xattr -cr "$adapter_target" >/dev/null 2>&1 || true
+  fi
+  if [ -n "${tray_target:-}" ]; then
+    xattr -cr "$tray_target" >/dev/null 2>&1 || true
   fi
 fi
 
 echo "vo install: installed $target"
 if [ -n "${adapter_target:-}" ]; then
   echo "vo install: installed $adapter_target"
+fi
+if [ -n "${tray_target:-}" ]; then
+  echo "vo install: installed $tray_target"
 fi
 version_out="$tmp/version.out"
 version_err="$tmp/version.err"

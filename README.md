@@ -32,6 +32,23 @@ $ vo --capabilities                   # ASR capability diagnostics
 $ vo --doctor                         # Environment diagnostics
 ```
 
+Status bar mode:
+
+```console
+$ vo --ui                             # Open the status bar provider switcher
+$ vo --ui --live                      # Open the switcher and start live mode
+$ vo --ui --provider doubao --live    # Set the initial provider, then start live
+```
+
+The status bar UI is the Rust `vo-tray` companion binary. Left-clicking the
+status item opens a compact provider panel; right-clicking keeps a native menu
+fallback. It lists built-in and configured provider profiles and runs live
+transcription as a supervised `vo --provider active --live` worker. Without a
+saved active provider, `active` defaults to Apple on supported macOS systems and
+Doubao elsewhere. Switching providers from the panel stores the active selection
+in `~/.config/vo/active-provider.json` and restarts the worker, so a failed
+provider can be replaced without leaving the status bar UI.
+
 Doubao does not require an API key:
 
 ```console
@@ -89,6 +106,9 @@ $ vo --doctor --json
 $ vo --capabilities
 $ vo --capabilities --asr doubao --json
 $ vo --capabilities --provider openai --json
+$ vo provider list
+$ vo provider current
+$ vo provider set doubao
 ```
 
 `--input` and `--mic-duration` are mutually exclusive. Without either flag, `vo`
@@ -127,6 +147,7 @@ crates/
   vo-asr*/                    ASR provider crates
   vo-audio/                   microphone recording
   vo-cli/                     command-line entry point
+  vo-tray/                    Rust status bar provider switcher
   vo-web/                     browser WASM provider/audio/storage APIs
 web/direct/                   static browser direct-provider tool
 adapters/apple-speech/        macOS 26 Apple Speech adapter

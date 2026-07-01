@@ -126,7 +126,7 @@ pub fn record_default_input_to_wav(
         other => {
             return Err(AudioError::Stream(format!(
                 "unsupported input sample format: {other:?}"
-            )))
+            )));
         }
     };
 
@@ -206,7 +206,7 @@ fn input_stream_config(device: &cpal::Device) -> AudioResult<SupportedStreamConf
 
 #[cfg(target_os = "macos")]
 fn request_microphone_permission() -> AudioResult<()> {
-    extern "C" {
+    unsafe extern "C" {
         fn vo_audio_request_microphone_permission() -> std::os::raw::c_int;
     }
 

@@ -1,7 +1,7 @@
 use jiff::{
+    Timestamp,
     fmt::temporal::{DateTimeParser, DateTimePrinter},
     tz::TimeZone,
-    Timestamp,
 };
 use serde::de;
 use serde::{Deserialize, Serialize};

@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <style>
+__VO_PANEL_CSS__
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div class="brand">
+        <div class="logo">vo</div>
+        <div class="current" id="current"></div>
+      </div>
+      <div class="chip" id="live-chip"></div>
+    </header>
+    <div class="status" id="status"></div>
+    <div class="providers-frame">
+      <section class="providers" id="providers" aria-label="Providers"></section>
+    </div>
+    <footer>
+      <div class="controls">
+        <button class="control primary" id="start-stop" type="button"></button>
+        <button class="control" id="restart" type="button"></button>
+      </div>
+      <span></span>
+      <div class="controls">
+        <button class="icon-control" type="button" data-action="refresh" title="Refresh providers" aria-label="Refresh providers">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 0 1-15.4 6.4L3 16"/><path d="M3 21v-5h5"/><path d="M3 12A9 9 0 0 1 18.4 5.6L21 8"/><path d="M21 3v5h-5"/></svg>
+        </button>
+        <button class="icon-control danger" type="button" data-action="quit" title="Quit vo" aria-label="Quit vo">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.8 0"/></svg>
+        </button>
+      </div>
+    </footer>
+  </main>
+  <script>
+window.__voNativeGlass = __VO_NATIVE_GLASS__;
+__VO_PANEL_JS__
+  </script>
+</body>
+</html>

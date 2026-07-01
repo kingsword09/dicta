@@ -1,5 +1,5 @@
-use anyhow::{bail, Context, Result};
-use clap::{Parser, ValueEnum};
+use anyhow::{Context, Result, bail};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -11,13 +11,13 @@ use vo_asr::{
     AsrCapabilities, AsrOptions, AsrProvider, LiveAsrOptions, LiveAsrProvider, LiveCapabilities,
     LiveModeKind, ProviderCapabilities,
 };
-use vo_asr_doubao::{doubao_capabilities, doubao_live_capabilities, DoubaoAsr, DoubaoConfig};
+use vo_asr_doubao::{DoubaoAsr, DoubaoConfig, doubao_capabilities, doubao_live_capabilities};
 use vo_asr_native_adapter::{
-    native_adapter_capabilities, native_adapter_live_capabilities, NativeAdapterAsr,
-    NativeAdapterConfig,
+    NativeAdapterAsr, NativeAdapterConfig, native_adapter_capabilities,
+    native_adapter_live_capabilities,
 };
 use vo_asr_openai_compatible::{
-    openai_compatible_capabilities, OpenAiCompatibleAsr, OpenAiCompatibleConfig,
+    OpenAiCompatibleAsr, OpenAiCompatibleConfig, openai_compatible_capabilities,
 };
 use vo_core::{
     AudioChannel, AudioInput, EventTimestamp, LiveEvent, LiveMetaEvent, LiveStatusEvent,
@@ -159,6 +159,72 @@ struct Cli {
 
     #[arg(long, help = "Print ASR provider capability diagnostics")]
     capabilities: bool,
+
+    #[arg(long, help = "Launch the status bar UI for live provider switching")]
+    ui: bool,
+
+    #[arg(long = "provider-state", env = "VO_PROVIDER_STATE", hide = true)]
+    provider_state: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+impl Cli {
+    fn with_provider_name(&self, provider: Option<String>) -> Self {
+        Self {
+            asr: self.asr,
+            api_base: self.api_base.clone(),
+            api_key: self.api_key.clone(),
+            api_model: self.api_model.clone(),
+            provider,
+            provider_config: self.provider_config.clone(),
+            src: self.src.clone(),
+            doubao_credential_path: self.doubao_credential_path.clone(),
+            doubao_device_id: self.doubao_device_id.clone(),
+            doubao_token: self.doubao_token.clone(),
+            dst: self.dst.clone(),
+            native_adapter: self.native_adapter.clone(),
+            apple_adapter: self.apple_adapter.clone(),
+            input: self.input.clone(),
+            mic_duration: self.mic_duration,
+            live: self.live,
+            live_chunk: self.live_chunk,
+            no_mic: self.no_mic,
+            no_speaker: self.no_speaker,
+            voice_processing: self.voice_processing,
+            select_device: self.select_device,
+            json: self.json,
+            transcript: self.transcript.clone(),
+            doctor: self.doctor,
+            capabilities: self.capabilities,
+            ui: self.ui,
+            provider_state: self.provider_state.clone(),
+            command: self.command.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum Command {
+    #[command(about = "Manage named ASR provider selections")]
+    Provider(ProviderCommand),
+}
+
+#[derive(Debug, Clone, Args)]
+struct ProviderCommand {
+    #[command(subcommand)]
+    action: ProviderAction,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum ProviderAction {
+    #[command(about = "List built-in and configured providers")]
+    List,
+    #[command(about = "Show the provider selected for --provider active")]
+    Current,
+    #[command(about = "Set the provider selected by --provider active")]
+    Set { name: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -213,18 +279,24 @@ struct ProviderProfile {
 #[serde(rename_all = "kebab-case")]
 enum ProfileProviderKind {
     OpenaiCompatible,
+    Doubao,
+    Apple,
 }
 
 impl ProfileProviderKind {
     fn backend(self) -> AsrBackend {
         match self {
             Self::OpenaiCompatible => AsrBackend::OpenaiCompatible,
+            Self::Doubao => AsrBackend::Doubao,
+            Self::Apple => AsrBackend::Apple,
         }
     }
 
     fn as_str(self) -> &'static str {
         match self {
             Self::OpenaiCompatible => "openai-compatible",
+            Self::Doubao => "doubao",
+            Self::Apple => "apple",
         }
     }
 }
@@ -233,6 +305,46 @@ impl ProfileProviderKind {
 struct ResolvedProviderProfile {
     name: String,
     profile: ProviderProfile,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ActiveProviderState {
+    provider: Option<String>,
+    updated_at_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProviderListReport {
+    current: Option<String>,
+    state_path: Option<String>,
+    provider_config: Option<String>,
+    providers: Vec<ProviderListEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProviderListEntry {
+    name: String,
+    kind: String,
+    built_in: bool,
+    selected: bool,
+    model: String,
+    batch_file: bool,
+    live: bool,
+    local_config_ok: bool,
+    local_config_error: Option<String>,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CurrentProviderReport {
+    provider: Option<String>,
+    state_path: Option<String>,
+    resolved: Option<String>,
+    kind: Option<String>,
+    model: Option<String>,
+    live: bool,
+    local_config_ok: bool,
+    local_config_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -258,6 +370,16 @@ impl EffectiveProvider {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.ui {
+        run_ui(&cli).await?;
+        return Ok(());
+    }
+
+    if let Some(command) = &cli.command {
+        run_command(&cli, command).await?;
+        return Ok(());
+    }
+
     if cli.capabilities {
         run_capabilities(&cli)?;
         return Ok(());
@@ -306,6 +428,204 @@ async fn main() -> Result<()> {
 
     audio_source.cleanup();
     Ok(())
+}
+
+async fn run_command(cli: &Cli, command: &Command) -> Result<()> {
+    match command {
+        Command::Provider(command) => run_provider_command(cli, command).await,
+    }
+}
+
+async fn run_ui(cli: &Cli) -> Result<()> {
+    if let Some(provider) = non_empty(&cli.provider).filter(|provider| provider != "active") {
+        let profiles = available_provider_profiles(cli)?;
+        if !profiles.contains_key(&provider) {
+            bail!(
+                "provider '{provider}' was not found; run `vo provider list` to see available providers"
+            );
+        }
+        write_active_provider_name(cli, &provider)?;
+    }
+
+    let vo_bin = std::env::current_exe().context("failed to resolve current vo executable")?;
+    let launcher = resolve_tray_launcher().context(
+        "could not find vo-tray; install the release companion binary or run `cargo build -p vo-tray`",
+    )?;
+    let description = launcher.description();
+    let mut command = launcher.command();
+    command.env("VO_BIN", &vo_bin);
+    if let Some(config) = configured_provider_config_path(cli) {
+        command.env("VO_PROVIDER_CONFIG", config);
+    }
+    if let Some(state) = provider_state_path(cli) {
+        command.env("VO_PROVIDER_STATE", state);
+    }
+    command.env("VO_UI_LIVE_ARGS", live_args_for_ui(cli).join("\n"));
+    command.env("VO_UI_AUTOSTART", if cli.live { "1" } else { "0" });
+    command
+        .status()
+        .await
+        .with_context(|| format!("failed to launch tray UI with {description}"))
+        .and_then(|status| {
+            if status.success() {
+                Ok(())
+            } else {
+                bail!("tray UI exited with status {status}")
+            }
+        })
+}
+
+#[derive(Debug, Clone)]
+enum TrayLauncher {
+    Binary(PathBuf),
+    CargoRun { repo_root: PathBuf },
+}
+
+impl TrayLauncher {
+    fn command(&self) -> tokio::process::Command {
+        match self {
+            Self::Binary(path) => tokio::process::Command::new(path),
+            Self::CargoRun { repo_root } => {
+                let mut command = tokio::process::Command::new("cargo");
+                command
+                    .arg("run")
+                    .arg("-p")
+                    .arg("vo-tray")
+                    .arg("--bin")
+                    .arg("vo-tray")
+                    .arg("--")
+                    .current_dir(repo_root);
+                command
+            }
+        }
+    }
+
+    fn description(&self) -> String {
+        match self {
+            Self::Binary(path) => path.display().to_string(),
+            Self::CargoRun { repo_root } => {
+                format!("cargo run -p vo-tray in {}", repo_root.display())
+            }
+        }
+    }
+}
+
+fn resolve_tray_launcher() -> Option<TrayLauncher> {
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?;
+    let tray_binary = exe_dir.join(tray_binary_name());
+    if tray_binary.is_file() {
+        return Some(TrayLauncher::Binary(tray_binary));
+    }
+
+    if let Some(repo_root) = find_repo_root_from(exe_dir) {
+        let target_binary = repo_root
+            .join("target")
+            .join(debug_profile_dir())
+            .join(tray_binary_name());
+        if target_binary.is_file() {
+            return Some(TrayLauncher::Binary(target_binary));
+        }
+        if repo_root.join("crates/vo-tray/Cargo.toml").is_file() {
+            return Some(TrayLauncher::CargoRun { repo_root });
+        }
+    }
+
+    find_executable_in_path(tray_binary_name()).map(TrayLauncher::Binary)
+}
+
+fn find_repo_root_from(start: &std::path::Path) -> Option<PathBuf> {
+    let mut current = Some(start);
+    while let Some(dir) = current {
+        if dir.join("crates/vo-tray/Cargo.toml").is_file() && dir.join("Cargo.toml").is_file() {
+            return Some(dir.to_path_buf());
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn find_executable_in_path(name: &str) -> Option<PathBuf> {
+    let paths = env::var_os("PATH")?;
+    env::split_paths(&paths).find_map(|dir| {
+        let candidate = dir.join(name);
+        candidate.is_file().then_some(candidate)
+    })
+}
+
+fn tray_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "vo-tray.exe"
+    } else {
+        "vo-tray"
+    }
+}
+
+fn debug_profile_dir() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    }
+}
+
+fn live_args_for_ui(cli: &Cli) -> Vec<String> {
+    let mut args = Vec::new();
+    args.push("--provider".to_owned());
+    args.push("active".to_owned());
+    args.push("--live".to_owned());
+    if let Some(src) = non_empty(&cli.src) {
+        args.push("--src".to_owned());
+        args.push(src);
+    }
+    if let Some(dst) = non_empty(&cli.dst) {
+        args.push("--dst".to_owned());
+        args.push(dst);
+    }
+    if let Some(chunk) = cli.live_chunk {
+        args.push("--live-chunk".to_owned());
+        args.push(chunk.to_string());
+    }
+    if cli.no_mic {
+        args.push("--no-mic".to_owned());
+    }
+    if cli.no_speaker {
+        args.push("--no-speaker".to_owned());
+    }
+    if cli.voice_processing {
+        args.push("--voice-processing".to_owned());
+    }
+    if cli.select_device {
+        args.push("--select-device".to_owned());
+    }
+    if cli.json {
+        args.push("--json".to_owned());
+    }
+    if let Some(path) = &cli.transcript {
+        args.push("--transcript".to_owned());
+        args.push(path.display().to_string());
+    }
+    if let Some(path) = &cli.native_adapter {
+        args.push("--native-adapter".to_owned());
+        args.push(path.display().to_string());
+    }
+    if let Some(path) = &cli.apple_adapter {
+        args.push("--apple-adapter".to_owned());
+        args.push(path.display().to_string());
+    }
+    if let Some(path) = &cli.doubao_credential_path {
+        args.push("--doubao-credential-path".to_owned());
+        args.push(path.display().to_string());
+    }
+    if let Some(value) = non_empty(&cli.doubao_device_id) {
+        args.push("--doubao-device-id".to_owned());
+        args.push(value);
+    }
+    if let Some(value) = non_empty(&cli.doubao_token) {
+        args.push("--doubao-token".to_owned());
+        args.push(value);
+    }
+    args
 }
 
 fn should_run_live(cli: &Cli) -> bool {
@@ -389,7 +709,7 @@ fn resolve_live_backend(cli: &Cli) -> Result<AsrBackend> {
 }
 
 fn resolve_live_backend_for(cli: &Cli, apple_support: &AppleSupport) -> Result<AsrBackend> {
-    if let Some(profile) = resolve_provider_profile(cli)? {
+    if let Some(profile) = resolve_provider_profile_for(cli, apple_support)? {
         let effective = effective_provider_for(cli, apple_support, true)?;
         if effective.capabilities.live.is_some() {
             return Ok(effective.backend);
@@ -838,11 +1158,7 @@ impl LiveRenderer {
     }
 
     fn source_column_pad(&self) -> usize {
-        if self.show_channel_label {
-            16
-        } else {
-            11
-        }
+        if self.show_channel_label { 16 } else { 11 }
     }
 
     fn channel_column_pad(&self) -> usize {
@@ -1297,6 +1613,182 @@ fn run_capabilities(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+async fn run_provider_command(cli: &Cli, command: &ProviderCommand) -> Result<()> {
+    match &command.action {
+        ProviderAction::List => run_provider_list(cli),
+        ProviderAction::Current => run_provider_current(cli),
+        ProviderAction::Set { name } => run_provider_set(cli, name),
+    }
+}
+
+fn run_provider_list(cli: &Cli) -> Result<()> {
+    let report = gather_provider_list_report(cli)?;
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_provider_list_text(&report);
+    }
+    Ok(())
+}
+
+fn run_provider_current(cli: &Cli) -> Result<()> {
+    let report = gather_current_provider_report(cli)?;
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_current_provider_text(&report);
+    }
+    Ok(())
+}
+
+fn run_provider_set(cli: &Cli, name: &str) -> Result<()> {
+    let name = name.trim();
+    if name.is_empty() || name == "active" {
+        bail!("provider name must be a concrete built-in or configured provider");
+    }
+    let profiles = available_provider_profiles(cli)?;
+    if !profiles.contains_key(name) {
+        bail!("provider '{name}' was not found; run `vo provider list` to see available providers");
+    }
+    write_active_provider_name(cli, name)?;
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&gather_current_provider_report(cli)?)?
+        );
+    } else {
+        println!("Active provider: {name}");
+    }
+    Ok(())
+}
+
+fn gather_provider_list_report(cli: &Cli) -> Result<ProviderListReport> {
+    let apple_support = apple_support();
+    let current = active_or_default_provider_name(cli, &apple_support)?;
+    let profiles = available_provider_profiles(cli)?;
+    let mut providers = Vec::new();
+    for (name, profile) in profiles {
+        let profile_cli = cli.with_provider_name(Some(name.clone()));
+        let report = gather_capabilities_report_with_support(&profile_cli, &apple_support);
+        providers.push(ProviderListEntry {
+            name: name.clone(),
+            kind: profile.kind.as_str().to_owned(),
+            built_in: builtin_provider_profile(&name).is_some(),
+            selected: current.as_deref() == Some(name.as_str()),
+            model: report.model,
+            batch_file: report
+                .batch
+                .as_ref()
+                .is_some_and(|capabilities| capabilities.batch_file),
+            live: report.live.is_some(),
+            local_config_ok: report.local_config_ok,
+            local_config_error: report.local_config_error.or(report.resolution_error),
+            notes: report.notes,
+        });
+    }
+
+    Ok(ProviderListReport {
+        current,
+        state_path: provider_state_path(cli).map(|path| path.display().to_string()),
+        provider_config: provider_config_path(cli).map(|path| path.display().to_string()),
+        providers,
+    })
+}
+
+fn gather_current_provider_report(cli: &Cli) -> Result<CurrentProviderReport> {
+    let apple_support = apple_support();
+    let current = active_or_default_provider_name(cli, &apple_support)?;
+    let Some(provider) = current else {
+        return Ok(CurrentProviderReport {
+            provider: None,
+            state_path: provider_state_path(cli).map(|path| path.display().to_string()),
+            resolved: None,
+            kind: None,
+            model: None,
+            live: false,
+            local_config_ok: false,
+            local_config_error: Some(
+                "no active provider is set; run `vo provider set <name>`".to_owned(),
+            ),
+        });
+    };
+    let current_cli = cli.with_provider_name(Some(provider.clone()));
+    let report = gather_capabilities_report(&current_cli);
+    Ok(CurrentProviderReport {
+        provider: Some(provider),
+        state_path: provider_state_path(cli).map(|path| path.display().to_string()),
+        resolved: report.resolved,
+        kind: report.provider_kind,
+        model: Some(report.model),
+        live: report.live.is_some(),
+        local_config_ok: report.local_config_ok,
+        local_config_error: report.local_config_error.or(report.resolution_error),
+    })
+}
+
+fn print_provider_list_text(report: &ProviderListReport) {
+    println!("Providers");
+    if let Some(current) = &report.current {
+        println!("  Current: {current}");
+    } else {
+        println!("  Current: none");
+    }
+    if let Some(path) = &report.provider_config {
+        println!("  Config: {path}");
+    }
+    if let Some(path) = &report.state_path {
+        println!("  State: {path}");
+    }
+    println!();
+    for provider in &report.providers {
+        let marker = if provider.selected { "*" } else { " " };
+        let source = if provider.built_in {
+            "built-in"
+        } else {
+            "custom"
+        };
+        println!(
+            "{marker} {} ({}, {}, model {})",
+            provider.name, provider.kind, source, provider.model
+        );
+        println!("    Batch file: {}", yes_no(provider.batch_file));
+        println!("    Live: {}", yes_no(provider.live));
+        println!("    Local config ok: {}", yes_no(provider.local_config_ok));
+        if let Some(error) = &provider.local_config_error {
+            println!("    Error: {error}");
+        }
+        for note in &provider.notes {
+            println!("    Note: {note}");
+        }
+    }
+}
+
+fn print_current_provider_text(report: &CurrentProviderReport) {
+    println!("Current provider");
+    if let Some(provider) = &report.provider {
+        println!("  Provider: {provider}");
+    } else {
+        println!("  Provider: none");
+    }
+    if let Some(resolved) = &report.resolved {
+        println!("  Resolved: {resolved}");
+    }
+    if let Some(kind) = &report.kind {
+        println!("  Kind: {kind}");
+    }
+    if let Some(model) = &report.model {
+        println!("  Model: {model}");
+    }
+    println!("  Live: {}", yes_no(report.live));
+    println!("  Local config ok: {}", yes_no(report.local_config_ok));
+    if let Some(error) = &report.local_config_error {
+        println!("  Error: {error}");
+    }
+    if let Some(path) = &report.state_path {
+        println!("  State: {path}");
+    }
+}
+
 fn gather_doctor_report(cli: &Cli) -> DoctorReport {
     gather_doctor_report_with_audio(cli, default_audio_report())
 }
@@ -1494,7 +1986,7 @@ fn effective_provider_for(
     apple_support: &AppleSupport,
     capability_mode: bool,
 ) -> Result<EffectiveProvider> {
-    let profile = resolve_provider_profile(cli)?;
+    let profile = resolve_provider_profile_for(cli, apple_support)?;
     let backend = if let Some(profile) = &profile {
         profile.profile.kind.backend()
     } else if capability_mode {
@@ -1882,11 +2374,7 @@ fn doctor_audio_hint(report: &DoctorReport) -> Option<&'static str> {
 }
 
 fn yes_no(value: bool) -> &'static str {
-    if value {
-        "yes"
-    } else {
-        "no"
-    }
+    if value { "yes" } else { "no" }
 }
 
 struct ResolvedAudioSource {
@@ -1951,7 +2439,7 @@ fn resolve_backend(cli: &Cli) -> Result<AsrBackend> {
 }
 
 fn resolve_backend_for(cli: &Cli, apple_support: &AppleSupport) -> Result<AsrBackend> {
-    if let Some(profile) = resolve_provider_profile(cli)? {
+    if let Some(profile) = resolve_provider_profile_for(cli, apple_support)? {
         return Ok(profile.profile.kind.backend());
     }
 
@@ -2006,7 +2494,15 @@ fn build_provider(backend: AsrBackend, cli: &Cli) -> Result<Box<dyn AsrProvider>
 }
 
 fn resolve_provider_profile(cli: &Cli) -> Result<Option<ResolvedProviderProfile>> {
-    let Some(name) = non_empty(&cli.provider) else {
+    let apple_support = apple_support();
+    resolve_provider_profile_for(cli, &apple_support)
+}
+
+fn resolve_provider_profile_for(
+    cli: &Cli,
+    apple_support: &AppleSupport,
+) -> Result<Option<ResolvedProviderProfile>> {
+    let Some(name) = resolve_requested_provider_name(cli, apple_support)? else {
         return Ok(None);
     };
 
@@ -2041,8 +2537,135 @@ fn resolve_provider_profile(cli: &Cli) -> Result<Option<ResolvedProviderProfile>
     Ok(Some(ResolvedProviderProfile { name, profile }))
 }
 
+fn resolve_requested_provider_name(
+    cli: &Cli,
+    apple_support: &AppleSupport,
+) -> Result<Option<String>> {
+    let Some(name) = non_empty(&cli.provider) else {
+        return Ok(None);
+    };
+    if name == "active" {
+        let Some(active) = active_or_default_provider_name(cli, apple_support)? else {
+            bail!(
+                "no active provider is set; run `vo provider set <name>` or pass a concrete --provider"
+            );
+        };
+        return Ok(Some(active));
+    }
+    Ok(Some(name))
+}
+
+fn active_or_default_provider_name(
+    cli: &Cli,
+    apple_support: &AppleSupport,
+) -> Result<Option<String>> {
+    if let Some(active) = read_active_provider_name(cli)? {
+        return Ok(Some(active));
+    }
+    Ok(Some(default_live_provider_name(apple_support).to_owned()))
+}
+
+fn default_live_provider_name(apple_support: &AppleSupport) -> &'static str {
+    if apple_support.supported {
+        "apple"
+    } else {
+        "doubao"
+    }
+}
+
+fn available_provider_profiles(cli: &Cli) -> Result<BTreeMap<String, ProviderProfile>> {
+    let mut profiles = BTreeMap::new();
+    for name in ["apple", "doubao", "openai"] {
+        if let Some(profile) = builtin_provider_profile(name) {
+            profiles.insert(name.to_owned(), profile);
+        }
+    }
+
+    if let Some(config_path) = provider_config_path(cli) {
+        let content = std::fs::read_to_string(&config_path).with_context(|| {
+            format!(
+                "failed to read provider config from {}",
+                config_path.display()
+            )
+        })?;
+        let parsed: ProviderProfilesFile = toml::from_str(&content).with_context(|| {
+            format!(
+                "failed to parse provider config from {}",
+                config_path.display()
+            )
+        })?;
+        profiles.extend(parsed.providers);
+    }
+
+    Ok(profiles)
+}
+
+fn read_active_provider_name(cli: &Cli) -> Result<Option<String>> {
+    let Some(path) = provider_state_path(cli) else {
+        return Ok(None);
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read provider state from {}", path.display()))?;
+    let state: ActiveProviderState = serde_json::from_str(&content)
+        .with_context(|| format!("failed to parse provider state from {}", path.display()))?;
+    Ok(state
+        .provider
+        .and_then(|value| non_empty_string(Some(&value)).map(ToOwned::to_owned)))
+}
+
+fn write_active_provider_name(cli: &Cli, name: &str) -> Result<()> {
+    let path = provider_state_path(cli).context(
+        "could not determine provider state path; set VO_PROVIDER_STATE or HOME/XDG_CONFIG_HOME",
+    )?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create provider state directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    let state = ActiveProviderState {
+        provider: Some(name.to_owned()),
+        updated_at_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0),
+    };
+    let content = serde_json::to_string_pretty(&state)?;
+    std::fs::write(&path, format!("{content}\n"))
+        .with_context(|| format!("failed to write provider state to {}", path.display()))
+}
+
 fn builtin_provider_profile(name: &str) -> Option<ProviderProfile> {
     match name {
+        "doubao" => Some(ProviderProfile {
+            kind: ProfileProviderKind::Doubao,
+            api_base: None,
+            default_model: Some(vo_asr_doubao::DEFAULT_MODEL.to_owned()),
+            api_key: None,
+            api_key_env: None,
+            batch_file: None,
+            streaming: None,
+            requires_network: None,
+            live_enabled: None,
+            notes: vec!["Built-in Doubao IME profile.".to_owned()],
+        }),
+        "apple" => Some(ProviderProfile {
+            kind: ProfileProviderKind::Apple,
+            api_base: None,
+            default_model: Some("apple".to_owned()),
+            api_key: None,
+            api_key_env: None,
+            batch_file: None,
+            streaming: None,
+            requires_network: None,
+            live_enabled: None,
+            notes: vec!["Built-in Apple on-device profile.".to_owned()],
+        }),
         "openai" => Some(ProviderProfile {
             kind: ProfileProviderKind::OpenaiCompatible,
             api_base: Some(default_openai_api_base().to_owned()),
@@ -2066,7 +2689,23 @@ fn provider_config_path(cli: &Cli) -> Option<PathBuf> {
         .filter(|path| path.exists())
 }
 
+fn configured_provider_config_path(cli: &Cli) -> Option<PathBuf> {
+    cli.provider_config
+        .clone()
+        .or_else(default_provider_config_path)
+}
+
 fn default_provider_config_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("providers.toml"))
+}
+
+fn provider_state_path(cli: &Cli) -> Option<PathBuf> {
+    cli.provider_state
+        .clone()
+        .or_else(|| config_dir().map(|dir| dir.join("active-provider.json")))
+}
+
+fn config_dir() -> Option<PathBuf> {
     let base = if cfg!(windows) {
         env::var_os("APPDATA")
             .map(PathBuf::from)
@@ -2076,7 +2715,7 @@ fn default_provider_config_path() -> Option<PathBuf> {
             .map(PathBuf::from)
             .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
     }?;
-    Some(base.join("vo").join("providers.toml"))
+    Some(base.join("vo"))
 }
 
 fn openai_compatible_api_base(cli: &Cli, profile: Option<&ResolvedProviderProfile>) -> String {
@@ -2225,6 +2864,7 @@ fn default_model(backend: AsrBackend) -> &'static str {
 fn default_model_for_name(backend: &str) -> &'static str {
     match backend {
         "doubao" => vo_asr_doubao::DEFAULT_MODEL,
+        "apple" => "apple",
         _ => "whisper-1",
     }
 }
@@ -2263,6 +2903,9 @@ mod tests {
             transcript: None,
             doctor: false,
             capabilities: false,
+            ui: false,
+            provider_state: None,
+            command: None,
         }
     }
 
@@ -2279,7 +2922,9 @@ mod tests {
 
     fn write_temp_provider_config(contents: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "vo-test-providers-{}.toml",
+            "vo-test-providers-{}-{:?}-{}.toml",
+            std::process::id(),
+            std::thread::current().id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -2287,6 +2932,18 @@ mod tests {
         ));
         std::fs::write(&path, contents).unwrap();
         path
+    }
+
+    fn temp_provider_state_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "vo-test-active-provider-{}-{:?}-{}.json",
+            std::process::id(),
+            std::thread::current().id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
     }
 
     #[test]
@@ -2452,9 +3109,11 @@ mod tests {
         let backend = resolve_backend_for(&cli, &support).unwrap();
 
         assert_eq!(backend, AsrBackend::Apple);
-        assert!(validate_backend_config(backend, &cli)
-            .as_deref()
-            .is_some_and(|error| error.contains("--native-adapter")));
+        assert!(
+            validate_backend_config(backend, &cli)
+                .as_deref()
+                .is_some_and(|error| error.contains("--native-adapter"))
+        );
     }
 
     #[test]
@@ -2482,10 +3141,12 @@ mod tests {
             ..test_cli()
         };
 
-        assert!(validate_batch_options(&cli)
-            .unwrap_err()
-            .to_string()
-            .contains("--dst"));
+        assert!(
+            validate_batch_options(&cli)
+                .unwrap_err()
+                .to_string()
+                .contains("--dst")
+        );
     }
 
     #[test]
@@ -2495,10 +3156,12 @@ mod tests {
             ..test_cli()
         };
 
-        assert!(validate_batch_options(&cli)
-            .unwrap_err()
-            .to_string()
-            .contains("--select-device"));
+        assert!(
+            validate_batch_options(&cli)
+                .unwrap_err()
+                .to_string()
+                .contains("--select-device")
+        );
     }
 
     #[test]
@@ -2509,10 +3172,12 @@ mod tests {
             ..test_cli()
         };
 
-        assert!(resolve_live_backend(&cli)
-            .unwrap_err()
-            .to_string()
-            .contains("--asr apple"));
+        assert!(
+            resolve_live_backend(&cli)
+                .unwrap_err()
+                .to_string()
+                .contains("--asr apple")
+        );
     }
 
     #[test]
@@ -2528,10 +3193,12 @@ mod tests {
             reason: "macOS 15.6.1 is below 26".to_owned(),
         };
 
-        assert!(resolve_live_backend_for(&cli, &support)
-            .unwrap_err()
-            .to_string()
-            .contains("does not support live mode"));
+        assert!(
+            resolve_live_backend_for(&cli, &support)
+                .unwrap_err()
+                .to_string()
+                .contains("does not support live mode")
+        );
     }
 
     #[test]
@@ -2786,10 +3453,12 @@ live_enabled = true
         assert_eq!(report.resolved.as_deref(), Some("openai-compatible"));
         assert_eq!(report.provider.as_deref(), Some("bad-live"));
         assert!(!report.local_config_ok);
-        assert!(report
-            .local_config_error
-            .as_deref()
-            .is_some_and(|error| error.contains("does not support live mode")));
+        assert!(
+            report
+                .local_config_error
+                .as_deref()
+                .is_some_and(|error| error.contains("does not support live mode"))
+        );
         assert!(report.live.is_none());
     }
 
@@ -2822,6 +3491,158 @@ live_enabled = false
         assert_eq!(report.backend.provider.as_deref(), Some("local-key"));
         assert!(report.backend.api_key_configured);
         assert!(report.backend.api_base_configured);
+    }
+
+    #[test]
+    fn builtin_doubao_profile_resolves_live_capabilities() {
+        let cli = Cli {
+            provider: Some("doubao".to_owned()),
+            capabilities: true,
+            ..test_cli()
+        };
+        let support = AppleSupport {
+            version: Some("15.6.1".to_owned()),
+            supported: false,
+            reason: "macOS 15.6.1 is below 26".to_owned(),
+        };
+
+        let report = gather_capabilities_report_with_support(&cli, &support);
+
+        assert_eq!(report.resolved.as_deref(), Some("doubao"));
+        assert_eq!(report.provider.as_deref(), Some("doubao"));
+        assert!(report.local_config_ok);
+        assert!(report.live.is_some());
+    }
+
+    #[test]
+    fn active_provider_state_resolves_provider_profile() {
+        let state = temp_provider_state_path();
+        let cli = Cli {
+            provider: Some("active".to_owned()),
+            provider_state: Some(state.clone()),
+            capabilities: true,
+            ..test_cli()
+        };
+        write_active_provider_name(&cli, "doubao").unwrap();
+        let support = AppleSupport {
+            version: Some("15.6.1".to_owned()),
+            supported: false,
+            reason: "macOS 15.6.1 is below 26".to_owned(),
+        };
+
+        let report = gather_capabilities_report_with_support(&cli, &support);
+        let _ = std::fs::remove_file(state);
+
+        assert_eq!(report.provider.as_deref(), Some("doubao"));
+        assert_eq!(report.resolved.as_deref(), Some("doubao"));
+    }
+
+    #[test]
+    fn active_provider_defaults_to_doubao_when_state_is_missing_and_apple_is_unavailable() {
+        let state = temp_provider_state_path();
+        let cli = Cli {
+            provider: Some("active".to_owned()),
+            provider_state: Some(state),
+            capabilities: true,
+            ..test_cli()
+        };
+        let support = AppleSupport {
+            version: Some("15.6.1".to_owned()),
+            supported: false,
+            reason: "macOS 15.6.1 is below 26".to_owned(),
+        };
+
+        let report = gather_capabilities_report_with_support(&cli, &support);
+
+        assert_eq!(report.provider.as_deref(), Some("doubao"));
+        assert_eq!(report.resolved.as_deref(), Some("doubao"));
+        assert!(report.local_config_ok);
+        assert!(report.live.is_some());
+    }
+
+    #[test]
+    fn active_provider_defaults_to_apple_when_state_is_missing_and_apple_is_available() {
+        let state = temp_provider_state_path();
+        let cli = Cli {
+            provider: Some("active".to_owned()),
+            provider_state: Some(state),
+            native_adapter: Some(PathBuf::from("vo-adapter-apple-speech")),
+            capabilities: true,
+            ..test_cli()
+        };
+        let support = AppleSupport {
+            version: Some("26.0.0".to_owned()),
+            supported: true,
+            reason: "macOS 26+ detected".to_owned(),
+        };
+
+        let report = gather_capabilities_report_with_support(&cli, &support);
+
+        assert_eq!(report.provider.as_deref(), Some("apple"));
+        assert_eq!(report.resolved.as_deref(), Some("apple"));
+        assert!(report.local_config_ok);
+        assert!(report.live.is_some());
+    }
+
+    #[test]
+    fn provider_list_includes_builtins_and_custom_profiles() {
+        let config = write_temp_provider_config(
+            r#"
+[providers.siliconflow]
+kind = "openai-compatible"
+api_base = "https://api.siliconflow.cn"
+default_model = "FunAudioLLM/SenseVoiceSmall"
+api_key_env = "SILICONFLOW_API_KEY"
+live_enabled = false
+"#,
+        );
+        let state = temp_provider_state_path();
+        let cli = Cli {
+            provider_config: Some(config.clone()),
+            provider_state: Some(state.clone()),
+            ..test_cli()
+        };
+        write_active_provider_name(&cli, "siliconflow").unwrap();
+
+        let report = gather_provider_list_report(&cli).unwrap();
+        let _ = std::fs::remove_file(config);
+        let _ = std::fs::remove_file(state);
+
+        assert_eq!(report.current.as_deref(), Some("siliconflow"));
+        assert!(
+            report
+                .providers
+                .iter()
+                .any(|provider| provider.name == "doubao" && provider.live)
+        );
+        assert!(
+            report
+                .providers
+                .iter()
+                .any(|provider| provider.name == "openai" && provider.built_in)
+        );
+        assert!(
+            report
+                .providers
+                .iter()
+                .any(|provider| provider.name == "siliconflow"
+                    && provider.selected
+                    && !provider.built_in)
+        );
+    }
+
+    #[test]
+    fn current_provider_reports_default_provider_when_state_is_missing() {
+        let state = temp_provider_state_path();
+        let cli = Cli {
+            provider_state: Some(state),
+            ..test_cli()
+        };
+
+        let report = gather_current_provider_report(&cli).unwrap();
+
+        assert!(report.provider.is_some());
+        assert!(report.live);
     }
 
     #[test]
@@ -2862,10 +3683,12 @@ live_enabled = false
 
         assert_eq!(report.resolved.as_deref(), Some("apple"));
         assert!(!report.local_config_ok);
-        assert!(report
-            .local_config_error
-            .as_deref()
-            .is_some_and(|error| error.contains("--native-adapter")));
+        assert!(
+            report
+                .local_config_error
+                .as_deref()
+                .is_some_and(|error| error.contains("--native-adapter"))
+        );
         assert!(report.live.as_ref().is_some_and(|live| live.translation));
     }
 
@@ -2887,10 +3710,12 @@ live_enabled = false
         assert_eq!(report.resolved.as_deref(), Some("apple"));
         assert!(!report.local_config_ok);
         assert!(report.resolution_error.is_none());
-        assert!(report
-            .local_config_error
-            .as_deref()
-            .is_some_and(|error| error.contains("unavailable")));
+        assert!(
+            report
+                .local_config_error
+                .as_deref()
+                .is_some_and(|error| error.contains("unavailable"))
+        );
         assert!(report.batch.as_ref().is_some_and(|batch| batch.batch_file));
         assert!(report.live.as_ref().is_some_and(|live| live.translation));
     }

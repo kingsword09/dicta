@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use js_sys::Array;
-use wasm_bindgen::{closure::Closure, prelude::wasm_bindgen, JsCast, JsValue};
+use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     Blob, BlobEvent, File, FilePropertyBag, MediaRecorder, MediaRecorderOptions, MediaStream,

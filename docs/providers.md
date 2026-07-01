@@ -127,6 +127,8 @@ implementation capability ceiling from its `kind`.
 Built-in profiles can be selected directly:
 
 ```console
+$ vo --input audio.wav --provider doubao
+$ vo --input audio.wav --provider apple --native-adapter ./vo-adapter-apple-speech
 $ vo --input audio.wav --provider openai
 $ vo --capabilities --provider openai --json
 ```
@@ -159,6 +161,45 @@ that the implementation does not support; for example, an `openai-compatible`
 profile that sets `live_enabled = true` reports a local configuration error.
 For API keys, `--api-key` / `VO_ASR_API_KEY` wins over profile settings; profile
 `api_key` wins over `api_key_env`.
+
+## Active provider and status bar mode
+
+Provider profiles can also be selected through a small state file. This is the
+control surface used by `vo --ui`:
+
+```console
+$ vo provider list
+$ vo provider set doubao
+$ vo provider current
+$ vo --provider active --live
+```
+
+`vo provider set <name>` writes `~/.config/vo/active-provider.json` by default.
+`--provider active` resolves that file to a concrete built-in or configured
+profile. When the state file is missing, `active` defaults to the built-in Apple
+provider on supported macOS systems and the built-in Doubao provider elsewhere,
+so first launch does not require a manual selection. The state file stores only
+the selected provider name; secrets remain in CLI flags, environment variables,
+or `providers.toml`.
+
+`vo --ui` launches the Rust `vo-tray` companion binary. The status item opens a
+compact provider panel on left click and keeps a right-click native menu as a
+fallback. The companion reads the same provider list and starts live
+transcription as a supervised `vo --provider active --live` worker. When a
+provider is selected from the panel, the companion updates the active provider
+and restarts the worker if it is running. This gives immediate recovery when the
+current provider is unavailable without forcing every ASR provider
+implementation to support an in-process hot-swap protocol.
+
+Release archives install `vo-tray` next to `vo`. In a source checkout, `vo --ui`
+uses the sibling `target/debug/vo-tray` binary when it exists, or falls back to
+`cargo run -p vo-tray`. The UI is Rust-owned and uses the operating system
+WebView for the panel, so switching providers requires no npm, Node, or bundled
+frontend build step.
+
+Custom OpenAI-compatible profiles appear in the panel automatically after they
+are added to `providers.toml`; no Rust code is needed unless the provider uses a
+new protocol or runtime integration.
 
 Capability diagnostics are local and explicit. `vo --capabilities` resolves the
 selected backend, checks local configuration requirements such as a native

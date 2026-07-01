@@ -4,7 +4,7 @@ use opus::{Application, Channels, Encoder};
 use prost::Message;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
@@ -340,7 +340,7 @@ impl DoubaoAsr {
                     return Err(AsrError::Request(format!(
                         "doubao ASR failed: {}",
                         parsed.error_msg
-                    )))
+                    )));
                 }
                 ResponseKind::SessionFinished => break,
                 ResponseKind::TaskStarted
