@@ -53,27 +53,37 @@ jobs:
           - os: ubuntu-latest
             archive_suffix: linux_x86_64
             bin: target/release/vo
+            tray_bin: target/release/vo-tray
             exe_name: vo
+            tray_exe_name: vo-tray
             archive_ext: tar.gz
           - os: ubuntu-24.04-arm
             archive_suffix: linux_arm64
             bin: target/release/vo
+            tray_bin: target/release/vo-tray
             exe_name: vo
+            tray_exe_name: vo-tray
             archive_ext: tar.gz
           - os: macos-26
             archive_suffix: darwin_arm64
             bin: target/release/vo
+            tray_bin: target/release/vo-tray
             exe_name: vo
+            tray_exe_name: vo-tray
             archive_ext: tar.gz
           - os: windows-latest
             archive_suffix: windows_x86_64
             bin: target/release/vo.exe
+            tray_bin: target/release/vo-tray.exe
             exe_name: vo.exe
+            tray_exe_name: vo-tray.exe
             archive_ext: zip
           - os: windows-11-arm
             archive_suffix: windows_arm64
             bin: target/release/vo.exe
+            tray_bin: target/release/vo-tray.exe
             exe_name: vo.exe
+            tray_exe_name: vo-tray.exe
             archive_ext: zip
     runs-on: ${{ matrix.os }}
     permissions:
@@ -85,9 +95,9 @@ jobs:
           ref: ${{ needs.tagpr.outputs.tagpr-tag }}
           fetch-depth: 0
 
-      - name: Install Linux audio dependencies
+      - name: Install Linux desktop dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev pkg-config
 
       - name: Show toolchain
         run: |
@@ -98,7 +108,7 @@ jobs:
         run: cargo fetch --locked
 
       - name: Build release binary
-        run: cargo build --release -p vo-cli --locked
+        run: cargo build --release -p vo-cli -p vo-tray --locked
 
       - name: Build Apple Speech adapter
         if: matrix.archive_suffix == 'darwin_arm64'
@@ -110,8 +120,10 @@ jobs:
           TAG="${{ needs.tagpr.outputs.tagpr-tag }}"
           VERSION="${TAG#v}"
           BIN="${{ matrix.bin }}"
+          TRAY_BIN="${{ matrix.tray_bin }}"
           STAGE="$(mktemp -d)"
           cp "$BIN" "$STAGE/${{ matrix.exe_name }}"
+          cp "$TRAY_BIN" "$STAGE/${{ matrix.tray_exe_name }}"
           if [ "${{ matrix.archive_suffix }}" = "darwin_arm64" ]; then
             ADAPTER_BIN="$(cd adapters/apple-speech && swift build -c release --arch arm64 --show-bin-path)/vo"
             cp "$ADAPTER_BIN" "$STAGE/vo-adapter-apple-speech"
