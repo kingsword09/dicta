@@ -17,6 +17,20 @@ into `~/.local/bin` by default. Release assets cover macOS arm64, Linux
 x86_64/arm64, and Windows x86_64/arm64. macOS arm64 archives also include the
 Apple Speech adapter.
 
+Update or remove an installed release:
+
+```console
+$ vo update
+$ vo update --version 0.10.4
+$ vo uninstall
+$ vo uninstall --yes
+```
+
+`vo update` installs into the directory containing the running `vo` binary unless
+`--install-dir` or `VO_INSTALL_DIR` is set. `vo uninstall` removes `vo`,
+`vo-tray`, and bundled adapter binaries from that install directory. User
+configuration under `~/.config/vo` is left in place.
+
 ## Usage
 
 Live mode:
