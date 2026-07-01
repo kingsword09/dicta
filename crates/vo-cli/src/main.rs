@@ -1,15 +1,25 @@
 use anyhow::{Context, Result, bail};
+use axum::{
+    Json, Router,
+    extract::{DefaultBodyLimit, Multipart, State, multipart::MultipartRejection},
+    http::{HeaderValue, Method, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{cmp, env};
+use tower_http::cors::{Any, CorsLayer};
 use vo_asr::{
     AsrCapabilities, AsrOptions, AsrProvider, LiveAsrOptions, LiveAsrProvider, LiveCapabilities,
-    LiveModeKind, ProviderCapabilities,
+    LiveModeKind, ProviderCapabilities, ResponseFormat,
 };
 use vo_asr_doubao::{DoubaoAsr, DoubaoConfig, doubao_capabilities, doubao_live_capabilities};
 use vo_asr_native_adapter::{
@@ -25,7 +35,7 @@ use vo_core::{
     TranscriptTarget,
 };
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(name = "vo")]
 #[command(version)]
 #[command(about = "Cross-platform transcription CLI with pluggable ASR providers")]
@@ -207,12 +217,49 @@ impl Cli {
 
 #[derive(Debug, Clone, Subcommand)]
 enum Command {
+    #[command(about = "Serve an OpenAI-compatible ASR HTTP API")]
+    Serve(ServeCommand),
     #[command(about = "Manage named ASR provider selections")]
     Provider(ProviderCommand),
     #[command(about = "Update installed vo binaries from GitHub Releases")]
     Update(UpdateCommand),
     #[command(about = "Uninstall installed vo binaries")]
     Uninstall(UninstallCommand),
+}
+
+#[derive(Debug, Clone, Args)]
+struct ServeCommand {
+    #[arg(
+        long,
+        env = "VO_SERVE_HOST",
+        default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST),
+        help = "Host/IP to bind the HTTP server"
+    )]
+    host: IpAddr,
+
+    #[arg(
+        long,
+        env = "VO_SERVE_PORT",
+        default_value_t = 4777,
+        help = "Port to bind the HTTP server"
+    )]
+    port: u16,
+
+    #[arg(
+        long = "cors-origin",
+        env = "VO_SERVE_CORS_ORIGIN",
+        value_delimiter = ',',
+        help = "Allowed browser CORS origin; pass '*' for local development"
+    )]
+    cors_origins: Vec<String>,
+
+    #[arg(
+        long = "max-upload-mb",
+        env = "VO_SERVE_MAX_UPLOAD_MB",
+        default_value_t = 25,
+        help = "Maximum multipart upload size in MiB"
+    )]
+    max_upload_mb: usize,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -466,10 +513,550 @@ async fn main() -> Result<()> {
 
 async fn run_command(cli: &Cli, command: &Command) -> Result<()> {
     match command {
+        Command::Serve(command) => run_serve(cli, command).await,
         Command::Provider(command) => run_provider_command(cli, command).await,
         Command::Update(command) => run_update_command(command).await,
         Command::Uninstall(command) => run_uninstall_command(command),
     }
+}
+
+async fn run_serve(cli: &Cli, command: &ServeCommand) -> Result<()> {
+    let max_upload_bytes = max_upload_bytes(command.max_upload_mb)?;
+    let addr = SocketAddr::new(command.host, command.port);
+    let state = ServeState {
+        cli: Arc::new(cli.clone()),
+    };
+    let app = serve_router(state, command, max_upload_bytes)?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("failed to bind vo serve on {addr}"))?;
+    let local_addr = listener
+        .local_addr()
+        .context("failed to read vo serve listen address")?;
+
+    eprintln!("vo serve listening on http://{local_addr}");
+    eprintln!("  POST http://{local_addr}/v1/audio/transcriptions");
+    axum::serve(listener, app)
+        .await
+        .context("vo serve HTTP server failed")
+}
+
+fn serve_router(
+    state: ServeState,
+    command: &ServeCommand,
+    max_upload_bytes: usize,
+) -> Result<Router> {
+    let mut router = Router::new()
+        .route("/health", get(serve_health))
+        .route("/v1/models", get(serve_models))
+        .route("/v1/audio/transcriptions", post(serve_transcriptions))
+        .layer(DefaultBodyLimit::max(max_upload_bytes))
+        .with_state(state);
+
+    if !command.cors_origins.is_empty() {
+        router = router.layer(serve_cors_layer(&command.cors_origins)?);
+    }
+
+    Ok(router)
+}
+
+fn max_upload_bytes(max_upload_mb: usize) -> Result<usize> {
+    if max_upload_mb == 0 {
+        bail!("--max-upload-mb must be greater than zero");
+    }
+    max_upload_mb
+        .checked_mul(1024 * 1024)
+        .context("--max-upload-mb is too large")
+}
+
+fn serve_cors_layer(origins: &[String]) -> Result<CorsLayer> {
+    let layer = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
+    let origins = origins
+        .iter()
+        .filter_map(|origin| non_empty_string(Some(origin)).map(ToOwned::to_owned))
+        .collect::<Vec<_>>();
+
+    if origins.iter().any(|origin| origin == "*") {
+        return Ok(layer.allow_origin(Any));
+    }
+
+    let origins = origins
+        .iter()
+        .map(|origin| {
+            HeaderValue::from_str(origin)
+                .with_context(|| format!("invalid --cors-origin value: {origin}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(layer.allow_origin(origins))
+}
+
+#[derive(Clone)]
+struct ServeState {
+    cli: Arc<Cli>,
+}
+
+#[derive(Debug, Serialize)]
+struct ServeHealth {
+    status: &'static str,
+    version: &'static str,
+    backend: Option<String>,
+    provider: Option<String>,
+    model: String,
+    local_config_ok: bool,
+    local_config_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ServeModelList {
+    object: &'static str,
+    data: Vec<ServeModel>,
+}
+
+#[derive(Debug, Serialize)]
+struct ServeModel {
+    id: String,
+    object: &'static str,
+    owned_by: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ServeTranscriptionResponse {
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language: Option<String>,
+}
+
+#[derive(Debug)]
+struct ServeTranscriptionRequest {
+    audio: ServeUploadedAudio,
+    model: Option<String>,
+    language: Option<String>,
+    prompt: Option<String>,
+    response_format: ServeResponseFormat,
+}
+
+#[derive(Debug)]
+struct ServeUploadedAudio {
+    data: Vec<u8>,
+    filename: String,
+    mime_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServeResponseFormat {
+    Json,
+    Text,
+}
+
+impl ServeResponseFormat {
+    fn as_asr_response_format(self) -> ResponseFormat {
+        match self {
+            Self::Json => ResponseFormat::Json,
+            Self::Text => ResponseFormat::Text,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ServeErrorResponse {
+    error: ServeErrorBody,
+}
+
+#[derive(Debug, Serialize)]
+struct ServeErrorBody {
+    message: String,
+    #[serde(rename = "type")]
+    error_type: &'static str,
+    param: Option<String>,
+    code: Option<String>,
+}
+
+#[derive(Debug)]
+struct ServeApiError {
+    status: StatusCode,
+    message: String,
+    error_type: &'static str,
+    param: Option<String>,
+    code: Option<String>,
+}
+
+impl ServeApiError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+            error_type: "invalid_request_error",
+            param: None,
+            code: None,
+        }
+    }
+
+    fn invalid_param(param: &str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+            error_type: "invalid_request_error",
+            param: Some(param.to_owned()),
+            code: None,
+        }
+    }
+
+    fn server_config(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+            error_type: "server_error",
+            param: None,
+            code: None,
+        }
+    }
+
+    fn provider(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            message: message.into(),
+            error_type: "provider_error",
+            param: None,
+            code: None,
+        }
+    }
+
+    fn from_multipart_rejection(err: MultipartRejection) -> Self {
+        Self {
+            status: err.status(),
+            message: format!("invalid multipart form: {err}"),
+            error_type: "invalid_request_error",
+            param: None,
+            code: None,
+        }
+    }
+
+    fn from_asr_error(err: vo_asr::AsrError) -> Self {
+        match err {
+            vo_asr::AsrError::Input(message) => Self::bad_request(message),
+            vo_asr::AsrError::Config(message) => Self::server_config(message),
+            vo_asr::AsrError::Request(message) | vo_asr::AsrError::InvalidResponse(message) => {
+                Self::provider(message)
+            }
+        }
+    }
+}
+
+impl IntoResponse for ServeApiError {
+    fn into_response(self) -> Response {
+        let status = self.status;
+        let body = Json(ServeErrorResponse {
+            error: ServeErrorBody {
+                message: self.message,
+                error_type: self.error_type,
+                param: self.param,
+                code: self.code,
+            },
+        });
+        (status, body).into_response()
+    }
+}
+
+async fn serve_health(State(state): State<ServeState>) -> Json<ServeHealth> {
+    Json(serve_health_report(&state.cli))
+}
+
+async fn serve_models(State(state): State<ServeState>) -> Json<ServeModelList> {
+    let report = gather_capabilities_report(&state.cli);
+    let mut data = vec![ServeModel {
+        id: "vo".to_owned(),
+        object: "model",
+        owned_by: "vo",
+    }];
+    if report.model != "vo" {
+        data.push(ServeModel {
+            id: report.model,
+            object: "model",
+            owned_by: "vo",
+        });
+    }
+
+    Json(ServeModelList {
+        object: "list",
+        data,
+    })
+}
+
+async fn serve_transcriptions(
+    State(state): State<ServeState>,
+    multipart: std::result::Result<Multipart, MultipartRejection>,
+) -> std::result::Result<Response, ServeApiError> {
+    let request =
+        parse_transcription_multipart(multipart.map_err(ServeApiError::from_multipart_rejection)?)
+            .await?;
+    let response_format = request.response_format;
+    let transcript = transcribe_serve_request(&state.cli, request).await?;
+    Ok(transcription_response(transcript, response_format))
+}
+
+fn serve_health_report(cli: &Cli) -> ServeHealth {
+    let report = gather_capabilities_report(cli);
+    let local_config_error = report.local_config_error.or(report.resolution_error);
+    ServeHealth {
+        status: if report.local_config_ok {
+            "ok"
+        } else {
+            "degraded"
+        },
+        version: env!("CARGO_PKG_VERSION"),
+        backend: report.resolved,
+        provider: report.provider,
+        model: report.model,
+        local_config_ok: report.local_config_ok,
+        local_config_error,
+    }
+}
+
+async fn parse_transcription_multipart(
+    mut multipart: Multipart,
+) -> std::result::Result<ServeTranscriptionRequest, ServeApiError> {
+    let mut audio = None;
+    let mut model = None;
+    let mut language = None;
+    let mut prompt = None;
+    let mut response_format = ServeResponseFormat::Json;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|err| ServeApiError::bad_request(format!("invalid multipart field: {err}")))?
+    {
+        let Some(name) = field.name().map(ToOwned::to_owned) else {
+            continue;
+        };
+        match name.as_str() {
+            "file" => {
+                if audio.is_some() {
+                    return Err(ServeApiError::invalid_param(
+                        "file",
+                        "only one audio file is supported",
+                    ));
+                }
+                audio = Some(read_uploaded_audio(field).await?);
+            }
+            "model" => {
+                model = non_empty_string(Some(&read_multipart_text(field).await?))
+                    .map(ToOwned::to_owned);
+            }
+            "language" => {
+                language = non_empty_string(Some(&read_multipart_text(field).await?))
+                    .map(ToOwned::to_owned);
+            }
+            "prompt" => {
+                prompt = non_empty_string(Some(&read_multipart_text(field).await?))
+                    .map(ToOwned::to_owned);
+            }
+            "response_format" => {
+                let value = read_multipart_text(field).await?;
+                response_format = parse_serve_response_format(Some(&value))?;
+            }
+            "stream" => {
+                let value = read_multipart_text(field).await?;
+                if parse_form_bool(&value, "stream")? {
+                    return Err(ServeApiError::invalid_param(
+                        "stream",
+                        "streaming transcription is not supported by vo serve yet",
+                    ));
+                }
+            }
+            "timestamp_granularities" | "timestamp_granularities[]" => {
+                let _ = read_multipart_text(field).await?;
+                return Err(ServeApiError::invalid_param(
+                    "timestamp_granularities",
+                    "timestamp granularities are not supported by vo serve yet",
+                ));
+            }
+            "temperature" => {
+                let _ = read_multipart_text(field).await?;
+            }
+            _ => {
+                let _ = read_multipart_text(field).await;
+            }
+        }
+    }
+
+    let audio = audio.ok_or_else(|| {
+        ServeApiError::invalid_param("file", "multipart field 'file' is required")
+    })?;
+    if audio.data.is_empty() {
+        return Err(ServeApiError::invalid_param(
+            "file",
+            "uploaded audio file is empty",
+        ));
+    }
+
+    Ok(ServeTranscriptionRequest {
+        audio,
+        model,
+        language,
+        prompt,
+        response_format,
+    })
+}
+
+async fn read_uploaded_audio(
+    field: axum::extract::multipart::Field<'_>,
+) -> std::result::Result<ServeUploadedAudio, ServeApiError> {
+    let filename = field
+        .file_name()
+        .and_then(|name| non_empty_string(Some(name)).map(ToOwned::to_owned))
+        .unwrap_or_else(|| "audio".to_owned());
+    let mime_type = field
+        .content_type()
+        .and_then(|mime| non_empty_string(Some(mime)).map(ToOwned::to_owned));
+    let data = field
+        .bytes()
+        .await
+        .map_err(|err| ServeApiError::bad_request(format!("failed to read uploaded file: {err}")))?
+        .to_vec();
+
+    Ok(ServeUploadedAudio {
+        data,
+        filename,
+        mime_type,
+    })
+}
+
+async fn read_multipart_text(
+    field: axum::extract::multipart::Field<'_>,
+) -> std::result::Result<String, ServeApiError> {
+    field
+        .text()
+        .await
+        .map_err(|err| ServeApiError::bad_request(format!("failed to read multipart field: {err}")))
+}
+
+async fn transcribe_serve_request(
+    cli: &Cli,
+    request: ServeTranscriptionRequest,
+) -> std::result::Result<vo_asr::Transcript, ServeApiError> {
+    let mut request_cli = cli.clone();
+    if let Some(model) = request.model.as_deref().and_then(serve_model_override) {
+        request_cli.api_model = Some(model);
+    }
+    let backend = resolve_backend(&request_cli).map_err(|err| {
+        ServeApiError::server_config(format!("ASR backend resolution failed: {err}"))
+    })?;
+    let provider = build_provider(backend, &request_cli)
+        .map_err(|err| ServeApiError::server_config(format!("ASR provider setup failed: {err}")))?;
+    let options = AsrOptions {
+        language: request.language.or_else(|| request_cli.src.clone()),
+        prompt: request.prompt,
+        response_format: request.response_format.as_asr_response_format(),
+    };
+
+    if backend == AsrBackend::Apple {
+        let path = temp_upload_path(&request.audio.filename);
+        tokio::fs::write(&path, &request.audio.data)
+            .await
+            .map_err(|err| {
+                ServeApiError::bad_request(format!(
+                    "failed to stage uploaded audio at {}: {err}",
+                    path.display()
+                ))
+            })?;
+        let result = provider
+            .transcribe(AudioInput::File(path.clone()), options)
+            .await
+            .map_err(ServeApiError::from_asr_error);
+        let _ = tokio::fs::remove_file(path).await;
+        return result;
+    }
+
+    provider
+        .transcribe(
+            AudioInput::Bytes {
+                data: request.audio.data,
+                filename: request.audio.filename,
+                mime_type: request.audio.mime_type,
+            },
+            options,
+        )
+        .await
+        .map_err(ServeApiError::from_asr_error)
+}
+
+fn transcription_response(
+    transcript: vo_asr::Transcript,
+    response_format: ServeResponseFormat,
+) -> Response {
+    match response_format {
+        ServeResponseFormat::Json => Json(ServeTranscriptionResponse {
+            text: transcript.text,
+            language: transcript.language,
+        })
+        .into_response(),
+        ServeResponseFormat::Text => (
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            transcript.text,
+        )
+            .into_response(),
+    }
+}
+
+fn parse_serve_response_format(
+    value: Option<&str>,
+) -> std::result::Result<ServeResponseFormat, ServeApiError> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some("json") => Ok(ServeResponseFormat::Json),
+        Some("text") => Ok(ServeResponseFormat::Text),
+        Some(other) => Err(ServeApiError::invalid_param(
+            "response_format",
+            format!("response_format '{other}' is not supported; use 'json' or 'text'"),
+        )),
+    }
+}
+
+fn serve_model_override(model: &str) -> Option<String> {
+    non_empty_string(Some(model))
+        .filter(|model| !matches!(*model, "vo" | "default"))
+        .map(ToOwned::to_owned)
+}
+
+fn parse_form_bool(value: &str, param: &str) -> std::result::Result<bool, ServeApiError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "false" | "0" | "no" | "off" => Ok(false),
+        "true" | "1" | "yes" | "on" => Ok(true),
+        _ => Err(ServeApiError::invalid_param(
+            param,
+            format!("{param} must be true or false"),
+        )),
+    }
+}
+
+fn temp_upload_path(filename: &str) -> PathBuf {
+    let extension = safe_upload_extension(filename).unwrap_or_else(|| "audio".to_owned());
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "vo-serve-{}-{nanos}.{extension}",
+        std::process::id()
+    ))
+}
+
+fn safe_upload_extension(filename: &str) -> Option<String> {
+    Path::new(filename)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::trim)
+        .filter(|extension| !extension.is_empty())
+        .map(|extension| {
+            extension
+                .chars()
+                .filter(|ch| ch.is_ascii_alphanumeric())
+                .take(16)
+                .collect::<String>()
+        })
+        .filter(|extension| !extension.is_empty())
 }
 
 async fn run_ui(cli: &Cli) -> Result<()> {
@@ -3091,6 +3678,98 @@ mod tests {
             assert!(names.contains(&"vo-tray"));
             assert!(names.contains(&"vo-adapter-apple-speech"));
         }
+    }
+
+    #[test]
+    fn serve_command_uses_localhost_defaults() {
+        let cli = Cli::try_parse_from(["vo", "serve"]).unwrap();
+
+        let Some(Command::Serve(command)) = cli.command else {
+            panic!("expected serve command");
+        };
+        assert_eq!(command.host, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(command.port, 4777);
+        assert_eq!(command.max_upload_mb, 25);
+        assert!(command.cors_origins.is_empty());
+    }
+
+    #[test]
+    fn serve_command_accepts_cors_origins() {
+        let cli = Cli::try_parse_from([
+            "vo",
+            "serve",
+            "--cors-origin",
+            "http://localhost:3000,http://127.0.0.1:5173",
+        ])
+        .unwrap();
+
+        let Some(Command::Serve(command)) = cli.command else {
+            panic!("expected serve command");
+        };
+        assert_eq!(
+            command.cors_origins,
+            vec!["http://localhost:3000", "http://127.0.0.1:5173"]
+        );
+    }
+
+    #[test]
+    fn serve_response_format_supports_json_and_text_only() {
+        assert_eq!(
+            parse_serve_response_format(None).unwrap(),
+            ServeResponseFormat::Json
+        );
+        assert_eq!(
+            parse_serve_response_format(Some("json")).unwrap(),
+            ServeResponseFormat::Json
+        );
+        assert_eq!(
+            parse_serve_response_format(Some("text")).unwrap(),
+            ServeResponseFormat::Text
+        );
+
+        let err = parse_serve_response_format(Some("verbose_json")).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.param.as_deref(), Some("response_format"));
+    }
+
+    #[test]
+    fn serve_model_alias_keeps_configured_provider_model() {
+        assert_eq!(serve_model_override("vo"), None);
+        assert_eq!(serve_model_override("default"), None);
+        assert_eq!(
+            serve_model_override(" whisper-1 ").as_deref(),
+            Some("whisper-1")
+        );
+    }
+
+    #[test]
+    fn serve_bool_parser_matches_form_values() {
+        assert!(parse_form_bool("true", "stream").unwrap());
+        assert!(parse_form_bool("1", "stream").unwrap());
+        assert!(!parse_form_bool("false", "stream").unwrap());
+        assert!(!parse_form_bool("0", "stream").unwrap());
+
+        let err = parse_form_bool("maybe", "stream").unwrap_err();
+        assert_eq!(err.param.as_deref(), Some("stream"));
+    }
+
+    #[test]
+    fn serve_upload_extension_is_sanitized() {
+        assert_eq!(
+            safe_upload_extension("recording.wav").as_deref(),
+            Some("wav")
+        );
+        assert_eq!(
+            safe_upload_extension("recording.w@v").as_deref(),
+            Some("wv")
+        );
+        assert!(safe_upload_extension("recording").is_none());
+    }
+
+    #[test]
+    fn serve_rejects_zero_upload_limit() {
+        assert!(max_upload_bytes(0).is_err());
+        assert_eq!(max_upload_bytes(2).unwrap(), 2 * 1024 * 1024);
     }
 
     #[test]

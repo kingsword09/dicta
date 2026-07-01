@@ -34,6 +34,43 @@ Expected response:
 
 `language` in the response is accepted when present.
 
+## Local OpenAI-compatible server
+
+`vo serve` exposes the currently selected Rust provider as an OpenAI-compatible
+batch ASR HTTP API:
+
+```console
+$ vo --provider active serve --cors-origin http://localhost:5173
+$ curl -s \
+    -F file=@audio.wav \
+    -F model=vo \
+    -F language=zh-CN \
+    http://127.0.0.1:4777/v1/audio/transcriptions
+```
+
+Endpoints:
+
+```text
+GET  /health
+GET  /v1/models
+POST /v1/audio/transcriptions
+```
+
+The transcription endpoint accepts `multipart/form-data`. `file` is required.
+`model`, `language`, `prompt`, `response_format`, and `temperature` are accepted
+for OpenAI-compatible clients. `model=vo` and `model=default` use the server's
+configured provider model; any other non-empty `model` acts as a per-request
+`--api-model` override where that is meaningful. The provider selected at server
+startup remains authoritative. `response_format=json` returns
+`{"text":"..."}` plus `language` when known, and `response_format=text` returns
+plain text.
+
+`vo serve` is batch-only. It rejects `stream=true`, timestamp granularities,
+`verbose_json`, SRT, and VTT until provider capabilities expose those results
+directly. The default bind address is `127.0.0.1:4777`; pass `--cors-origin`
+for browser projects and keep secrets in CLI flags, environment variables, or
+provider profiles on the server side.
+
 ## Doubao
 
 `--asr doubao` uses `vo-asr-doubao`. That crate implements the unofficial
