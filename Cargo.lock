@@ -633,7 +633,7 @@ dependencies = [
 
 [[package]]
 name = "dicta-asr"
-version = "0.10.6"
+version = "0.10.7"
 dependencies = [
  "async-trait",
  "dicta-core",
@@ -642,7 +642,7 @@ dependencies = [
 
 [[package]]
 name = "dicta-asr-doubao"
-version = "0.10.6"
+version = "0.10.7"
 dependencies = [
  "async-trait",
  "dicta-asr",
@@ -663,7 +663,7 @@ dependencies = [
 
 [[package]]
 name = "dicta-asr-native-adapter"
-version = "0.10.6"
+version = "0.10.7"
 dependencies = [
  "async-trait",
  "dicta-asr",
@@ -674,7 +674,7 @@ dependencies = [
 
 [[package]]
 name = "dicta-asr-openai-compatible"
-version = "0.10.6"
+version = "0.10.7"
 dependencies = [
  "async-trait",
  "dicta-asr",
@@ -687,7 +687,7 @@ dependencies = [
 
 [[package]]
 name = "dicta-asr-qianwen"
-version = "0.10.6"
+version = "0.10.7"
 dependencies = [
  "async-trait",
  "dicta-asr",
@@ -701,7 +701,7 @@ dependencies = [
 
 [[package]]
 name = "dicta-audio"
-version = "0.10.6"
+version = "0.10.7"
 dependencies = [
  "cc",
  "cpal",
@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "dicta-cli"
-version = "0.10.6"
+version = "0.10.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -738,7 +738,7 @@ dependencies = [
 
 [[package]]
 name = "dicta-core"
-version = "0.10.6"
+version = "0.10.7"
 dependencies = [
  "jiff",
  "serde",
@@ -748,7 +748,7 @@ dependencies = [
 
 [[package]]
 name = "dicta-tray"
-version = "0.10.6"
+version = "0.10.7"
 dependencies = [
  "anyhow",
  "objc2",
@@ -765,7 +765,7 @@ dependencies = [
 
 [[package]]
 name = "dicta-web"
-version = "0.10.6"
+version = "0.10.7"
 dependencies = [
  "dicta-core",
  "js-sys",
