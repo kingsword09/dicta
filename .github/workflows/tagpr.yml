@@ -52,38 +52,38 @@ jobs:
         include:
           - os: ubuntu-latest
             archive_suffix: linux_x86_64
-            bin: target/release/vo
-            tray_bin: target/release/vo-tray
-            exe_name: vo
-            tray_exe_name: vo-tray
+            bin: target/release/dicta
+            tray_bin: target/release/dicta-tray
+            exe_name: dicta
+            tray_exe_name: dicta-tray
             archive_ext: tar.gz
           - os: ubuntu-24.04-arm
             archive_suffix: linux_arm64
-            bin: target/release/vo
-            tray_bin: target/release/vo-tray
-            exe_name: vo
-            tray_exe_name: vo-tray
+            bin: target/release/dicta
+            tray_bin: target/release/dicta-tray
+            exe_name: dicta
+            tray_exe_name: dicta-tray
             archive_ext: tar.gz
           - os: macos-26
             archive_suffix: darwin_arm64
-            bin: target/release/vo
-            tray_bin: target/release/vo-tray
-            exe_name: vo
-            tray_exe_name: vo-tray
+            bin: target/release/dicta
+            tray_bin: target/release/dicta-tray
+            exe_name: dicta
+            tray_exe_name: dicta-tray
             archive_ext: tar.gz
           - os: windows-latest
             archive_suffix: windows_x86_64
-            bin: target/release/vo.exe
-            tray_bin: target/release/vo-tray.exe
-            exe_name: vo.exe
-            tray_exe_name: vo-tray.exe
+            bin: target/release/dicta.exe
+            tray_bin: target/release/dicta-tray.exe
+            exe_name: dicta.exe
+            tray_exe_name: dicta-tray.exe
             archive_ext: zip
           - os: windows-11-arm
             archive_suffix: windows_arm64
-            bin: target/release/vo.exe
-            tray_bin: target/release/vo-tray.exe
-            exe_name: vo.exe
-            tray_exe_name: vo-tray.exe
+            bin: target/release/dicta.exe
+            tray_bin: target/release/dicta-tray.exe
+            exe_name: dicta.exe
+            tray_exe_name: dicta-tray.exe
             archive_ext: zip
     runs-on: ${{ matrix.os }}
     permissions:
@@ -108,7 +108,7 @@ jobs:
         run: cargo fetch --locked
 
       - name: Build release binary
-        run: cargo build --release -p vo-cli -p vo-tray --locked
+        run: cargo build --release -p dicta-cli -p dicta-tray --locked
 
       - name: Build Apple Speech adapter
         if: matrix.archive_suffix == 'darwin_arm64'
@@ -125,12 +125,12 @@ jobs:
           cp "$BIN" "$STAGE/${{ matrix.exe_name }}"
           cp "$TRAY_BIN" "$STAGE/${{ matrix.tray_exe_name }}"
           if [ "${{ matrix.archive_suffix }}" = "darwin_arm64" ]; then
-            ADAPTER_BIN="$(cd adapters/apple-speech && swift build -c release --arch arm64 --show-bin-path)/vo"
-            cp "$ADAPTER_BIN" "$STAGE/vo-adapter-apple-speech"
+            ADAPTER_BIN="$(cd adapters/apple-speech && swift build -c release --arch arm64 --show-bin-path)/dicta-adapter-apple-speech"
+            cp "$ADAPTER_BIN" "$STAGE/dicta-adapter-apple-speech"
           fi
           cp LICENSE README.md "$STAGE/"
-          ARCHIVE="vo_v${VERSION}_${{ matrix.archive_suffix }}.${{ matrix.archive_ext }}"
-          LATEST_ARCHIVE="vo_${{ matrix.archive_suffix }}.${{ matrix.archive_ext }}"
+          ARCHIVE="dicta_v${VERSION}_${{ matrix.archive_suffix }}.${{ matrix.archive_ext }}"
+          LATEST_ARCHIVE="dicta_${{ matrix.archive_suffix }}.${{ matrix.archive_ext }}"
           if [ "${{ matrix.archive_ext }}" = "zip" ]; then
             7z a "$ARCHIVE" "$STAGE"/*
             cp "$ARCHIVE" "$LATEST_ARCHIVE"

@@ -3,11 +3,11 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleIdentifier</key>
-    <string>io.github.k1low.vo</string>
+    <string>io.github.kingsword09.dicta</string>
     <key>CFBundleName</key>
-    <string>vo</string>
+    <string>dicta</string>
     <key>CFBundleExecutable</key>
-    <string>vo</string>
+    <string>dicta</string>
     <key>CFBundleVersion</key>
     <string>0.10.5</string>
     <key>CFBundleShortVersionString</key>
@@ -17,10 +17,10 @@
     <key>LSMinimumSystemVersion</key>
     <string>26.0</string>
     <key>NSMicrophoneUsageDescription</key>
-    <string>vo はマイク入力から文字起こしと翻訳を行うためにマイクを使用します。</string>
+    <string>dicta はマイク入力から文字起こしと翻訳を行うためにマイクを使用します。</string>
     <key>NSSpeechRecognitionUsageDescription</key>
-    <string>vo はオンデバイスの音声認識でマイク入力を文字起こしします。すべての処理は端末上で完結します。</string>
+    <string>dicta はオンデバイスの音声認識でマイク入力を文字起こしします。すべての処理は端末上で完結します。</string>
     <key>NSAudioCaptureUsageDescription</key>
-    <string>vo は他アプリの音声 (会議の相手の声など) を文字起こしするために、システム音声を取得します。画面の映像は取得しません。</string>
+    <string>dicta は他アプリの音声 (会議の相手の声など) を文字起こしするために、システム音声を取得します。画面の映像は取得しません。</string>
 </dict>
 </plist>

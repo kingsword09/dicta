@@ -1,10 +1,10 @@
 # Web WASM boundary
 
-`crates/vo-web` is the browser-only WASM crate. It is separate from the Rust CLI
+`crates/dicta-web` is the browser-only WASM crate. It is separate from the Rust CLI
 and native provider crates so browser builds do not pull in `tokio`, `reqwest`,
 `cpal`, platform adapters, or the Doubao native WebSocket stack.
 
-The crate shares `vo-core` transcript schema. A successful transcription returns
+The crate shares `dicta-core` transcript schema. A successful transcription returns
 this shape:
 
 ```json
@@ -88,4 +88,4 @@ web-only implementation and should be treated as browser-visible storage; do not
 use it for a public hosted app where provider keys must remain private.
 
 IndexedDB can be added later for larger artifacts such as cached audio blobs or
-session history without changing `vo-core`.
+session history without changing `dicta-core`.

@@ -2,28 +2,28 @@
 import PackageDescription
 
 let package = Package(
-    name: "vo",
+    name: "dicta",
     platforms: [
         .macOS("26.0")
     ],
     products: [
-        .executable(name: "vo", targets: ["vo"])
+        .executable(name: "dicta", targets: ["dicta"])
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0")
     ],
     targets: [
         .executableTarget(
-            name: "vo",
+            name: "dicta",
             dependencies: [
                 .product(name: "ArgumentParser", package: "swift-argument-parser")
             ],
-            path: "Sources/vo"
+            path: "Sources/dicta"
         ),
         .testTarget(
-            name: "voTests",
-            dependencies: ["vo"],
-            path: "Tests/voTests"
+            name: "dictaTests",
+            dependencies: ["dicta"],
+            path: "Tests/dictaTests"
         )
     ]
 )

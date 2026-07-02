@@ -1,31 +1,31 @@
 #!/usr/bin/env sh
 set -eu
 
-repo="${VO_REPO:-kingsword09/vo}"
-version="${VO_VERSION:-latest}"
-install_dir="${VO_INSTALL_DIR:-$HOME/.local/bin}"
-archive_override="${VO_ARCHIVE:-}"
-base_url_override="${VO_BASE_URL:-}"
+repo="${DICTA_REPO:-kingsword09/dicta}"
+version="${DICTA_VERSION:-latest}"
+install_dir="${DICTA_INSTALL_DIR:-$HOME/.local/bin}"
+archive_override="${DICTA_ARCHIVE:-}"
+base_url_override="${DICTA_BASE_URL:-}"
 
 usage() {
   cat <<'USAGE'
-vo installer
+dicta installer
 
 Usage:
-  curl -fsSL https://raw.githubusercontent.com/kingsword09/vo/main/install.sh | sh
+  curl -fsSL https://raw.githubusercontent.com/kingsword09/dicta/main/install.sh | sh
   ./install.sh --uninstall
 
 Environment:
-  VO_REPO         GitHub repository, default: kingsword09/vo
-  VO_VERSION      Release version or tag, default: latest
-  VO_INSTALL_DIR  Install directory, default: $HOME/.local/bin
-  VO_ARCHIVE      Local archive path to install from
-  VO_BASE_URL     Base URL or file:// directory containing release archives
+  DICTA_REPO         GitHub repository, default: kingsword09/dicta
+  DICTA_VERSION      Release version or tag, default: latest
+  DICTA_INSTALL_DIR  Install directory, default: $HOME/.local/bin
+  DICTA_ARCHIVE      Local archive path to install from
+  DICTA_BASE_URL     Base URL or file:// directory containing release archives
 USAGE
 }
 
 fail() {
-  echo "vo install: $*" >&2
+  echo "dicta install: $*" >&2
   exit 1
 }
 
@@ -36,34 +36,29 @@ case "${1:-}" in
     ;;
   --uninstall)
     case "$(uname -s)" in
-      MINGW*|MSYS*|CYGWIN*) exe_name="vo.exe" ;;
-      *) exe_name="vo" ;;
+      MINGW*|MSYS*|CYGWIN*) exe_name="dicta.exe" ;;
+      *) exe_name="dicta" ;;
     esac
     case "$exe_name" in
-      *.exe) tray_name="vo-tray.exe"; adapter_name="vo-adapter-apple-speech.exe"; compat_adapter_name="vo-apple-adapter.exe" ;;
-      *) tray_name="vo-tray"; adapter_name="vo-adapter-apple-speech"; compat_adapter_name="vo-apple-adapter" ;;
+      *.exe) tray_name="dicta-tray.exe"; adapter_name="dicta-adapter-apple-speech.exe" ;;
+      *) tray_name="dicta-tray"; adapter_name="dicta-adapter-apple-speech" ;;
     esac
     target="$install_dir/$exe_name"
     tray_target="$install_dir/$tray_name"
     adapter_target="$install_dir/$adapter_name"
-    compat_adapter_target="$install_dir/$compat_adapter_name"
     if [ -e "$target" ]; then
       rm -f "$target"
-      echo "vo install: removed $target"
+      echo "dicta install: removed $target"
     else
-      echo "vo install: $target is not installed"
+      echo "dicta install: $target is not installed"
     fi
     if [ -e "$adapter_target" ]; then
       rm -f "$adapter_target"
-      echo "vo install: removed $adapter_target"
+      echo "dicta install: removed $adapter_target"
     fi
     if [ -e "$tray_target" ]; then
       rm -f "$tray_target"
-      echo "vo install: removed $tray_target"
-    fi
-    if [ -e "$compat_adapter_target" ]; then
-      rm -f "$compat_adapter_target"
-      echo "vo install: removed $compat_adapter_target"
+      echo "dicta install: removed $tray_target"
     fi
     exit 0
     ;;
@@ -108,16 +103,14 @@ esac
 
 if [ "$os" = "windows" ]; then
   archive_ext="zip"
-  exe_name="vo.exe"
-  tray_name="vo-tray.exe"
-  adapter_name="vo-adapter-apple-speech.exe"
-  compat_adapter_name="vo-apple-adapter.exe"
+  exe_name="dicta.exe"
+  tray_name="dicta-tray.exe"
+  adapter_name="dicta-adapter-apple-speech.exe"
 else
   archive_ext="tar.gz"
-  exe_name="vo"
-  tray_name="vo-tray"
-  adapter_name="vo-adapter-apple-speech"
-  compat_adapter_name="vo-apple-adapter"
+  exe_name="dicta"
+  tray_name="dicta-tray"
+  adapter_name="dicta-adapter-apple-speech"
 fi
 
 if [ "$os" = "darwin" ] && [ "$arch" != "arm64" ]; then
@@ -169,7 +162,7 @@ else
 fi
 
 suffix="${os}_${arch}"
-archive="vo_${suffix}.${archive_ext}"
+archive="dicta_${suffix}.${archive_ext}"
 url="$base_url/$archive"
 
 archive_path="$tmp/$archive"
@@ -192,31 +185,31 @@ download_archive() {
 if [ -n "$archive_override" ]; then
   [ -f "$archive_override" ] || fail "archive does not exist: $archive_override"
   archive_path="$archive_override"
-  echo "vo install: installing from local archive $archive_path"
+  echo "dicta install: installing from local archive $archive_path"
 elif [ -f "$url" ]; then
   archive_path="$url"
-  echo "vo install: installing from local archive $archive_path"
+  echo "dicta install: installing from local archive $archive_path"
 else
-  echo "vo install: downloading $repo $display_version for $suffix"
-  echo "vo install: $url"
+  echo "dicta install: downloading $repo $display_version for $suffix"
+  echo "dicta install: $url"
   if ! download_archive "$url" "$archive_path"; then
     if [ "$version" = "latest" ]; then
       if [ "$need_url_tool" = "curl" ]; then
         latest_url="$(curl --fail --location --silent --output /dev/null --write-out '%{url_effective}' "https://github.com/$repo/releases/latest")"
         tag="${latest_url##*/}"
         [ -n "$tag" ] || fail "download failed: $url"
-        versioned_archive="vo_${tag}_${suffix}.${archive_ext}"
+        versioned_archive="dicta_${tag}_${suffix}.${archive_ext}"
         versioned_url="https://github.com/$repo/releases/download/$tag/$versioned_archive"
-        echo "vo install: retrying versioned asset name: $versioned_url"
+        echo "dicta install: retrying versioned asset name: $versioned_url"
         archive_path="$tmp/$versioned_archive"
         download_archive "$versioned_url" "$archive_path" || fail "download failed: $versioned_url"
       else
         fail "download failed: $url"
       fi
     else
-      versioned_archive="vo_${tag}_${suffix}.${archive_ext}"
+      versioned_archive="dicta_${tag}_${suffix}.${archive_ext}"
       versioned_url="$base_url/$versioned_archive"
-      echo "vo install: retrying versioned asset name: $versioned_url"
+      echo "dicta install: retrying versioned asset name: $versioned_url"
       archive_path="$tmp/$versioned_archive"
       download_archive "$versioned_url" "$archive_path" || fail "download failed: $versioned_url"
     fi
@@ -246,10 +239,7 @@ if [ -z "$adapter_path" ]; then
   adapter_path="$(find "$tmp/extract" -type f -name "$adapter_name" | head -n 1)"
 fi
 if [ -z "$adapter_path" ]; then
-  adapter_path="$(find "$tmp/extract" -type f -name "$compat_adapter_name" -perm -u+x | head -n 1)"
-fi
-if [ -z "$adapter_path" ]; then
-  adapter_path="$(find "$tmp/extract" -type f -name "$compat_adapter_name" | head -n 1)"
+  adapter_path="$(find "$tmp/extract" -type f -name "$adapter_name" | head -n 1)"
 fi
 if [ -n "$adapter_path" ]; then
   adapter_target="$install_dir/$adapter_name"
@@ -277,17 +267,17 @@ if [ "$os" = "darwin" ] && command -v xattr >/dev/null 2>&1; then
   fi
 fi
 
-echo "vo install: installed $target"
+echo "dicta install: installed $target"
 if [ -n "${adapter_target:-}" ]; then
-  echo "vo install: installed $adapter_target"
+  echo "dicta install: installed $adapter_target"
 fi
 if [ -n "${tray_target:-}" ]; then
-  echo "vo install: installed $tray_target"
+  echo "dicta install: installed $tray_target"
 fi
 version_out="$tmp/version.out"
 version_err="$tmp/version.err"
 if ! "$target" --version >"$version_out" 2>"$version_err"; then
-  echo "vo install: warning: installed binary could not run on this system"
+  echo "dicta install: warning: installed binary could not run on this system"
   if [ -s "$version_err" ]; then
     sed 's/^/  /' "$version_err" >&2
   fi
@@ -295,6 +285,6 @@ else
   cat "$version_out"
 fi
 if [ ":$PATH:" != *":$install_dir:"* ]; then
-  echo "vo install: add this to your shell profile:"
+  echo "dicta install: add this to your shell profile:"
   echo "  export PATH=\"$install_dir:\$PATH\""
 fi

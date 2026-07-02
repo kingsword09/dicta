@@ -1,14 +1,15 @@
 [workspace]
 members = [
-    "crates/vo-asr",
-    "crates/vo-asr-doubao",
-    "crates/vo-asr-native-adapter",
-    "crates/vo-asr-openai-compatible",
-    "crates/vo-audio",
-    "crates/vo-cli",
-    "crates/vo-core",
-    "crates/vo-tray",
-    "crates/vo-web",
+    "crates/dicta-asr",
+    "crates/dicta-asr-doubao",
+    "crates/dicta-asr-native-adapter",
+    "crates/dicta-asr-openai-compatible",
+    "crates/dicta-asr-qianwen",
+    "crates/dicta-audio",
+    "crates/dicta-core",
+    "crates/dicta-cli",
+    "crates/dicta-tray",
+    "crates/dicta-web",
 ]
 resolver = "2"
 
@@ -22,19 +23,24 @@ version = "0.10.5"
 anyhow = "1.0.98"
 async-trait = "0.1.88"
 axum = { version = "0.8.7", features = ["multipart"] }
+base64 = "0.22.1"
 bytes = "1.10.1"
 clap = { version = "4.5.40", features = ["derive", "env"] }
 cpal = "0.16.0"
+flate2 = "1.1.5"
 futures-util = "0.3.31"
 hound = "3.5.1"
 jiff = { version = "0.2.31", default-features = false, features = ["std", "serde", "tz-system"] }
+libloading = "0.8.9"
 md5 = "0.7.0"
 opus = "0.3.1"
 prost = "0.14.1"
 reqwest = { version = "0.12.22", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
+sha2 = "0.10.9"
 tao = "0.35.3"
+tar = "0.4.44"
 thiserror = "2.0.12"
 time = "=0.3.44"
 toml = "0.9.9"
@@ -43,10 +49,11 @@ tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots"]
 tower-http = { version = "0.6.11", features = ["cors"] }
 tray-icon = "0.24.1"
 uuid = { version = "1.17.0", features = ["v4"] }
-vo-asr = { path = "crates/vo-asr" }
-vo-asr-doubao = { path = "crates/vo-asr-doubao" }
-vo-asr-native-adapter = { path = "crates/vo-asr-native-adapter" }
-vo-asr-openai-compatible = { path = "crates/vo-asr-openai-compatible" }
-vo-audio = { path = "crates/vo-audio" }
-vo-core = { path = "crates/vo-core" }
+dicta-asr = { path = "crates/dicta-asr" }
+dicta-asr-doubao = { path = "crates/dicta-asr-doubao" }
+dicta-asr-native-adapter = { path = "crates/dicta-asr-native-adapter" }
+dicta-asr-openai-compatible = { path = "crates/dicta-asr-openai-compatible" }
+dicta-asr-qianwen = { path = "crates/dicta-asr-qianwen" }
+dicta-audio = { path = "crates/dicta-audio" }
+dicta-core = { path = "crates/dicta-core" }
 wry = { version = "0.55.1", features = ["transparent"] }
