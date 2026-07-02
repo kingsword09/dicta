@@ -49,6 +49,9 @@ const APP_NAME: &str = "dicta";
 const CONFIG_DIR_NAME: &str = "dicta";
 const PROVIDER_PROTOCOL: &str = "dicta-provider-jsonl-v1";
 const DEFAULT_NPM_REGISTRY: &str = "https://registry.npmjs.org";
+const DEFAULT_PROVIDER_SCOPE: &str = "dicta-asr";
+const DEFAULT_PROVIDER_KEYWORD: &str = "dicta-provider";
+const PROVIDER_INSTALL_METADATA_FILE: &str = ".dicta-provider-install.json";
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "dicta")]
@@ -349,12 +352,49 @@ struct ProviderCommand {
 enum ProviderAction {
     #[command(about = "List built-in and configured providers")]
     List,
+    #[command(about = "List installable provider packages from the npm registry")]
+    Available(ProviderAvailableCommand),
     #[command(about = "Show the provider selected for --provider active")]
     Current,
     #[command(about = "Set the provider selected by --provider active")]
     Set { name: String },
     #[command(about = "Install an ASR provider package without npm install")]
     Install(ProviderInstallCommand),
+    #[command(about = "Update one installed provider or all installed providers")]
+    Update(ProviderUpdateCommand),
+    #[command(visible_alias = "uninstall", about = "Remove an installed provider")]
+    Remove(ProviderRemoveCommand),
+}
+
+#[derive(Debug, Clone, Args)]
+struct ProviderAvailableCommand {
+    #[arg(
+        long,
+        default_value = DEFAULT_PROVIDER_SCOPE,
+        help = "npm scope to search for installable provider packages"
+    )]
+    scope: String,
+
+    #[arg(
+        long,
+        default_value = DEFAULT_PROVIDER_KEYWORD,
+        help = "npm keyword required for installable provider packages"
+    )]
+    keyword: String,
+
+    #[arg(
+        long,
+        default_value = DEFAULT_NPM_REGISTRY,
+        help = "npm-compatible registry used for package discovery"
+    )]
+    registry: String,
+
+    #[arg(
+        long,
+        default_value_t = 50,
+        help = "Maximum number of packages to show"
+    )]
+    limit: usize,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -374,6 +414,39 @@ struct ProviderInstallCommand {
 
     #[arg(long, help = "Replace an existing installed provider")]
     force: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ProviderUpdateCommand {
+    #[arg(
+        help = "Installed provider id or npm package name; omit to update all installed providers"
+    )]
+    name: Option<String>,
+
+    #[arg(long, help = "Provider version or npm dist-tag, default: latest")]
+    version: Option<String>,
+
+    #[arg(
+        long,
+        default_value = DEFAULT_NPM_REGISTRY,
+        help = "npm-compatible registry used for updates"
+    )]
+    registry: String,
+
+    #[arg(
+        long,
+        help = "Reinstall even when the requested version is already installed"
+    )]
+    force: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ProviderRemoveCommand {
+    #[arg(help = "Installed provider id or npm package name")]
+    name: String,
+
+    #[arg(short = 'y', long, help = "Do not ask for confirmation")]
+    yes: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -472,6 +545,7 @@ struct ResolvedProviderProfile {
 struct InstalledProvider {
     root: PathBuf,
     manifest: ProviderPackageManifest,
+    install_metadata: Option<ProviderInstallMetadata>,
 }
 
 impl InstalledProvider {
@@ -520,6 +594,32 @@ impl InstalledProvider {
             notes: self.manifest.notes.clone(),
         }
     }
+
+    fn source_package(&self) -> Option<&str> {
+        self.install_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.package.as_deref())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProviderInstallMetadata {
+    source: ProviderInstallSourceKind,
+    #[serde(default)]
+    package: Option<String>,
+    #[serde(default)]
+    registry: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+    installed_at_ms: u128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ProviderInstallSourceKind {
+    Npm,
+    Directory,
+    Tarball,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -658,6 +758,8 @@ struct ProviderListEntry {
     built_in: bool,
     installed: bool,
     install_path: Option<String>,
+    installed_version: Option<String>,
+    source_package: Option<String>,
     selected: bool,
     model: String,
     batch_file: bool,
@@ -2509,9 +2611,12 @@ fn run_capabilities(cli: &Cli) -> Result<()> {
 async fn run_provider_command(cli: &Cli, command: &ProviderCommand) -> Result<()> {
     match &command.action {
         ProviderAction::List => run_provider_list(cli),
+        ProviderAction::Available(command) => run_provider_available(cli, command).await,
         ProviderAction::Current => run_provider_current(cli),
         ProviderAction::Set { name } => run_provider_set(cli, name),
         ProviderAction::Install(command) => run_provider_install(cli, command).await,
+        ProviderAction::Update(command) => run_provider_update(cli, command).await,
+        ProviderAction::Remove(command) => run_provider_remove(cli, command),
     }
 }
 
@@ -2565,12 +2670,74 @@ struct ProviderInstallReport {
     version: Option<String>,
     protocol: String,
     source: String,
+    source_package: Option<String>,
     install_path: String,
     command: String,
 }
 
+#[derive(Debug, Serialize)]
+struct ProviderAvailableReport {
+    registry: String,
+    scope: String,
+    keyword: String,
+    packages: Vec<ProviderAvailableEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderAvailableEntry {
+    package: String,
+    provider_id: String,
+    latest_version: String,
+    description: Option<String>,
+    installed: bool,
+    installed_version: Option<String>,
+    update_available: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderUpdateReport {
+    registry: String,
+    target: Option<String>,
+    providers: Vec<ProviderUpdateEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderUpdateEntry {
+    id: String,
+    package: Option<String>,
+    previous_version: Option<String>,
+    latest_version: Option<String>,
+    changed: bool,
+    skipped: bool,
+    install_path: Option<String>,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderRemoveReport {
+    id: String,
+    install_path: String,
+    active_provider_cleared: bool,
+}
+
 async fn run_provider_install(cli: &Cli, command: &ProviderInstallCommand) -> Result<()> {
     let source = ProviderInstallSource::resolve(command).await?;
+    let report = install_provider_from_source(cli, source, command.force)?;
+
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_provider_install_report(&report);
+    }
+
+    Ok(())
+}
+
+fn install_provider_from_source(
+    cli: &Cli,
+    source: ProviderInstallSource,
+    force: bool,
+) -> Result<ProviderInstallReport> {
     let providers_dir = provider_install_dir(cli)
         .context("could not determine provider install directory; set DICTA_PROVIDER_DIR")?;
     fs::create_dir_all(&providers_dir).with_context(|| {
@@ -2597,44 +2764,329 @@ async fn run_provider_install(cli: &Cli, command: &ProviderInstallCommand) -> Re
     })?;
 
     let install_result = install_provider_to_staging(&source, &staging).and_then(|manifest| {
-        finish_provider_install(command.force, &providers_dir, &staging, manifest)
+        finish_provider_install(force, &providers_dir, &staging, manifest, &source.metadata)
     });
     if install_result.is_err() {
         let _ = fs::remove_dir_all(&staging);
     }
     let (installed, final_path) = install_result?;
 
-    let report = ProviderInstallReport {
+    Ok(ProviderInstallReport {
         id: installed.id().to_owned(),
         name: installed.manifest.name.clone(),
         version: installed.manifest.version.clone(),
         protocol: installed.manifest.protocol.clone(),
         source: source.description,
+        source_package: source.metadata.package.clone(),
         install_path: final_path.display().to_string(),
         command: installed.command_path().display().to_string(),
-    };
+    })
+}
 
+fn print_provider_install_report(report: &ProviderInstallReport) {
+    println!("Installed provider: {}", report.id);
+    if let Some(name) = &report.name {
+        println!("  Name: {name}");
+    }
+    if let Some(version) = &report.version {
+        println!("  Version: {version}");
+    }
+    if let Some(package) = &report.source_package {
+        println!("  Package: {package}");
+    }
+    println!("  Path: {}", report.install_path);
+    println!("  Command: {}", report.command);
+    println!("  Protocol: {}", report.protocol);
+}
+
+async fn run_provider_available(cli: &Cli, command: &ProviderAvailableCommand) -> Result<()> {
+    let report = gather_provider_available_report(cli, command).await?;
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        println!("Installed provider: {}", report.id);
-        if let Some(name) = &report.name {
-            println!("  Name: {name}");
+        print_provider_available_text(&report);
+    }
+    Ok(())
+}
+
+async fn gather_provider_available_report(
+    cli: &Cli,
+    command: &ProviderAvailableCommand,
+) -> Result<ProviderAvailableReport> {
+    let registry = command.registry.trim().trim_end_matches('/').to_owned();
+    let scope = command.scope.trim().trim_start_matches('@').to_owned();
+    let keyword = command.keyword.trim().to_owned();
+    let packages = search_npm_provider_packages(&registry, &scope, &keyword, command.limit).await?;
+    let installed = installed_providers(cli)?;
+    let entries = packages
+        .into_iter()
+        .map(|package| {
+            let provider_id = provider_id_from_package_name(&package.name).to_owned();
+            let installed_provider = installed.get(&provider_id);
+            let installed_version =
+                installed_provider.and_then(|provider| provider.manifest.version.clone());
+            let update_available = installed_version
+                .as_ref()
+                .is_some_and(|version| version != &package.version);
+            ProviderAvailableEntry {
+                package: package.name,
+                provider_id,
+                latest_version: package.version,
+                description: package.description,
+                installed: installed_provider.is_some(),
+                installed_version,
+                update_available,
+            }
+        })
+        .collect();
+
+    Ok(ProviderAvailableReport {
+        registry,
+        scope,
+        keyword,
+        packages: entries,
+    })
+}
+
+fn print_provider_available_text(report: &ProviderAvailableReport) {
+    println!("Installable providers");
+    println!("  Registry: {}", report.registry);
+    println!("  Scope: @{}", report.scope);
+    println!();
+    for package in &report.packages {
+        let status = if package.update_available {
+            "update available"
+        } else if package.installed {
+            "installed"
+        } else {
+            "not installed"
+        };
+        println!(
+            "{} ({}, latest {}, {})",
+            package.provider_id, package.package, package.latest_version, status
+        );
+        if let Some(version) = &package.installed_version {
+            println!("    Installed version: {version}");
         }
-        if let Some(version) = &report.version {
-            println!("  Version: {version}");
+        if let Some(description) = &package.description {
+            println!("    {description}");
         }
-        println!("  Path: {}", report.install_path);
-        println!("  Command: {}", report.command);
-        println!("  Protocol: {}", report.protocol);
+    }
+}
+
+async fn run_provider_update(cli: &Cli, command: &ProviderUpdateCommand) -> Result<()> {
+    let report = update_provider_packages(cli, command).await?;
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_provider_update_text(&report);
+    }
+    Ok(())
+}
+
+async fn update_provider_packages(
+    cli: &Cli,
+    command: &ProviderUpdateCommand,
+) -> Result<ProviderUpdateReport> {
+    let registry = command.registry.trim().trim_end_matches('/').to_owned();
+    let installed = installed_providers(cli)?;
+    let targets = provider_update_targets(&installed, command.name.as_deref())?;
+    let mut entries = Vec::new();
+
+    for provider in targets {
+        let id = provider.id().to_owned();
+        let package = provider_update_package(&provider);
+        let previous_version = provider.manifest.version.clone();
+        let Some(package) = package else {
+            entries.push(ProviderUpdateEntry {
+                id,
+                package: None,
+                previous_version,
+                latest_version: None,
+                changed: false,
+                skipped: true,
+                install_path: Some(provider.root.display().to_string()),
+                message:
+                    "provider was installed from a local path; no npm package metadata is available"
+                        .to_owned(),
+            });
+            continue;
+        };
+
+        let update_registry = provider
+            .install_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.registry.clone())
+            .unwrap_or_else(|| registry.clone());
+        let latest_version =
+            resolve_npm_package_version(&package, command.version.as_deref(), &update_registry)
+                .await?;
+        if !command.force && previous_version.as_deref() == Some(latest_version.as_str()) {
+            entries.push(ProviderUpdateEntry {
+                id,
+                package: Some(package),
+                previous_version,
+                latest_version: Some(latest_version),
+                changed: false,
+                skipped: true,
+                install_path: Some(provider.root.display().to_string()),
+                message: "already up to date".to_owned(),
+            });
+            continue;
+        }
+
+        let source = ProviderInstallSource::resolve_npm(
+            &package,
+            command.version.as_deref(),
+            &update_registry,
+        )
+        .await?;
+        let install_report = install_provider_from_source(cli, source, true)?;
+        entries.push(ProviderUpdateEntry {
+            id: install_report.id,
+            package: install_report.source_package,
+            previous_version,
+            latest_version: install_report.version,
+            changed: true,
+            skipped: false,
+            install_path: Some(install_report.install_path),
+            message: "updated".to_owned(),
+        });
     }
 
+    Ok(ProviderUpdateReport {
+        registry,
+        target: command.name.clone(),
+        providers: entries,
+    })
+}
+
+fn provider_update_targets(
+    installed: &BTreeMap<String, InstalledProvider>,
+    target: Option<&str>,
+) -> Result<Vec<InstalledProvider>> {
+    if let Some(target) = target.and_then(|value| non_empty_string(Some(value))) {
+        return installed
+            .values()
+            .find(|provider| provider_matches_name_or_package(provider, target))
+            .cloned()
+            .map(|provider| vec![provider])
+            .with_context(|| format!("installed provider '{target}' was not found"));
+    }
+    Ok(installed.values().cloned().collect())
+}
+
+fn provider_update_package(provider: &InstalledProvider) -> Option<String> {
+    match provider.install_metadata.as_ref() {
+        Some(metadata) if metadata.source == ProviderInstallSourceKind::Npm => metadata
+            .package
+            .clone()
+            .or_else(|| Some(format!("@{DEFAULT_PROVIDER_SCOPE}/{}", provider.id()))),
+        Some(_) => None,
+        None => Some(format!("@{DEFAULT_PROVIDER_SCOPE}/{}", provider.id())),
+    }
+}
+
+fn provider_matches_name_or_package(provider: &InstalledProvider, value: &str) -> bool {
+    let value = value.trim();
+    if value == provider.id() || provider_id_from_package_name(value) == provider.id() {
+        return true;
+    }
+    let canonical = canonical_provider_package_name(value);
+    provider.source_package().is_some_and(|package| {
+        package == value || package == canonical || provider_id_from_package_name(package) == value
+    })
+}
+
+fn print_provider_update_text(report: &ProviderUpdateReport) {
+    println!("Provider updates");
+    println!("  Registry: {}", report.registry);
+    for provider in &report.providers {
+        let marker = if provider.changed {
+            "updated"
+        } else if provider.skipped {
+            "skipped"
+        } else {
+            "checked"
+        };
+        println!("  {}: {}", provider.id, marker);
+        if let Some(package) = &provider.package {
+            println!("    Package: {package}");
+        }
+        if let Some(previous) = &provider.previous_version {
+            println!("    Previous: {previous}");
+        }
+        if let Some(latest) = &provider.latest_version {
+            println!("    Latest: {latest}");
+        }
+        println!("    {}", provider.message);
+    }
+}
+
+fn run_provider_remove(cli: &Cli, command: &ProviderRemoveCommand) -> Result<()> {
+    let installed = installed_providers(cli)?;
+    let provider = installed
+        .values()
+        .find(|provider| provider_matches_name_or_package(provider, &command.name))
+        .cloned()
+        .with_context(|| format!("installed provider '{}' was not found", command.name.trim()))?;
+
+    if !command.yes && !confirm_provider_remove(&provider)? {
+        println!("dicta provider remove: cancelled");
+        return Ok(());
+    }
+
+    let active_provider_cleared = read_active_provider_name(cli)?.as_deref() == Some(provider.id());
+    fs::remove_dir_all(&provider.root).with_context(|| {
+        format!(
+            "failed to remove provider directory {}",
+            provider.root.display()
+        )
+    })?;
+    if active_provider_cleared {
+        clear_active_provider_name(cli)?;
+    }
+
+    let report = ProviderRemoveReport {
+        id: provider.id().to_owned(),
+        install_path: provider.root.display().to_string(),
+        active_provider_cleared,
+    };
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Removed provider: {}", report.id);
+        println!("  Path: {}", report.install_path);
+        if report.active_provider_cleared {
+            println!("  Active provider selection was cleared");
+        }
+    }
     Ok(())
+}
+
+fn confirm_provider_remove(provider: &InstalledProvider) -> Result<bool> {
+    if !io::stdin().is_terminal() {
+        bail!(
+            "refusing to remove provider without confirmation on non-interactive stdin; pass --yes"
+        );
+    }
+    eprint!(
+        "Remove provider '{}' from {}? [y/N] ",
+        provider.id(),
+        provider.root.display()
+    );
+    io::stderr().flush().ok();
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("failed to read provider removal confirmation")?;
+    Ok(is_uninstall_confirmation(&input))
 }
 
 struct ProviderInstallSource {
     description: String,
     package: ProviderInstallPackage,
+    metadata: ProviderInstallMetadata,
 }
 
 enum ProviderInstallPackage {
@@ -2654,6 +3106,12 @@ impl ProviderInstallSource {
             return Ok(Self {
                 description: local.display().to_string(),
                 package: ProviderInstallPackage::Directory(local),
+                metadata: provider_install_metadata(
+                    ProviderInstallSourceKind::Directory,
+                    None,
+                    None,
+                    None,
+                ),
             });
         }
         if local.is_file() {
@@ -2662,24 +3120,43 @@ impl ProviderInstallSource {
             return Ok(Self {
                 description: local.display().to_string(),
                 package: ProviderInstallPackage::Tgz(data),
+                metadata: provider_install_metadata(
+                    ProviderInstallSourceKind::Tarball,
+                    None,
+                    None,
+                    None,
+                ),
             });
         }
 
-        let npm = fetch_npm_package(command).await?;
+        Self::resolve_npm(package, command.version.as_deref(), &command.registry).await
+    }
+
+    async fn resolve_npm(package: &str, version: Option<&str>, registry: &str) -> Result<Self> {
+        let npm = fetch_npm_package(package, version, registry).await?;
         Ok(Self {
             description: npm.description,
             package: ProviderInstallPackage::Tgz(npm.data),
+            metadata: provider_install_metadata(
+                ProviderInstallSourceKind::Npm,
+                Some(npm.package_name),
+                Some(registry.trim().trim_end_matches('/').to_owned()),
+                Some(npm.version),
+            ),
         })
     }
 }
 
 struct DownloadedNpmPackage {
     description: String,
+    package_name: String,
+    version: String,
     data: Vec<u8>,
 }
 
 #[derive(Debug, Deserialize)]
 struct NpmPackageMetadata {
+    name: String,
     #[serde(rename = "dist-tags", default)]
     dist_tags: BTreeMap<String, String>,
     #[serde(default)]
@@ -2687,7 +3164,34 @@ struct NpmPackageMetadata {
 }
 
 #[derive(Debug, Deserialize)]
+struct NpmSearchResponse {
+    #[serde(default)]
+    objects: Vec<NpmSearchObject>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NpmSearchObject {
+    package: NpmSearchPackage,
+}
+
+#[derive(Debug, Deserialize)]
+struct NpmSearchPackage {
+    name: String,
+    version: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    keywords: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct NpmPackageVersion {
+    #[serde(default)]
+    os: Vec<String>,
+    #[serde(default)]
+    cpu: Vec<String>,
+    #[serde(rename = "optionalDependencies", default)]
+    optional_dependencies: BTreeMap<String, String>,
     dist: NpmPackageDist,
 }
 
@@ -2697,12 +3201,141 @@ struct NpmPackageDist {
     integrity: Option<String>,
 }
 
-async fn fetch_npm_package(command: &ProviderInstallCommand) -> Result<DownloadedNpmPackage> {
-    let registry = command.registry.trim().trim_end_matches('/');
-    let name = command.package.trim();
-    let metadata_url = format!("{registry}/{}", npm_package_url_name(name));
+#[derive(Debug, Clone)]
+struct NpmProviderPackageSummary {
+    name: String,
+    version: String,
+    description: Option<String>,
+}
+
+async fn search_npm_provider_packages(
+    registry: &str,
+    scope: &str,
+    keyword: &str,
+    limit: usize,
+) -> Result<Vec<NpmProviderPackageSummary>> {
+    let registry = registry.trim().trim_end_matches('/');
+    let scope_prefix = format!("@{}/", scope.trim().trim_start_matches('@'));
+    let text = format!(
+        "scope:{} keywords:{}",
+        scope.trim().trim_start_matches('@'),
+        keyword
+    );
     let client = reqwest::Client::new();
-    let metadata = client
+    let search: NpmSearchResponse = client
+        .get(format!("{registry}/-/v1/search"))
+        .query(&[("text", text.as_str()), ("size", &limit.max(1).to_string())])
+        .send()
+        .await
+        .with_context(|| "failed to query npm provider search")?
+        .error_for_status()
+        .with_context(|| "npm provider search returned an error")?
+        .json()
+        .await
+        .with_context(|| "failed to parse npm provider search response")?;
+
+    Ok(search
+        .objects
+        .into_iter()
+        .filter_map(|object| {
+            let package = object.package;
+            (package.name.starts_with(&scope_prefix)
+                && package.keywords.iter().any(|value| value == keyword))
+            .then_some(NpmProviderPackageSummary {
+                name: package.name,
+                version: package.version,
+                description: package.description,
+            })
+        })
+        .collect())
+}
+
+async fn resolve_npm_package_version(
+    package_name: &str,
+    requested: Option<&str>,
+    registry: &str,
+) -> Result<String> {
+    let registry = registry.trim().trim_end_matches('/');
+    let client = reqwest::Client::new();
+    let metadata = fetch_npm_metadata(
+        &client,
+        registry,
+        &canonical_provider_package_name(package_name),
+    )
+    .await?;
+    resolve_npm_version(&metadata, requested.unwrap_or("latest"))
+}
+
+async fn fetch_npm_package(
+    package_name: &str,
+    requested: Option<&str>,
+    registry: &str,
+) -> Result<DownloadedNpmPackage> {
+    let registry = registry.trim().trim_end_matches('/');
+    let requested_name = canonical_provider_package_name(package_name);
+    let requested = requested.unwrap_or("latest");
+    let client = reqwest::Client::new();
+    let metadata = fetch_npm_metadata(&client, registry, &requested_name).await?;
+    let version = resolve_npm_version(&metadata, requested)?;
+    let package = metadata.versions.get(&version).with_context(|| {
+        format!(
+            "npm package '{}' metadata is missing version '{version}'",
+            metadata.name
+        )
+    })?;
+
+    if let Some(platform) =
+        resolve_optional_platform_package(&client, registry, &metadata.name, package).await?
+    {
+        let platform_metadata = fetch_npm_metadata(&client, registry, &platform.name).await?;
+        let platform_version = resolve_npm_version(&platform_metadata, &platform.version)?;
+        let platform_package = platform_metadata
+            .versions
+            .get(&platform_version)
+            .with_context(|| {
+                format!(
+                    "npm package '{}' metadata is missing version '{platform_version}'",
+                    platform_metadata.name
+                )
+            })?;
+        let data = download_npm_package(&client, platform_package).await?;
+        return Ok(DownloadedNpmPackage {
+            description: format!(
+                "{}@{} -> {}@{}",
+                metadata.name, version, platform_metadata.name, platform_version
+            ),
+            package_name: metadata.name,
+            version,
+            data,
+        });
+    }
+
+    if !npm_package_version_matches_current_platform(package) {
+        bail!(
+            "npm package '{}@{}' does not support this platform ({} / {})",
+            metadata.name,
+            version,
+            npm_current_os(),
+            npm_current_cpu()
+        );
+    }
+
+    let data = download_npm_package(&client, package).await?;
+    Ok(DownloadedNpmPackage {
+        description: format!("{}@{}", metadata.name, version),
+        package_name: metadata.name,
+        version,
+        data,
+    })
+}
+
+async fn fetch_npm_metadata(
+    client: &reqwest::Client,
+    registry: &str,
+    name: &str,
+) -> Result<NpmPackageMetadata> {
+    let metadata_url = format!("{registry}/{}", npm_package_url_name(name));
+    client
         .get(&metadata_url)
         .send()
         .await
@@ -2711,21 +3344,81 @@ async fn fetch_npm_package(command: &ProviderInstallCommand) -> Result<Downloade
         .with_context(|| format!("npm registry returned an error for {metadata_url}"))?
         .json::<NpmPackageMetadata>()
         .await
-        .with_context(|| format!("failed to parse npm registry metadata for {name}"))?;
+        .with_context(|| format!("failed to parse npm registry metadata for {name}"))
+}
 
-    let requested = command.version.as_deref().unwrap_or("latest");
-    let version = metadata
+fn resolve_npm_version(metadata: &NpmPackageMetadata, requested: &str) -> Result<String> {
+    let requested = requested.trim();
+    if requested == "*" {
+        return metadata
+            .dist_tags
+            .get("latest")
+            .cloned()
+            .with_context(|| format!("npm package '{}' has no latest dist-tag", metadata.name));
+    }
+    let normalized = requested
+        .strip_prefix('v')
+        .or_else(|| requested.strip_prefix('='))
+        .or_else(|| requested.strip_prefix('^'))
+        .or_else(|| requested.strip_prefix('~'))
+        .unwrap_or(requested);
+    metadata
         .versions
-        .get(requested)
-        .map(|_| requested.to_owned())
+        .get(normalized)
+        .map(|_| normalized.to_owned())
         .or_else(|| metadata.dist_tags.get(requested).cloned())
         .with_context(|| {
-            format!("npm package '{name}' has no version or dist-tag '{requested}'")
-        })?;
-    let package = metadata
-        .versions
-        .get(&version)
-        .with_context(|| format!("npm package '{name}' metadata is missing version '{version}'"))?;
+            format!(
+                "npm package '{}' has no version or dist-tag '{requested}'",
+                metadata.name
+            )
+        })
+}
+
+struct OptionalPlatformPackage {
+    name: String,
+    version: String,
+}
+
+async fn resolve_optional_platform_package(
+    client: &reqwest::Client,
+    registry: &str,
+    root_name: &str,
+    package: &NpmPackageVersion,
+) -> Result<Option<OptionalPlatformPackage>> {
+    for (dependency, version) in &package.optional_dependencies {
+        if !is_probable_provider_platform_package(root_name, dependency) {
+            continue;
+        }
+        let metadata = fetch_npm_metadata(client, registry, dependency).await?;
+        let resolved_version = resolve_npm_version(&metadata, version)?;
+        let Some(candidate) = metadata.versions.get(&resolved_version) else {
+            continue;
+        };
+        if npm_package_version_matches_current_platform(candidate) {
+            return Ok(Some(OptionalPlatformPackage {
+                name: metadata.name,
+                version: resolved_version,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn is_probable_provider_platform_package(root_name: &str, dependency: &str) -> bool {
+    dependency.starts_with(&format!("{root_name}-"))
+        || dependency
+            .rsplit_once('/')
+            .map(|(_, name)| {
+                name.starts_with(&format!("{}-", provider_id_from_package_name(root_name)))
+            })
+            .unwrap_or(false)
+}
+
+async fn download_npm_package(
+    client: &reqwest::Client,
+    package: &NpmPackageVersion,
+) -> Result<Vec<u8>> {
     let bytes = client
         .get(&package.dist.tarball)
         .send()
@@ -2747,10 +3440,16 @@ async fn fetch_npm_package(command: &ProviderInstallCommand) -> Result<Downloade
         verify_npm_integrity(&bytes, integrity)?;
     }
 
-    Ok(DownloadedNpmPackage {
-        description: format!("{name}@{version}"),
-        data: bytes,
-    })
+    Ok(bytes)
+}
+
+fn canonical_provider_package_name(name: &str) -> String {
+    let name = name.trim();
+    if name.starts_with('@') {
+        name.to_owned()
+    } else {
+        format!("@{DEFAULT_PROVIDER_SCOPE}/{name}")
+    }
 }
 
 fn npm_package_url_name(name: &str) -> String {
@@ -2758,6 +3457,63 @@ fn npm_package_url_name(name: &str) -> String {
         format!("{}%2F{}", scope, package)
     } else {
         name.to_owned()
+    }
+}
+
+fn provider_id_from_package_name(name: &str) -> &str {
+    name.rsplit_once('/').map(|(_, name)| name).unwrap_or(name)
+}
+
+fn npm_package_version_matches_current_platform(package: &NpmPackageVersion) -> bool {
+    npm_list_allows(&package.os, npm_current_os())
+        && npm_list_allows(&package.cpu, npm_current_cpu())
+}
+
+fn npm_list_allows(values: &[String], current: &str) -> bool {
+    if values.iter().any(|value| value == &format!("!{current}")) {
+        return false;
+    }
+    let positives = values
+        .iter()
+        .filter(|value| !value.starts_with('!'))
+        .collect::<Vec<_>>();
+    positives.is_empty() || positives.iter().any(|value| value.as_str() == current)
+}
+
+fn npm_current_os() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(windows) {
+        "win32"
+    } else {
+        std::env::consts::OS
+    }
+}
+
+fn npm_current_cpu() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x64",
+        "x86" => "ia32",
+        other => other,
+    }
+}
+
+fn provider_install_metadata(
+    source: ProviderInstallSourceKind,
+    package: Option<String>,
+    registry: Option<String>,
+    version: Option<String>,
+) -> ProviderInstallMetadata {
+    ProviderInstallMetadata {
+        source,
+        package,
+        registry,
+        version,
+        installed_at_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0),
     }
 }
 
@@ -2793,6 +3549,7 @@ fn finish_provider_install(
     providers_dir: &Path,
     staging: &Path,
     manifest: ProviderPackageManifest,
+    metadata: &ProviderInstallMetadata,
 ) -> Result<(InstalledProvider, PathBuf)> {
     let final_path = providers_dir.join(&manifest.id);
     if final_path.exists() {
@@ -2818,11 +3575,33 @@ fn finish_provider_install(
         )
     })?;
     ensure_provider_command_executable(&final_path, &manifest)?;
+    write_provider_install_metadata(&final_path, metadata)?;
     let installed = InstalledProvider {
         root: final_path.clone(),
         manifest,
+        install_metadata: Some(metadata.clone()),
     };
     Ok((installed, final_path))
+}
+
+fn write_provider_install_metadata(root: &Path, metadata: &ProviderInstallMetadata) -> Result<()> {
+    let content = serde_json::to_string_pretty(metadata)?;
+    fs::write(
+        root.join(PROVIDER_INSTALL_METADATA_FILE),
+        format!("{content}\n"),
+    )
+    .with_context(|| {
+        format!(
+            "failed to write provider install metadata in {}",
+            root.display()
+        )
+    })
+}
+
+fn read_provider_install_metadata(root: &Path) -> Option<ProviderInstallMetadata> {
+    fs::read_to_string(root.join(PROVIDER_INSTALL_METADATA_FILE))
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
 }
 
 fn ensure_provider_command_executable(
@@ -2910,6 +3689,10 @@ fn unpack_provider_tgz(data: &[u8], staging: &Path) -> Result<()> {
             continue;
         }
         let target = staging.join(relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create directory {}", parent.display()))?;
+        }
         entry
             .unpack(&target)
             .with_context(|| format!("failed to unpack provider file {}", target.display()))?;
@@ -3085,6 +3868,10 @@ fn gather_provider_list_report(cli: &Cli) -> Result<ProviderListReport> {
             built_in: builtin_provider_profile(&name).is_some(),
             installed: installed_provider.is_some(),
             install_path: installed_provider.map(|provider| provider.root.display().to_string()),
+            installed_version: installed_provider
+                .and_then(|provider| provider.manifest.version.clone()),
+            source_package: installed_provider
+                .and_then(|provider| provider.source_package().map(ToOwned::to_owned)),
             selected: current.as_deref() == Some(name.as_str()),
             model: report.model,
             batch_file: report
@@ -3172,6 +3959,12 @@ fn print_provider_list_text(report: &ProviderListReport) {
         println!("    Batch file: {}", yes_no(provider.batch_file));
         println!("    Live: {}", yes_no(provider.live));
         println!("    Local config ok: {}", yes_no(provider.local_config_ok));
+        if let Some(version) = &provider.installed_version {
+            println!("    Installed version: {version}");
+        }
+        if let Some(package) = &provider.source_package {
+            println!("    Package: {package}");
+        }
         if let Some(path) = &provider.install_path {
             println!("    Installed at: {path}");
         }
@@ -4158,6 +4951,7 @@ fn installed_providers(cli: &Cli) -> Result<BTreeMap<String, InstalledProvider>>
         providers.insert(
             manifest.id.clone(),
             InstalledProvider {
+                install_metadata: read_provider_install_metadata(&provider_root),
                 root: provider_root,
                 manifest,
             },
@@ -4204,6 +4998,17 @@ fn write_active_provider_name(cli: &Cli, name: &str) -> Result<()> {
     let content = serde_json::to_string_pretty(&state)?;
     std::fs::write(&path, format!("{content}\n"))
         .with_context(|| format!("failed to write provider state to {}", path.display()))
+}
+
+fn clear_active_provider_name(cli: &Cli) -> Result<()> {
+    let Some(path) = provider_state_path(cli) else {
+        return Ok(());
+    };
+    if path.exists() {
+        fs::remove_file(&path)
+            .with_context(|| format!("failed to remove provider state {}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn builtin_provider_profile(name: &str) -> Option<ProviderProfile> {
@@ -4911,6 +5716,58 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    fn write_test_provider_source(root: &Path, id: &str, version: &str) {
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(
+            root.join("provider.toml"),
+            format!(
+                r#"
+id = "{id}"
+name = "Test ASR"
+version = "{version}"
+protocol = "dicta-provider-jsonl-v1"
+command = "bin/{id}"
+model = "{id}"
+notes = ["Installed from a local directory."]
+
+[batch]
+file = true
+streaming = false
+requires_network = false
+
+[live]
+mode = "chunked"
+mic = true
+finalized_results = true
+expected_latency_ms = 5000
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(root.join("bin").join(id), "#!/bin/sh\nexit 0\n").unwrap();
+    }
+
+    fn test_installed_provider(
+        id: &str,
+        install_metadata: Option<ProviderInstallMetadata>,
+    ) -> InstalledProvider {
+        InstalledProvider {
+            root: temp_test_dir("dicta-installed-provider"),
+            manifest: ProviderPackageManifest {
+                id: id.to_owned(),
+                name: Some("Test ASR".to_owned()),
+                version: Some("0.1.0".to_owned()),
+                protocol: PROVIDER_PROTOCOL.to_owned(),
+                command: PathBuf::from(format!("bin/{id}")),
+                model: Some(id.to_owned()),
+                batch: ProviderBatchManifest::default(),
+                live: None,
+                notes: Vec::new(),
+            },
+            install_metadata,
+        }
     }
 
     #[test]
@@ -5811,32 +6668,7 @@ live_enabled = false
     async fn provider_install_copies_local_provider_without_node_modules() {
         let source = temp_test_dir("dicta-provider-source");
         let provider_dir = temp_test_dir("dicta-provider-install");
-        std::fs::create_dir_all(source.join("bin")).unwrap();
-        std::fs::write(
-            source.join("provider.toml"),
-            r#"
-id = "local-asr"
-name = "Local ASR"
-version = "0.1.0"
-protocol = "dicta-provider-jsonl-v1"
-command = "bin/local-asr"
-model = "local-asr"
-notes = ["Installed from a local directory."]
-
-[batch]
-file = true
-streaming = false
-requires_network = false
-
-[live]
-mode = "chunked"
-mic = true
-finalized_results = true
-expected_latency_ms = 5000
-"#,
-        )
-        .unwrap();
-        std::fs::write(source.join("bin/local-asr"), "#!/bin/sh\nexit 0\n").unwrap();
+        write_test_provider_source(&source, "local-asr", "0.1.0");
 
         let cli = Cli {
             provider_dir: Some(provider_dir.clone()),
@@ -5853,7 +6685,18 @@ expected_latency_ms = 5000
         let installed_root = provider_dir.join("local-asr");
         assert!(installed_root.join("provider.toml").is_file());
         assert!(installed_root.join("bin/local-asr").is_file());
+        assert!(
+            installed_root
+                .join(PROVIDER_INSTALL_METADATA_FILE)
+                .is_file()
+        );
         assert!(!provider_dir.join("node_modules").exists());
+
+        let metadata = read_provider_install_metadata(&installed_root).unwrap();
+        assert_eq!(metadata.source, ProviderInstallSourceKind::Directory);
+        assert_eq!(metadata.package, None);
+        assert_eq!(metadata.registry, None);
+        assert_eq!(metadata.version, None);
 
         let report = gather_provider_list_report(&cli).unwrap();
         let installed = report
@@ -5865,10 +6708,141 @@ expected_latency_ms = 5000
         assert!(!installed.built_in);
         assert_eq!(installed.kind, "external");
         assert_eq!(installed.model, "local-asr");
+        assert_eq!(installed.installed_version.as_deref(), Some("0.1.0"));
+        assert_eq!(installed.source_package, None);
         assert!(installed.live);
 
         let _ = std::fs::remove_dir_all(source);
         let _ = std::fs::remove_dir_all(provider_dir);
+    }
+
+    #[test]
+    fn provider_remove_deletes_installed_provider_and_clears_active_state() {
+        let source_dir = temp_test_dir("dicta-provider-source");
+        let provider_dir = temp_test_dir("dicta-provider-install");
+        let state = temp_provider_state_path();
+        write_test_provider_source(&source_dir, "local-asr", "0.1.0");
+
+        let cli = Cli {
+            provider_dir: Some(provider_dir.clone()),
+            provider_state: Some(state.clone()),
+            ..test_cli()
+        };
+        let source = ProviderInstallSource {
+            description: source_dir.display().to_string(),
+            package: ProviderInstallPackage::Directory(source_dir.clone()),
+            metadata: provider_install_metadata(
+                ProviderInstallSourceKind::Directory,
+                None,
+                None,
+                None,
+            ),
+        };
+        install_provider_from_source(&cli, source, false).unwrap();
+        write_active_provider_name(&cli, "local-asr").unwrap();
+
+        run_provider_remove(
+            &cli,
+            &ProviderRemoveCommand {
+                name: "local-asr".to_owned(),
+                yes: true,
+            },
+        )
+        .unwrap();
+
+        assert!(!provider_dir.join("local-asr").exists());
+        assert_eq!(read_active_provider_name(&cli).unwrap(), None);
+
+        let _ = std::fs::remove_dir_all(source_dir);
+        let _ = std::fs::remove_dir_all(provider_dir);
+        let _ = std::fs::remove_file(state);
+    }
+
+    #[test]
+    fn provider_update_uses_npm_metadata_and_skips_local_sources() {
+        let npm_provider = test_installed_provider(
+            "qianwenime-asr",
+            Some(provider_install_metadata(
+                ProviderInstallSourceKind::Npm,
+                Some("@dicta-asr/qianwenime-asr".to_owned()),
+                Some(DEFAULT_NPM_REGISTRY.to_owned()),
+                Some("0.1.0".to_owned()),
+            )),
+        );
+        let local_provider = test_installed_provider(
+            "local-asr",
+            Some(provider_install_metadata(
+                ProviderInstallSourceKind::Directory,
+                None,
+                None,
+                None,
+            )),
+        );
+        let legacy_provider = test_installed_provider("doubaoime-asr", None);
+
+        assert_eq!(
+            provider_update_package(&npm_provider).as_deref(),
+            Some("@dicta-asr/qianwenime-asr")
+        );
+        assert_eq!(provider_update_package(&local_provider), None);
+        assert_eq!(
+            provider_update_package(&legacy_provider).as_deref(),
+            Some("@dicta-asr/doubaoime-asr")
+        );
+    }
+
+    #[test]
+    fn provider_package_names_use_logical_scope_and_npm_platform_terms() {
+        assert_eq!(
+            canonical_provider_package_name("qianwenime-asr"),
+            "@dicta-asr/qianwenime-asr"
+        );
+        assert_eq!(
+            canonical_provider_package_name("@dicta-asr/qianwenime-asr"),
+            "@dicta-asr/qianwenime-asr"
+        );
+        assert_eq!(
+            provider_id_from_package_name("@dicta-asr/qianwenime-asr"),
+            "qianwenime-asr"
+        );
+        assert!(is_probable_provider_platform_package(
+            "@dicta-asr/qianwenime-asr",
+            "@dicta-asr/qianwenime-asr-darwin-arm64"
+        ));
+        assert!(!is_probable_provider_platform_package(
+            "@dicta-asr/qianwenime-asr",
+            "@dicta-asr/other-asr-darwin-arm64"
+        ));
+        assert_ne!(npm_current_os(), "macos");
+        assert_ne!(npm_current_cpu(), "aarch64");
+    }
+
+    #[test]
+    fn npm_platform_constraints_follow_current_platform() {
+        let current_os = npm_current_os().to_owned();
+        let current_cpu = npm_current_cpu().to_owned();
+
+        assert!(npm_list_allows(&[], &current_os));
+        assert!(npm_list_allows(
+            std::slice::from_ref(&current_os),
+            &current_os
+        ));
+        assert!(!npm_list_allows(&[format!("!{current_os}")], &current_os));
+        assert!(!npm_list_allows(
+            &["definitely-other".to_owned()],
+            &current_os
+        ));
+
+        let package = NpmPackageVersion {
+            os: vec![current_os],
+            cpu: vec![current_cpu],
+            optional_dependencies: BTreeMap::new(),
+            dist: NpmPackageDist {
+                tarball: "https://registry.npmjs.org/example/-/example.tgz".to_owned(),
+                integrity: None,
+            },
+        };
+        assert!(npm_package_version_matches_current_platform(&package));
     }
 
     #[test]
