@@ -1,0 +1,11 @@
+[package]
+name = "dicta-asr"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+thiserror.workspace = true
+dicta-core.workspace = true

@@ -6,7 +6,7 @@ transcription calls. It does not run a backend and does not require WASM.
 The important file is:
 
 ```text
-web/direct/vo-transcriber.js
+web/direct/dicta-transcriber.js
 ```
 
 `web/direct/index.html` is a static demo that shows the same module used as a
@@ -20,7 +20,7 @@ $ python3 -m http.server 8765
 $ open http://127.0.0.1:8765/web/direct/
 ```
 
-This is only for loading browser assets; it is not a `vo` backend and it does
+This is only for loading browser assets; it is not a `dicta` backend and it does
 not proxy or store API keys. A local server also avoids browser-specific
 `file://` restrictions for ES module loading.
 
@@ -53,7 +53,7 @@ Authorization: Bearer <api key>
 Use `transcribeAudio` when your app already has a `Blob` or `File`.
 
 ```js
-import { transcribeAudio } from "./vo-transcriber.js";
+import { transcribeAudio } from "./dicta-transcriber.js";
 
 const result = await transcribeAudio(audioBlob, {
   apiBase: "https://api.example.com",
@@ -74,13 +74,13 @@ Web Speech API is unavailable. Its extension point is:
 onAudioRecorded?: (audioBlob: Blob) => Promise<string>
 ```
 
-`createVoAudioRecordedHandler` matches that shape directly:
+`createDictaAudioRecordedHandler` matches that shape directly:
 
 ```tsx
 import { SpeechInput } from "@/components/ai-elements/speech-input";
-import { createVoAudioRecordedHandler } from "./vo-transcriber.js";
+import { createDictaAudioRecordedHandler } from "./dicta-transcriber.js";
 
-const transcribeWithVo = createVoAudioRecordedHandler({
+const transcribeWithDicta = createDictaAudioRecordedHandler({
   apiBase: "https://api.example.com",
   apiKey: "...",
   model: "doubao-asr",
@@ -91,7 +91,7 @@ export function Composer() {
   return (
     <SpeechInput
       lang="zh-CN"
-      onAudioRecorded={transcribeWithVo}
+      onAudioRecorded={transcribeWithDicta}
       onTranscriptionChange={(text) => setInput(text)}
     />
   );
@@ -103,28 +103,28 @@ memoize it when config comes from state:
 
 ```tsx
 const onAudioRecorded = useMemo(
-  () => createVoAudioRecordedHandler({ apiBase, apiKey, model, language }),
+  () => createDictaAudioRecordedHandler({ apiBase, apiKey, model, language }),
   [apiBase, apiKey, model, language]
 );
 ```
 
 ## Web Component
 
-Importing the module registers `<vo-speech-recorder>` automatically.
+Importing the module registers `<dicta-speech-recorder>` automatically.
 
 ```html
-<script type="module" src="./vo-transcriber.js"></script>
+<script type="module" src="./dicta-transcriber.js"></script>
 
-<vo-speech-recorder
+<dicta-speech-recorder
   api-base="https://api.example.com"
   api-key="..."
   model="doubao-asr"
   language="zh-CN"
-></vo-speech-recorder>
+></dicta-speech-recorder>
 
 <script>
-  document.querySelector("vo-speech-recorder").addEventListener(
-    "vo-transcription",
+  document.querySelector("dicta-speech-recorder").addEventListener(
+    "dicta-transcription",
     (event) => {
       console.log(event.detail.text);
     }
@@ -135,12 +135,12 @@ Importing the module registers `<vo-speech-recorder>` automatically.
 The custom element emits:
 
 ```text
-vo-recording-start
-vo-audio-recorded
-vo-transcription-start
-vo-transcription
-vo-error
-vo-state-change
+dicta-recording-start
+dicta-audio-recorded
+dicta-transcription-start
+dicta-transcription
+dicta-error
+dicta-state-change
 ```
 
 ## Constraints
@@ -159,6 +159,6 @@ vo-state-change
 For public deployments, add a server-side gateway later and keep provider keys
 on the server.
 
-For a WASM-backed web shell, use `crates/vo-web`. It exposes the same direct
+For a WASM-backed web shell, use `crates/dicta-web`. It exposes the same direct
 provider contract plus browser microphone recording and browser-side config
-storage while sharing `vo-core` transcript data. See [web-wasm.md](web-wasm.md).
+storage while sharing `dicta-core` transcript data. See [web-wasm.md](web-wasm.md).

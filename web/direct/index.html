@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>vo speech integration</title>
+  <title>dicta speech integration</title>
   <link rel="icon" href="data:,">
   <style>
     :root {
@@ -143,7 +143,7 @@
     input:focus-visible,
     textarea:focus-visible,
     button:focus-visible,
-    vo-speech-recorder:focus-visible {
+    dicta-speech-recorder:focus-visible {
       outline: 3px solid color-mix(in oklch, var(--accent) 34%, transparent);
       outline-offset: 2px;
     }
@@ -172,13 +172,13 @@
       justify-content: space-between;
     }
 
-    vo-speech-recorder {
-      --vo-bg: var(--field);
-      --vo-ink: var(--ink);
-      --vo-muted: var(--muted);
-      --vo-line: var(--line);
-      --vo-accent: var(--accent);
-      --vo-danger: var(--danger);
+    dicta-speech-recorder {
+      --dicta-bg: var(--field);
+      --dicta-ink: var(--ink);
+      --dicta-muted: var(--muted);
+      --dicta-line: var(--line);
+      --dicta-accent: var(--accent);
+      --dicta-danger: var(--danger);
     }
 
     .status {
@@ -265,7 +265,7 @@
 <body>
   <main>
     <header>
-      <span class="eyebrow">vo web integration</span>
+      <span class="eyebrow">dicta web integration</span>
       <h1>Recorder UI outside, transcription adapter inside.</h1>
       <p>
         Use the same browser module as a Web Component, a React handler for
@@ -304,7 +304,7 @@
       <article class="panel">
         <div class="component-host">
           <div class="component-row">
-            <vo-speech-recorder id="recorder" max-seconds="60"></vo-speech-recorder>
+            <dicta-speech-recorder id="recorder" max-seconds="60"></dicta-speech-recorder>
             <button id="copy" type="button">Copy transcript</button>
           </div>
           <div id="status" class="status" role="status" aria-live="polite">Ready</div>
@@ -315,9 +315,9 @@
           <details open>
             <summary>AI Elements SpeechInput</summary>
             <pre><code>import { SpeechInput } from "@/components/ai-elements/speech-input";
-import { createVoAudioRecordedHandler } from "./vo-transcriber.js";
+import { createDictaAudioRecordedHandler } from "./dicta-transcriber.js";
 
-const transcribeWithVo = createVoAudioRecordedHandler({
+const transcribeWithDicta = createDictaAudioRecordedHandler({
   apiBase: "https://api.example.com",
   apiKey: "...",
   model: "doubao-asr",
@@ -327,7 +327,7 @@ const transcribeWithVo = createVoAudioRecordedHandler({
 export function Composer() {
   return (
     &lt;SpeechInput
-      onAudioRecorded={transcribeWithVo}
+      onAudioRecorded={transcribeWithDicta}
       onTranscriptionChange={(text) =&gt; setInput(text)}
     /&gt;
   );
@@ -336,18 +336,18 @@ export function Composer() {
 
           <details>
             <summary>Web Component</summary>
-            <pre><code>&lt;script type="module" src="./vo-transcriber.js"&gt;&lt;/script&gt;
+            <pre><code>&lt;script type="module" src="./dicta-transcriber.js"&gt;&lt;/script&gt;
 
-&lt;vo-speech-recorder
+&lt;dicta-speech-recorder
   api-base="https://api.example.com"
   api-key="..."
   model="doubao-asr"
   language="zh-CN"
-&gt;&lt;/vo-speech-recorder&gt;
+&gt;&lt;/dicta-speech-recorder&gt;
 
 &lt;script&gt;
-  document.querySelector("vo-speech-recorder")
-    .addEventListener("vo-transcription", (event) =&gt; {
+  document.querySelector("dicta-speech-recorder")
+    .addEventListener("dicta-transcription", (event) =&gt; {
       console.log(event.detail.text);
     });
 &lt;/script&gt;</code></pre>
@@ -355,7 +355,7 @@ export function Composer() {
 
           <details>
             <summary>Plain JavaScript</summary>
-            <pre><code>import { transcribeAudio } from "./vo-transcriber.js";
+            <pre><code>import { transcribeAudio } from "./dicta-transcriber.js";
 
 const result = await transcribeAudio(audioBlob, {
   apiBase: "https://api.example.com",
@@ -371,7 +371,7 @@ console.log(result.text);</code></pre>
   </main>
 
   <script type="module">
-    import { transcribeAudio } from "./vo-transcriber.js";
+    import { transcribeAudio } from "./dicta-transcriber.js";
 
     const form = document.querySelector("#configForm");
     const recorder = document.querySelector("#recorder");
@@ -413,7 +413,7 @@ console.log(result.text);</code></pre>
     form.addEventListener("submit", (event) => event.preventDefault());
     syncRecorderAttributes();
 
-    recorder.addEventListener("vo-state-change", (event) => {
+    recorder.addEventListener("dicta-state-change", (event) => {
       const state = event.detail.state;
       const labels = {
         idle: "Ready",
@@ -426,13 +426,13 @@ console.log(result.text);</code></pre>
       status.textContent = labels[state] || state;
     });
 
-    recorder.addEventListener("vo-transcription", (event) => {
+    recorder.addEventListener("dicta-transcription", (event) => {
       result.classList.remove("error");
       result.textContent = event.detail.text || "(empty transcript)";
       status.textContent = `${event.detail.audio?.name || "audio"} · ${((event.detail.durationMs || 0) / 1000).toFixed(1)}s`;
     });
 
-    recorder.addEventListener("vo-error", (event) => {
+    recorder.addEventListener("dicta-error", (event) => {
       result.classList.add("error");
       result.textContent = event.detail.message;
     });

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the Rust workspace checks for the cross-platform vo CLI.
+# Run the Rust workspace checks for the cross-platform dicta CLI.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

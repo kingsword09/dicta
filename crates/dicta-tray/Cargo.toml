@@ -1,0 +1,41 @@
+[package]
+name = "dicta-tray"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "dicta-tray"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tao.workspace = true
+# wry 0.55 pulls cookie 0.18.1, which does not compile with time 0.3.52.
+time.workspace = true
+tray-icon.workspace = true
+wry.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.4", default-features = false, features = ["std"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "objc2-core-foundation",
+    "NSColor",
+    "NSGlassEffectView",
+    "NSResponder",
+    "NSView",
+    "NSWindow",
+] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSGeometry",
+    "NSObject",
+] }
+objc2-web-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "WKWebView",
+] }

@@ -36,11 +36,11 @@ VERSION="$VERSION" perl -0pi -e '
 
 VERSION="$VERSION" perl -i -0pe '
     s|(version:\s*")[^"]+|${1}$ENV{VERSION}|;
-' "$ADAPTER/Sources/vo/Vo.swift"
+' "$ADAPTER/Sources/dicta/Dicta.swift"
 
 VERSION="$VERSION" perl -i -0pe '
     s|(<key>CFBundleShortVersionString</key>\s*<string>)[^<]+|${1}$ENV{VERSION}|;
     s|(<key>CFBundleVersion</key>\s*<string>)[^<]+|${1}$ENV{VERSION}|;
 ' "$ADAPTER/Resources/Info.plist"
 
-git add Cargo.lock "$ADAPTER/Sources/vo/Vo.swift" "$ADAPTER/Resources/Info.plist"
+git add Cargo.lock "$ADAPTER/Sources/dicta/Dicta.swift" "$ADAPTER/Resources/Info.plist"
