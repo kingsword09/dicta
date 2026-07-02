@@ -96,6 +96,26 @@ implementation without adding a new backend. Built-in profiles can be selected
 with `--provider`; custom profiles are loaded from `~/.config/vo/providers.toml`
 or `--provider-config` and may use either `api_key_env` or direct `api_key`.
 
+Local OpenAI-compatible ASR server:
+
+```console
+$ vo --provider active serve --cors-origin http://localhost:5173
+$ curl -s http://127.0.0.1:4777/health
+$ curl -s \
+    -F file=@meeting.wav \
+    -F model=vo \
+    -F language=zh \
+    http://127.0.0.1:4777/v1/audio/transcriptions
+```
+
+`vo serve` exposes the selected provider through
+`POST /v1/audio/transcriptions` for local projects that want to use `fetch`,
+OpenAI-style multipart uploads, or a small backend gateway. It accepts `file`,
+`model`, `language`, `prompt`, and `response_format=json|text`. Use `model=vo`
+or `model=default` to keep the server's configured provider model. Streaming,
+timestamp granularities, SRT/VTT, and verbose JSON are intentionally not
+advertised until a provider capability can back them.
+
 Apple on-device mode requires macOS 26 and an Apple Speech adapter:
 
 ```console

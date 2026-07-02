@@ -19,6 +19,19 @@ target/debug/vo --help
 target/debug/vo --doctor
 ```
 
+`vo serve` exposes the selected batch ASR provider as a local
+OpenAI-compatible HTTP API:
+
+```bash
+target/debug/vo --provider active serve --host 127.0.0.1 --port 4777
+```
+
+It serves `GET /health`, `GET /v1/models`, and
+`POST /v1/audio/transcriptions` with multipart `file`, `model`, `language`,
+`prompt`, and `response_format=json|text`. Keep this a thin adapter over the
+existing provider orchestration; do not move provider protocol logic into the
+HTTP layer.
+
 The Rust code is organized as:
 
 | Path | Role |
@@ -55,6 +68,11 @@ vo --input PATH
    [--json]
    [--transcript PATH]
    [--doctor]
+vo serve
+   [--host HOST]
+   [--port PORT]
+   [--cors-origin ORIGIN]
+   [--max-upload-mb MIB]
 ```
 
 `--input` and `--mic-duration` are mutually exclusive. Microphone mode records
@@ -69,6 +87,12 @@ Apple and Doubao.
 prints system, backend-resolution, API-config, default-input, Apple on-device
 support, and runtime diagnostics. With `--json`, it emits a single
 pretty-printed JSON object.
+
+`serve` bypasses CLI audio-source validation and does not enter live mode. It
+accepts OpenAI-compatible multipart batch transcription requests and returns
+OpenAI-style JSON errors. It is intentionally batch-only: streaming,
+timestamps, verbose JSON, SRT, and VTT should remain unsupported unless a
+provider capability can supply those results honestly.
 
 `--transcript PATH` writes the single finalized result after the provider
 returns. With `--json`, it writes one JSONL event plus a trailing newline.
@@ -136,8 +160,8 @@ transcription adapter.
 ## Design Principles
 
 - KISS: prefer direct provider calls over local sidecars or extra services.
-- YAGNI: do not add web server, WASM, plugin loading, or live audio abstractions
-  before the current CLI path needs them.
+- YAGNI: do not add broader web server features, plugin loading, or live audio
+  abstractions before the current CLI/server path needs them.
 - DRY: shared schemas and provider contracts belong in `vo-core` and `vo-asr`.
 - SOLID: provider protocol code, CLI orchestration, rendering, audio capture, and
   platform-specific adapters should stay separated. Keep Apple-specific behavior
