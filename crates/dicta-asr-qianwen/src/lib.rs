@@ -4,7 +4,7 @@ use dicta_asr::{
     LiveCapabilities, LiveEventCallback, LiveModeKind, ProviderCapabilities, Transcript,
 };
 use dicta_core::AudioInput;
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 use dicta_core::LiveStatusEvent;
 #[cfg(unix)]
 use dicta_core::{
@@ -13,7 +13,7 @@ use dicta_core::{
 };
 #[cfg(unix)]
 use libloading::{Library, Symbol};
-#[cfg(unix)]
+#[cfg(any(unix, test))]
 use serde::Deserialize;
 #[cfg(any(unix, test))]
 use serde_json::Value;
@@ -1333,6 +1333,7 @@ fn qianwen_embedded_runtime_path_from_host(host: &Path) -> PathBuf {
         .join(DEFAULT_EMBEDDED_RUNTIME_NAME)
 }
 
+#[cfg(any(unix, test))]
 fn qianwen_unet_runtime_path_from_host(host: &Path) -> PathBuf {
     host.join("Frameworks").join(DEFAULT_UNET_RUNTIME_NAME)
 }
@@ -1452,6 +1453,7 @@ fn now_millis() -> u128 {
         .unwrap_or(0)
 }
 
+#[cfg(any(unix, test))]
 fn non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
@@ -1568,6 +1570,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
     #[test]
     fn qianwen_settings_injects_default_microphone() {
         let mut settings = serde_json::Map::new();
@@ -1648,6 +1651,11 @@ mod tests {
         }))
         .unwrap();
 
+        assert_eq!(
+            entry.id.as_deref(),
+            Some("0c820e1b-4b65-4457-8d93-237de9cb5c16")
+        );
+        assert_eq!(entry.created_at_ms, Some(1782981137844));
         assert_eq!(entry.final_text().as_deref(), Some("今天星期几？"));
     }
 }

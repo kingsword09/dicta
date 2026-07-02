@@ -682,7 +682,7 @@ fn create_panel(
     proxy: tao::event_loop::EventLoopProxy<UserEvent>,
     app: &TrayApp,
 ) -> Result<Panel> {
-    let mut window_builder = WindowBuilder::new()
+    let window_builder = WindowBuilder::new()
         .with_title("dicta")
         .with_visible(false)
         .with_decorations(false)
@@ -693,9 +693,7 @@ fn create_panel(
         .with_background_color((0, 0, 0, 0))
         .with_inner_size(LogicalSize::new(PANEL_WIDTH, PANEL_HEIGHT));
     #[cfg(target_os = "macos")]
-    {
-        window_builder = window_builder.with_has_shadow(false);
-    }
+    let window_builder = window_builder.with_has_shadow(false);
     let window = window_builder
         .build(target)
         .context("panel window build failed")?;

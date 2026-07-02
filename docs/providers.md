@@ -300,7 +300,7 @@ Provider packages can live outside this repository and be installed with:
 ```console
 $ dicta provider install ./doubaoime-asr-0.1.0.tgz
 $ dicta provider install ./qianwenime-asr
-$ dicta provider install qianwenime-asr --registry https://registry.npmjs.org
+$ dicta provider install @dicta-asr/qianwenime-asr --registry https://registry.npmjs.org
 ```
 
 The installer treats npm as a tarball registry only. It queries metadata,
