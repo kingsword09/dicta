@@ -34,6 +34,9 @@ Expected response:
 
 `language` in the response is accepted when present.
 
+For a step-by-step profile setup guide, see
+[openai-compatible-provider.md](openai-compatible-provider.md).
+
 ## Local OpenAI-compatible server
 
 `dicta serve` exposes the currently selected Rust provider as an OpenAI-compatible

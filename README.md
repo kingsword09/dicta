@@ -1,8 +1,14 @@
 # dicta
 
 `dicta` is a Rust-first transcription toolkit for live and file-based speech
-transcription. It supports Doubao, OpenAI-compatible providers, Apple on-device
-speech on supported macOS systems, and browser integration paths.
+transcription. The default release keeps only portable, redistributable pieces
+in the main CLI and lets provider packages supply private or platform-specific
+ASR runtimes when needed.
+
+Built-in providers cover Apple on-device speech on supported macOS systems,
+Doubao IME ASR, and OpenAI-compatible batch APIs. Additional providers can be
+installed from npm-compatible tarballs without running `npm install` or creating
+`node_modules`.
 
 ## Install
 
@@ -30,6 +36,43 @@ $ dicta uninstall --yes
 `--install-dir` or `DICTA_INSTALL_DIR` is set. `dicta uninstall` removes `dicta`,
 `dicta-tray`, and bundled adapter binaries from that install directory. User
 configuration under `~/.config/dicta` is left in place.
+
+## Providers
+
+List built-in, configured, and installed providers:
+
+```console
+$ dicta provider list
+$ dicta provider current
+$ dicta --capabilities --provider active
+```
+
+Discover and install external provider packages:
+
+```console
+$ dicta provider available
+$ dicta provider install <provider-name>
+$ dicta provider update
+$ dicta provider update <provider-name>
+$ dicta provider remove <provider-name> --yes
+```
+
+Provider packages are downloaded directly from the npm registry as tarballs.
+Bare names resolve to the default `@dicta-asr` scope. `dicta` reads npm
+metadata, selects a matching platform artifact when a provider uses
+`optionalDependencies`, verifies npm integrity when present, and unpacks the
+provider into Dicta's provider directory. It does not run `npm install`, does not
+create `node_modules`, and does not require Node at runtime.
+
+Local provider directories and `.tgz` files are also supported:
+
+```console
+$ dicta provider install ./my-provider
+$ dicta provider install ./my-provider-0.1.0.tgz --force
+```
+
+See [docs/providers.md](docs/providers.md) for provider manifests, process
+protocol details, active-provider state, and custom OpenAI-compatible profiles.
 
 ## Usage
 
@@ -75,25 +118,6 @@ $ dicta --mic-duration 5 \
     --src zh-CN
 ```
 
-Qianwen Shell live transcription:
-
-```console
-$ dicta --asr qianwen \
-    --live \
-    --qianwen-host-bundle-path ../qw \
-    --src zh-CN
-$ DICTA_QIANWEN_HOST_BUNDLE_PATH=/Users/kingsword09/Documents/code/ai/qw \
-    dicta --provider qianwen --live --src zh-CN
-```
-
-Qianwen support loads the local `libQianwenShellEmbedded.dylib` runtime from a
-supplied `qw` bundle. Configure it with `--qianwen-host-bundle-path` or
-`--qianwen-runtime-path`. When the bundle does not expose Qianwen's WSG signing
-library, `dicta` supplies a small local shim backed by `libqianwen_unet_runtime.dylib`.
-Use `--qianwen-wsg-impl-path` only to override that path, or set
-`DICTA_QIANWEN_ASR_QUERY_SIGN` for the runtime's direct ASR query-sign debug hook.
-Batch file transcription is not exposed by this local voice-input runtime.
-
 OpenAI-compatible transcription:
 
 ```console
@@ -114,20 +138,8 @@ Named provider profiles let OpenAI-compatible services share the same Rust
 implementation without adding a new backend. Built-in profiles can be selected
 with `--provider`; custom profiles are loaded from `~/.config/dicta/providers.toml`
 or `--provider-config` and may use either `api_key_env` or direct `api_key`.
-
-Installable provider packages:
-
-```console
-$ dicta provider install ./doubaoime-asr-0.1.0.tgz
-$ dicta provider install ./qianwenime-asr
-$ dicta provider list
-$ dicta provider set qianwenime-asr
-```
-
-`dicta provider install` accepts a local provider directory, a `.tgz`, or an
-npm registry package name. It downloads and unpacks the provider package
-directly into Dicta's provider directory; it does not run `npm install`, does
-not create `node_modules`, and does not require Node at runtime.
+See [docs/openai-compatible-provider.md](docs/openai-compatible-provider.md) for
+a step-by-step provider profile setup guide.
 
 Local OpenAI-compatible ASR server:
 
@@ -211,13 +223,15 @@ $ ./scripts/test-apple-speech-adapter.sh
 ```text
 crates/
   dicta-core/                    shared transcript schema
-  dicta-asr*/                    ASR provider crates
+  dicta-asr/                     provider traits and capability contracts
+  dicta-asr-*/                   provider implementation crates
+  dicta-asr-native-adapter/      JSONL process bridge for native adapters
   dicta-audio/                   microphone recording
   dicta-cli/                     command-line entry point
   dicta-tray/                    Rust status bar provider switcher
   dicta-web/                     browser WASM provider/audio/storage APIs
-web/direct/                   static browser direct-provider tool
-adapters/apple-speech/        macOS 26 Apple Speech adapter
+web/direct/                      static browser direct-provider tool
+adapters/apple-speech/           macOS 26 Apple Speech adapter
 ```
 
 The primary runtime path is Rust. There is no Python sidecar or local FastAPI
@@ -226,13 +240,22 @@ API keys are only appropriate for personal/local workflows.
 
 Provider implementations declare their maximum batch and live capabilities.
 Named profiles can narrow those capabilities for OpenAI-compatible services
-without new Rust code. Apple live is streaming and can emit
-partial/final/translation events. Doubao live is chunked microphone
-transcription with chunk status and finalized text only; use `--capabilities` to
-inspect the resolved provider and `--doctor` for full environment diagnostics.
+without new Rust code. Installed provider packages run as separate processes
+through the same JSONL provider protocol used by the CLI. Apple live is
+streaming and can emit partial/final/translation events. Doubao live is chunked
+microphone transcription with chunk status and finalized text only; use
+`--capabilities` to inspect the resolved provider and `--doctor` for full
+environment diagnostics.
 
 ## License
 
 [MIT License](LICENSE)
 
 This project is MIT licensed.
+
+## Acknowledgements
+
+`dicta` started as `vo` and keeps the same focused spirit: a small transcription
+CLI that stays close to the operating system and avoids unnecessary runtime
+services. It also takes inspiration from [k1LoW/vo](https://github.com/k1LoW/vo),
+especially its focused macOS on-device transcription CLI experience.
