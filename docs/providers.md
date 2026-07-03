@@ -74,100 +74,6 @@ directly. The default bind address is `127.0.0.1:4777`; pass `--cors-origin`
 for browser projects and keep secrets in CLI flags, environment variables, or
 provider profiles on the server side.
 
-## Doubao
-
-`--asr doubao` uses `dicta-asr-doubao`. That crate implements the unofficial
-Doubao IME ASR protocol directly in Rust: it auto-registers a virtual Android
-device, caches credentials, obtains the ASR app key, encodes WAV input as Opus
-frames, and sends protobuf messages over WebSocket.
-
-```console
-$ dicta --input audio.wav \
-    --asr doubao \
-    --src zh-CN
-```
-
-This deliberately replaces the old `doubao_asr_api.py` runtime. No Python,
-FastAPI, or `doubaoime_asr` dependency is required by the Rust CLI.
-
-`--asr auto` also resolves to `doubao` on systems where Apple on-device ASR is
-not available. The provider does not require `--api-base` or `--api-key`.
-
-By default credentials are cached at `~/.config/dicta/doubao-credentials.json`.
-Override that path with `--doubao-credential-path` or provide existing
-credentials with `--doubao-device-id` and `--doubao-token`.
-
-The protocol is not official and may break if Doubao changes its input method
-service. The current Rust provider accepts 16-bit PCM WAV input and resamples it
-to 16 kHz mono before Opus encoding. `--mic-duration` works because the Rust
-audio path records WAV.
-
-Doubao live mode is a chunked live provider: the CLI records short microphone
-chunks, sends each chunk to Doubao, and renders finalized text when a response is
-available. While a chunk is active, the live event stream reports status updates
-such as recording, transcribing, and recoverable chunk failures. It does not
-expose partial results, speaker capture, or translation. Tune chunk size with
-`--live-chunk`, for example:
-
-```console
-$ dicta --asr doubao --src zh-CN --live-chunk 3
-```
-
-## Qianwen Shell runtime
-
-`--asr qianwen` uses `dicta-asr-qianwen`. It loads Qianwen's local
-`libQianwenShellEmbedded.dylib` from a supplied Qianwen IME `qw` bundle and
-drives the same embedded voice-input runtime used by the installed input method.
-
-```console
-$ dicta --asr qianwen \
-    --live \
-    --qianwen-host-bundle-path ../qw \
-    --src zh-CN
-$ DICTA_QIANWEN_HOST_BUNDLE_PATH=/Users/kingsword09/Documents/code/ai/qw \
-    dicta --provider qianwen --live --src zh-CN
-```
-
-The primary Qianwen-specific runtime input is the local runtime location:
-
-```console
-$ dicta --asr qianwen \
-    --live \
-    --qianwen-runtime-path ../qw/Frameworks/qianwen_shell/libQianwenShellEmbedded.dylib
-```
-
-For installed bundles that do not expose Qianwen's WSG implementation in a
-standard framework location, `dicta` writes a local WSG-compatible shim backed by
-`libqianwen_unet_runtime.dylib` and points the embedded runtime at it. To
-override that path explicitly:
-
-```console
-$ dicta --asr qianwen \
-    --live \
-    --qianwen-host-bundle-path ../qw \
-    --qianwen-wsg-impl-path /path/to/libwsg_impl.dylib
-```
-
-The embedded runtime also honors an ASR query-sign override. `dicta` maps
-`DICTA_QIANWEN_ASR_QUERY_SIGN` or `--qianwen-asr-query-sign` to Qianwen's
-`QWEN_SHELL_ASR_QUERY_SIGN` environment variable before starting the runtime.
-This is a narrow escape hatch for local debugging; the normal path is the
-provider-managed WSG shim or an explicitly supplied WSG library.
-
-By default, `dicta` looks for the embedded runtime under `../qw`, `../../qw`, and
-common installed app bundle locations. Browser-downloaded app bundles can carry
-macOS quarantine attributes that prevent dyld from loading local dylibs; clear
-them from the supplied bundle if the runtime cannot be loaded:
-
-```console
-$ xattr -dr com.apple.quarantine ../qw
-```
-
-The current Qianwen provider is live-only because this local runtime exposes the
-IME voice shortcut flow, not a file transcription API. Batch file transcription,
-speaker capture, translation, timestamps, and OpenAI-compatible HTTP serving are
-not advertised for this backend.
-
 ## Native adapter / Apple Speech
 
 `--asr apple` uses `dicta-asr-native-adapter`. The provider is intentionally a
@@ -221,10 +127,8 @@ implementation capability ceiling from its `kind`.
 Built-in profiles can be selected directly:
 
 ```console
-$ dicta --input audio.wav --provider doubao
 $ dicta --input audio.wav --provider apple --native-adapter ./dicta-adapter-apple-speech
 $ dicta --input audio.wav --provider openai
-$ dicta --provider qianwen --live --qianwen-host-bundle-path ../qw
 $ dicta --capabilities --provider openai --json
 ```
 
@@ -264,18 +168,18 @@ control surface used by `dicta --ui`:
 
 ```console
 $ dicta provider list
-$ dicta provider set doubao
+$ dicta provider set <provider-name>
 $ dicta provider current
 $ dicta --provider active --live
 ```
 
 `dicta provider set <name>` writes `~/.config/dicta/active-provider.json` by default.
-`--provider active` resolves that file to a concrete built-in or configured
-profile. When the state file is missing, `active` defaults to the built-in Apple
-provider on supported macOS systems and the built-in Doubao provider elsewhere,
-so first launch does not require a manual selection. The state file stores only
-the selected provider name; secrets remain in CLI flags, environment variables,
-or `providers.toml`.
+`--provider active` resolves that file to a concrete built-in, configured, or
+installed provider profile. When the state file is missing, `active` defaults to
+the built-in Apple provider only on supported macOS systems. On other systems,
+install a live provider package and select it with `dicta provider set <name>`.
+The state file stores only the selected provider name; secrets remain in CLI
+flags, environment variables, or `providers.toml`.
 
 `dicta --ui` launches the Rust `dicta-tray` companion binary. The status item opens a
 compact provider panel on left click and keeps a right-click native menu as a
@@ -301,9 +205,10 @@ new protocol or runtime integration.
 Provider packages can live outside this repository and be installed with:
 
 ```console
-$ dicta provider install ./doubaoime-asr-0.1.0.tgz
-$ dicta provider install ./qianwenime-asr
-$ dicta provider install @dicta-asr/qianwenime-asr --registry https://registry.npmjs.org
+$ dicta provider available
+$ dicta provider install <provider-name>
+$ dicta provider install ./my-provider
+$ dicta provider install ./my-provider-0.1.0.tgz --force
 ```
 
 The installer treats npm as a tarball registry only. It queries metadata,
@@ -314,12 +219,12 @@ not create `node_modules`, and does not require Node at runtime.
 An installed provider package must include `provider.toml`:
 
 ```toml
-id = "qianwenime-asr"
-name = "Qianwen IME ASR"
+id = "example-live-asr"
+name = "Example Live ASR"
 version = "0.1.0"
 protocol = "dicta-provider-jsonl-v1"
-command = "bin/dicta-provider-qianwenime-asr"
-model = "qianwenime-asr"
+command = "bin/dicta-provider-example"
+model = "example-live-asr"
 
 [batch]
 file = false
@@ -347,7 +252,6 @@ standard capability-discovery API.
 
 ```console
 $ dicta --capabilities
-$ dicta --capabilities --asr doubao --json
 $ dicta --capabilities --asr apple --native-adapter ./dicta-adapter-apple-speech
 $ dicta --capabilities --provider siliconflow --provider-config ./providers.toml
 ```
@@ -362,5 +266,5 @@ Meta -> Status? -> Volatile? -> Finalized -> Translated? -> Eof
 
 Apple live is a streaming provider: it supports mic/speaker capture, partial
 results, finalized results, translation, voice processing, and device selection.
-Doubao live is a chunked provider: it supports microphone capture and finalized
-results only, with status events for the current chunk phase.
+External live providers declare their own streaming or chunked event shape in
+`provider.toml`.

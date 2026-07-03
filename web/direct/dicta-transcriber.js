@@ -1,4 +1,4 @@
-const DEFAULT_MODEL = "doubao-asr";
+const DEFAULT_MODEL = "whisper-1";
 const DEFAULT_PROVIDER = "openai-compatible";
 const DEFAULT_MIME_CANDIDATES = [
   "audio/webm;codecs=opus",

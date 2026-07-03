@@ -985,7 +985,7 @@ mod tests {
 
     #[test]
     fn current_provider_is_switchable_only_when_live_ready() {
-        let report = provider_report(Some("doubao"));
+        let report = provider_report(Some("live-asr"));
 
         assert!(report_current_switchable(&report));
     }
@@ -995,7 +995,7 @@ mod tests {
         let report = provider_report(Some("openai"));
 
         assert!(!report_current_switchable(&report));
-        assert_eq!(first_switchable_provider(&report), Some("doubao"));
+        assert_eq!(first_switchable_provider(&report), Some("live-asr"));
     }
 
     #[test]
@@ -1003,7 +1003,7 @@ mod tests {
         let report = provider_report(None);
 
         assert!(!report_current_switchable(&report));
-        assert_eq!(first_switchable_provider(&report), Some("doubao"));
+        assert_eq!(first_switchable_provider(&report), Some("live-asr"));
     }
 
     #[test]
@@ -1020,7 +1020,7 @@ mod tests {
             report
                 .providers
                 .iter()
-                .any(|provider| provider.name == "doubao")
+                .any(|provider| provider.name == "live-asr")
         );
         assert!(
             !report
@@ -1028,7 +1028,7 @@ mod tests {
                 .iter()
                 .any(|provider| provider.name == "openai")
         );
-        assert_eq!(first_switchable_provider(&report), Some("doubao"));
+        assert_eq!(first_switchable_provider(&report), Some("live-asr"));
     }
 
     fn provider_report(current: Option<&str>) -> ProviderListReport {
@@ -1036,7 +1036,7 @@ mod tests {
             current: current.map(ToOwned::to_owned),
             providers: vec![
                 provider("apple", true, false),
-                provider("doubao", true, true),
+                provider("live-asr", true, true),
                 provider("openai", false, true),
             ],
         }
