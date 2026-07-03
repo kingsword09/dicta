@@ -13,17 +13,12 @@ use dicta_asr::{
     AsrCapabilities, AsrOptions, AsrProvider, LiveAsrOptions, LiveAsrProvider, LiveCapabilities,
     LiveEventCallback, LiveModeKind, ProviderCapabilities, ResponseFormat,
 };
-use dicta_asr_doubao::{DoubaoAsr, DoubaoConfig, doubao_capabilities, doubao_live_capabilities};
 use dicta_asr_native_adapter::{
     NativeAdapterAsr, NativeAdapterConfig, native_adapter_capabilities,
     native_adapter_live_capabilities,
 };
 use dicta_asr_openai_compatible::{
     OpenAiCompatibleAsr, OpenAiCompatibleConfig, openai_compatible_capabilities,
-};
-use dicta_asr_qianwen::{
-    DEFAULT_MODEL as QIANWEN_DEFAULT_MODEL, ENV_ASR_QUERY_SIGN as QIANWEN_ENV_ASR_QUERY_SIGN,
-    QianwenAsr, QianwenConfig, qianwen_capabilities, qianwen_live_capabilities,
 };
 use dicta_core::{
     AudioChannel, AudioInput, EventTimestamp, LiveEvent, LiveMetaEvent, LiveStatusEvent,
@@ -43,6 +38,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{cmp, env};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::time::{self, Instant as TokioInstant};
 use tower_http::cors::{Any, CorsLayer};
 
 const APP_NAME: &str = "dicta";
@@ -94,55 +90,6 @@ struct Cli {
 
     #[arg(long, env = "DICTA_SRC", help = "Source language/locale hint")]
     src: Option<String>,
-
-    #[arg(
-        long = "doubao-credential-path",
-        env = "DICTA_DOUBAO_CREDENTIAL_PATH",
-        help = "Path for cached Doubao IME device credentials"
-    )]
-    doubao_credential_path: Option<PathBuf>,
-
-    #[arg(
-        long = "doubao-device-id",
-        env = "DICTA_DOUBAO_DEVICE_ID",
-        help = "Override Doubao IME device id"
-    )]
-    doubao_device_id: Option<String>,
-
-    #[arg(
-        long = "doubao-token",
-        env = "DICTA_DOUBAO_TOKEN",
-        help = "Override Doubao IME ASR token"
-    )]
-    doubao_token: Option<String>,
-
-    #[arg(
-        long = "qianwen-runtime-path",
-        env = "DICTA_QIANWEN_RUNTIME_PATH",
-        help = "Path to Qianwen Shell embedded runtime dylib"
-    )]
-    qianwen_runtime_path: Option<PathBuf>,
-
-    #[arg(
-        long = "qianwen-host-bundle-path",
-        env = "DICTA_QIANWEN_HOST_BUNDLE_PATH",
-        help = "Path to QianwenIME app Contents directory, e.g. ../qw"
-    )]
-    qianwen_host_bundle_path: Option<PathBuf>,
-
-    #[arg(
-        long = "qianwen-wsg-impl-path",
-        env = "DICTA_QIANWEN_WSG_IMPL_PATH",
-        help = "Override path to Qianwen-compatible WSG dylib for ASR request signing"
-    )]
-    qianwen_wsg_impl_path: Option<PathBuf>,
-
-    #[arg(
-        long = "qianwen-asr-query-sign",
-        env = "DICTA_QIANWEN_ASR_QUERY_SIGN",
-        help = "Override Qianwen ASR query sign; passed to the embedded runtime"
-    )]
-    qianwen_asr_query_sign: Option<String>,
 
     #[arg(
         long,
@@ -236,13 +183,6 @@ impl Cli {
             provider,
             provider_config: self.provider_config.clone(),
             src: self.src.clone(),
-            doubao_credential_path: self.doubao_credential_path.clone(),
-            doubao_device_id: self.doubao_device_id.clone(),
-            doubao_token: self.doubao_token.clone(),
-            qianwen_runtime_path: self.qianwen_runtime_path.clone(),
-            qianwen_host_bundle_path: self.qianwen_host_bundle_path.clone(),
-            qianwen_wsg_impl_path: self.qianwen_wsg_impl_path.clone(),
-            qianwen_asr_query_sign: self.qianwen_asr_query_sign.clone(),
             dst: self.dst.clone(),
             native_adapter: self.native_adapter.clone(),
             input: self.input.clone(),
@@ -453,8 +393,6 @@ struct ProviderRemoveCommand {
 enum AsrBackend {
     Auto,
     OpenaiCompatible,
-    Doubao,
-    Qianwen,
     Apple,
     #[value(skip)]
     External,
@@ -465,8 +403,6 @@ impl AsrBackend {
         match self {
             Self::Auto => "auto",
             Self::OpenaiCompatible => "openai-compatible",
-            Self::Doubao => "doubao",
-            Self::Qianwen => "qianwen",
             Self::Apple => "apple",
             Self::External => "external",
         }
@@ -506,8 +442,6 @@ struct ProviderProfile {
 #[serde(rename_all = "kebab-case")]
 enum ProfileProviderKind {
     OpenaiCompatible,
-    Doubao,
-    Qianwen,
     Apple,
     External,
 }
@@ -516,8 +450,6 @@ impl ProfileProviderKind {
     fn backend(self) -> AsrBackend {
         match self {
             Self::OpenaiCompatible => AsrBackend::OpenaiCompatible,
-            Self::Doubao => AsrBackend::Doubao,
-            Self::Qianwen => AsrBackend::Qianwen,
             Self::Apple => AsrBackend::Apple,
             Self::External => AsrBackend::External,
         }
@@ -526,8 +458,6 @@ impl ProfileProviderKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::OpenaiCompatible => "openai-compatible",
-            Self::Doubao => "doubao",
-            Self::Qianwen => "qianwen",
             Self::Apple => "apple",
             Self::External => "external",
         }
@@ -1592,18 +1522,6 @@ fn live_args_for_ui(cli: &Cli) -> Vec<String> {
         args.push("--native-adapter".to_owned());
         args.push(path.display().to_string());
     }
-    if let Some(path) = &cli.doubao_credential_path {
-        args.push("--doubao-credential-path".to_owned());
-        args.push(path.display().to_string());
-    }
-    if let Some(value) = non_empty(&cli.doubao_device_id) {
-        args.push("--doubao-device-id".to_owned());
-        args.push(value);
-    }
-    if let Some(value) = non_empty(&cli.doubao_token) {
-        args.push("--doubao-token".to_owned());
-        args.push(value);
-    }
     args
 }
 
@@ -1629,24 +1547,14 @@ async fn run_live(cli: &Cli) -> Result<()> {
             let provider = build_native_adapter(cli)?;
             run_live_provider(cli, &provider).await
         }
-        AsrBackend::Doubao => {
-            let provider = DoubaoAsr::new(DoubaoConfig {
-                credential_path: cli.doubao_credential_path.clone(),
-                device_id: non_empty(&cli.doubao_device_id),
-                token: non_empty(&cli.doubao_token),
-            })?;
-            run_live_provider(cli, &provider).await
-        }
-        AsrBackend::Qianwen => {
-            let provider = build_qianwen_provider(cli)?;
-            run_live_provider(cli, &provider).await
-        }
         AsrBackend::External => {
             let provider = build_external_provider(cli)?;
             run_live_provider(cli, &provider).await
         }
         AsrBackend::OpenaiCompatible | AsrBackend::Auto => {
-            bail!("interactive live mode currently supports apple, doubao, and qianwen")
+            bail!(
+                "interactive live mode requires Apple on-device ASR or an installed live provider"
+            )
         }
     }
 }
@@ -1712,22 +1620,16 @@ fn resolve_live_backend_for(cli: &Cli, apple_support: &AppleSupport) -> Result<A
         AsrBackend::Auto | AsrBackend::Apple => {
             if apple_support.supported {
                 Ok(AsrBackend::Apple)
-            } else if cli.asr == AsrBackend::Auto {
-                Ok(AsrBackend::Doubao)
             } else {
                 bail!(
-                    "interactive live mode requires Apple on-device ASR: {}. Use --input or --mic-duration with --asr doubao on this system",
+                    "interactive live mode requires Apple on-device ASR or an installed live provider: {}",
                     apple_support.reason
                 )
             }
         }
-        AsrBackend::Doubao => Ok(AsrBackend::Doubao),
-        AsrBackend::Qianwen => Ok(AsrBackend::Qianwen),
         AsrBackend::External => unreachable!("external backend is selected through --provider"),
         AsrBackend::OpenaiCompatible => {
-            bail!(
-                "interactive live mode currently supports --asr apple, --asr doubao, or --asr qianwen"
-            )
+            bail!("interactive live mode requires --asr apple or an installed live provider")
         }
     }
 }
@@ -2505,13 +2407,6 @@ struct BackendReport {
     api_base_configured: bool,
     api_key_configured: bool,
     model: String,
-    doubao_credential_path: Option<String>,
-    doubao_device_id_configured: bool,
-    doubao_token_configured: bool,
-    qianwen_runtime_path: Option<String>,
-    qianwen_host_bundle_path: Option<String>,
-    qianwen_wsg_impl_path: Option<String>,
-    qianwen_asr_query_sign_configured: bool,
     native_adapter: Option<String>,
     error: Option<String>,
 }
@@ -4094,20 +3989,6 @@ fn gather_doctor_report_with_audio(cli: &Cli, audio: AudioReport) -> DoctorRepor
             api_base_configured: configured_api_base(cli, effective_result.as_ref().ok()).is_some(),
             api_key_configured: configured_api_key(cli, effective_result.as_ref().ok()).is_some(),
             model,
-            doubao_credential_path: cli
-                .doubao_credential_path
-                .clone()
-                .or_else(dicta_asr_doubao::default_credential_path)
-                .map(|path| path.display().to_string()),
-            doubao_device_id_configured: non_empty(&cli.doubao_device_id).is_some(),
-            doubao_token_configured: non_empty(&cli.doubao_token).is_some(),
-            qianwen_runtime_path: resolve_qianwen_runtime_path(cli)
-                .map(|path| path.display().to_string()),
-            qianwen_host_bundle_path: resolve_qianwen_host_bundle_path(cli)
-                .map(|path| path.display().to_string()),
-            qianwen_wsg_impl_path: resolve_qianwen_wsg_impl_path(cli)
-                .map(|path| path.display().to_string()),
-            qianwen_asr_query_sign_configured: qianwen_asr_query_sign_configured(cli),
             native_adapter: resolve_native_adapter(cli)
                 .as_ref()
                 .map(|path| path.display().to_string()),
@@ -4213,8 +4094,6 @@ fn gather_capabilities_report_with_support(
 fn provider_capabilities_for_backend(backend: AsrBackend) -> ProviderCapabilities {
     match backend {
         AsrBackend::OpenaiCompatible => openai_compatible_capabilities(),
-        AsrBackend::Doubao => doubao_capabilities(),
-        AsrBackend::Qianwen => qianwen_capabilities(),
         AsrBackend::Apple => native_adapter_capabilities(),
         AsrBackend::External => ProviderCapabilities {
             batch: AsrCapabilities {
@@ -4240,10 +4119,7 @@ fn effective_provider_for(
     } else if capability_mode {
         match cli.asr {
             AsrBackend::Auto => resolve_backend_for(cli, apple_support)?,
-            AsrBackend::OpenaiCompatible
-            | AsrBackend::Doubao
-            | AsrBackend::Qianwen
-            | AsrBackend::Apple => cli.asr,
+            AsrBackend::OpenaiCompatible | AsrBackend::Apple => cli.asr,
             AsrBackend::External => {
                 unreachable!("external backend is selected through --provider")
             }
@@ -4385,8 +4261,6 @@ fn live_expected_latency(cli: &Cli, capabilities: &LiveCapabilities) -> Option<D
 fn live_capabilities_for_backend(backend: AsrBackend) -> LiveCapabilities {
     match backend {
         AsrBackend::Apple => native_adapter_live_capabilities(),
-        AsrBackend::Doubao => doubao_live_capabilities(),
-        AsrBackend::Qianwen => qianwen_live_capabilities(),
         AsrBackend::Auto | AsrBackend::OpenaiCompatible | AsrBackend::External => {
             LiveCapabilities {
                 mode: LiveModeKind::Chunked,
@@ -4452,7 +4326,9 @@ fn apple_support() -> AppleSupport {
         (Some(version), Some(_)) => AppleSupport {
             version: Some(version.clone()),
             supported: false,
-            reason: format!("macOS {version} is below 26; use doubao or another HTTP provider"),
+            reason: format!(
+                "macOS {version} is below 26; use an HTTP provider or install a live provider"
+            ),
         },
         (version, _) => AppleSupport {
             version,
@@ -4603,32 +4479,6 @@ fn print_capabilities_text(report: &CapabilitiesReport) {
 
 fn print_doctor_backend_details(report: &DoctorReport) {
     match report.backend.resolved.as_deref() {
-        Some("doubao") => {
-            println!("  Model: {}", report.backend.model);
-            if let Some(path) = &report.backend.doubao_credential_path {
-                println!("  Credential cache: {path}");
-            }
-            if report.backend.doubao_device_id_configured || report.backend.doubao_token_configured
-            {
-                println!("  Credential overrides: yes");
-            }
-        }
-        Some("qianwen") => {
-            println!("  Model: {}", report.backend.model);
-            if let Some(path) = &report.backend.qianwen_runtime_path {
-                println!("  Runtime: {path}");
-            }
-            if let Some(path) = &report.backend.qianwen_host_bundle_path {
-                println!("  Host bundle: {path}");
-            }
-            if let Some(path) = &report.backend.qianwen_wsg_impl_path {
-                println!("  WSG impl: {path}");
-            }
-            println!(
-                "  ASR query sign configured: {}",
-                yes_no(report.backend.qianwen_asr_query_sign_configured)
-            );
-        }
         Some("openai-compatible") => {
             println!(
                 "  API base configured: {}",
@@ -4654,7 +4504,7 @@ fn print_doctor_backend_details(report: &DoctorReport) {
 fn doctor_audio_hint(report: &DoctorReport) -> Option<&'static str> {
     if report.system.os == "macos" {
         Some(
-            "start a microphone capture from the terminal app you use, for example `dicta --mic-duration 1 --asr doubao`, so macOS can show the permission prompt; then allow microphone access in System Settings > Privacy & Security > Microphone, restart the terminal, and check that a default input device is selected",
+            "start a microphone capture from the terminal app you use, for example `dicta --mic-duration 1 --asr openai-compatible`, so macOS can show the permission prompt; then allow microphone access in System Settings > Privacy & Security > Microphone, restart the terminal, and check that a default input device is selected",
         )
     } else {
         None
@@ -4733,22 +4583,10 @@ fn resolve_backend_for(cli: &Cli, apple_support: &AppleSupport) -> Result<AsrBac
 
     match cli.asr {
         AsrBackend::Auto => {
-            if let Some(model) = non_empty(&cli.api_model) {
-                return if is_doubao_model_alias(&model) {
-                    Ok(AsrBackend::Doubao)
-                } else if is_qianwen_model_alias(&model) {
-                    Ok(AsrBackend::Qianwen)
-                } else {
-                    Ok(AsrBackend::OpenaiCompatible)
-                };
-            }
-            if apple_support.supported {
-                Ok(AsrBackend::OpenaiCompatible)
-            } else {
-                Ok(AsrBackend::Doubao)
-            }
+            let _ = apple_support;
+            Ok(AsrBackend::OpenaiCompatible)
         }
-        AsrBackend::OpenaiCompatible | AsrBackend::Doubao | AsrBackend::Qianwen => Ok(cli.asr),
+        AsrBackend::OpenaiCompatible => Ok(cli.asr),
         AsrBackend::External => unreachable!("external backend is selected through --provider"),
         AsrBackend::Apple => {
             if apple_support.supported {
@@ -4774,12 +4612,6 @@ fn build_provider(backend: AsrBackend, cli: &Cli) -> Result<Box<dyn AsrProvider>
                 },
             )?))
         }
-        AsrBackend::Doubao => Ok(Box::new(DoubaoAsr::new(DoubaoConfig {
-            credential_path: cli.doubao_credential_path.clone(),
-            device_id: non_empty(&cli.doubao_device_id),
-            token: non_empty(&cli.doubao_token),
-        })?)),
-        AsrBackend::Qianwen => Ok(Box::new(build_qianwen_provider(cli)?)),
         AsrBackend::Apple => Ok(Box::new(build_native_adapter(cli)?)),
         AsrBackend::External => Ok(Box::new(build_external_provider(cli)?)),
         AsrBackend::Auto => unreachable!("backend must be resolved first"),
@@ -4872,20 +4704,20 @@ fn active_or_default_provider_name(
     if let Some(active) = read_active_provider_name(cli)? {
         return Ok(Some(active));
     }
-    Ok(Some(default_live_provider_name(apple_support).to_owned()))
+    Ok(default_live_provider_name(apple_support).map(ToOwned::to_owned))
 }
 
-fn default_live_provider_name(apple_support: &AppleSupport) -> &'static str {
+fn default_live_provider_name(apple_support: &AppleSupport) -> Option<&'static str> {
     if apple_support.supported {
-        "apple"
+        Some("apple")
     } else {
-        "doubao"
+        None
     }
 }
 
 fn available_provider_profiles(cli: &Cli) -> Result<BTreeMap<String, ProviderProfile>> {
     let mut profiles = BTreeMap::new();
-    for name in ["apple", "doubao", "openai", "qianwen"] {
+    for name in ["apple", "openai"] {
         if let Some(profile) = builtin_provider_profile(name) {
             profiles.insert(name.to_owned(), profile);
         }
@@ -5013,18 +4845,6 @@ fn clear_active_provider_name(cli: &Cli) -> Result<()> {
 
 fn builtin_provider_profile(name: &str) -> Option<ProviderProfile> {
     match name {
-        "doubao" => Some(ProviderProfile {
-            kind: ProfileProviderKind::Doubao,
-            api_base: None,
-            default_model: Some(dicta_asr_doubao::DEFAULT_MODEL.to_owned()),
-            api_key: None,
-            api_key_env: None,
-            batch_file: None,
-            streaming: None,
-            requires_network: None,
-            live_enabled: None,
-            notes: vec!["Built-in Doubao IME profile.".to_owned()],
-        }),
         "apple" => Some(ProviderProfile {
             kind: ProfileProviderKind::Apple,
             api_base: None,
@@ -5036,18 +4856,6 @@ fn builtin_provider_profile(name: &str) -> Option<ProviderProfile> {
             requires_network: None,
             live_enabled: None,
             notes: vec!["Built-in Apple on-device profile.".to_owned()],
-        }),
-        "qianwen" => Some(ProviderProfile {
-            kind: ProfileProviderKind::Qianwen,
-            api_base: None,
-            default_model: Some(QIANWEN_DEFAULT_MODEL.to_owned()),
-            api_key: None,
-            api_key_env: None,
-            batch_file: None,
-            streaming: None,
-            requires_network: None,
-            live_enabled: None,
-            notes: vec!["Built-in Qianwen Shell runtime profile.".to_owned()],
         }),
         "openai" => Some(ProviderProfile {
             kind: ProfileProviderKind::OpenaiCompatible,
@@ -5190,45 +4998,6 @@ fn configured_api_base(cli: &Cli, provider: Option<&EffectiveProvider>) -> Optio
     })
 }
 
-fn build_qianwen_provider(cli: &Cli) -> Result<QianwenAsr> {
-    Ok(QianwenAsr::new(qianwen_config_from_cli(cli))?)
-}
-
-fn qianwen_config_from_cli(cli: &Cli) -> QianwenConfig {
-    QianwenConfig {
-        runtime_path: cli.qianwen_runtime_path.clone(),
-        host_bundle_path: cli.qianwen_host_bundle_path.clone(),
-        wsg_impl_path: cli.qianwen_wsg_impl_path.clone(),
-        asr_query_sign: non_empty(&cli.qianwen_asr_query_sign),
-    }
-}
-
-fn resolve_qianwen_runtime_path(cli: &Cli) -> Option<PathBuf> {
-    QianwenAsr::new(qianwen_config_from_cli(cli))
-        .ok()
-        .and_then(|provider| provider.resolved_runtime_path())
-}
-
-fn resolve_qianwen_host_bundle_path(cli: &Cli) -> Option<PathBuf> {
-    QianwenAsr::new(qianwen_config_from_cli(cli))
-        .ok()
-        .and_then(|provider| provider.resolved_host_bundle_path())
-}
-
-fn resolve_qianwen_wsg_impl_path(cli: &Cli) -> Option<PathBuf> {
-    QianwenAsr::new(qianwen_config_from_cli(cli))
-        .ok()
-        .and_then(|provider| provider.resolved_wsg_impl_path())
-}
-
-fn qianwen_asr_query_sign_configured(cli: &Cli) -> bool {
-    non_empty(&cli.qianwen_asr_query_sign).is_some()
-        || env::var(QIANWEN_ENV_ASR_QUERY_SIGN)
-            .ok()
-            .and_then(|value| non_empty_string(Some(&value)).map(ToOwned::to_owned))
-            .is_some()
-}
-
 #[derive(Debug, Clone)]
 struct ExternalProvider {
     id: String,
@@ -5363,15 +5132,25 @@ impl LiveAsrProvider for ExternalProvider {
         let mut lines = BufReader::new(stdout).lines();
         let mut interrupted = false;
         let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
+        let shutdown_timer = time::sleep(Duration::from_secs(0));
+        tokio::pin!(shutdown_timer);
+        let mut shutdown_requested = false;
 
         loop {
             tokio::select! {
                 biased;
-                signal = &mut ctrl_c => {
+                signal = &mut ctrl_c, if !shutdown_requested => {
                     signal.map_err(|err| {
                         dicta_asr::AsrError::Request(format!("failed to listen for Ctrl-C: {err}"))
                     })?;
                     interrupted = true;
+                    shutdown_requested = true;
+                    shutdown_timer
+                        .as_mut()
+                        .reset(TokioInstant::now() + Duration::from_secs(30));
+                    request_external_provider_shutdown(&mut child).await;
+                }
+                _ = &mut shutdown_timer, if shutdown_requested => {
                     let _ = child.start_kill();
                     on_event(LiveEvent::Eof)?;
                     break;
@@ -5418,6 +5197,24 @@ impl LiveAsrProvider for ExternalProvider {
             .clone()
             .unwrap_or_else(|| live_capabilities_for_backend(AsrBackend::External))
     }
+}
+
+#[cfg(unix)]
+async fn request_external_provider_shutdown(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        let _ = tokio::process::Command::new("/bin/kill")
+            .arg("-INT")
+            .arg(pid.to_string())
+            .status()
+            .await;
+    } else {
+        let _ = child.start_kill();
+    }
+}
+
+#[cfg(not(unix))]
+async fn request_external_provider_shutdown(child: &mut tokio::process::Child) {
+    let _ = child.start_kill();
 }
 
 fn parse_external_provider_jsonl(stdout: &str) -> dicta_asr::AsrResult<dicta_asr::Transcript> {
@@ -5534,24 +5331,6 @@ fn validate_backend_config(backend: AsrBackend, cli: &Cli) -> Option<String> {
             "--asr apple requires --native-adapter, DICTA_NATIVE_ADAPTER, or a bundled native adapter binary next to dicta"
                 .to_owned(),
         ),
-        AsrBackend::Qianwen
-            if cli
-                .qianwen_wsg_impl_path
-                .as_ref()
-                .is_some_and(|path| !path.exists()) =>
-        {
-            Some(format!(
-                "--qianwen-wsg-impl-path does not exist: {}",
-                cli.qianwen_wsg_impl_path.as_ref().unwrap().display()
-            ))
-        }
-        AsrBackend::Qianwen
-            if resolve_qianwen_runtime_path(cli).is_none() =>
-        {
-            Some(
-                "--asr qianwen requires Qianwen Shell runtime; set --qianwen-runtime-path or --qianwen-host-bundle-path".to_owned(),
-            )
-        }
         AsrBackend::External => resolve_provider_profile(cli)
             .ok()
             .flatten()
@@ -5566,10 +5345,7 @@ fn validate_backend_config(backend: AsrBackend, cli: &Cli) -> Option<String> {
                     )
                 })
             }),
-        AsrBackend::OpenaiCompatible
-        | AsrBackend::Doubao
-        | AsrBackend::Qianwen
-        | AsrBackend::Apple => None,
+        AsrBackend::OpenaiCompatible | AsrBackend::Apple => None,
         AsrBackend::Auto => None,
     }
 }
@@ -5585,17 +5361,14 @@ fn validate_capability_config(
             apple_support.reason
         )),
         AsrBackend::Apple => validate_backend_config(backend, cli),
-        AsrBackend::Qianwen => validate_backend_config(backend, cli),
         AsrBackend::External => validate_backend_config(backend, cli),
-        AsrBackend::OpenaiCompatible | AsrBackend::Doubao => None,
+        AsrBackend::OpenaiCompatible => None,
         AsrBackend::Auto => None,
     }
 }
 
 fn default_model(backend: AsrBackend) -> &'static str {
     match backend {
-        AsrBackend::Doubao => dicta_asr_doubao::DEFAULT_MODEL,
-        AsrBackend::Qianwen => QIANWEN_DEFAULT_MODEL,
         AsrBackend::External => "external",
         _ => "whisper-1",
     }
@@ -5603,20 +5376,10 @@ fn default_model(backend: AsrBackend) -> &'static str {
 
 fn default_model_for_name(backend: &str) -> &'static str {
     match backend {
-        "doubao" => dicta_asr_doubao::DEFAULT_MODEL,
-        "qianwen" => QIANWEN_DEFAULT_MODEL,
         "apple" => "apple",
         "external" => "external",
         _ => "whisper-1",
     }
-}
-
-fn is_doubao_model_alias(model: &str) -> bool {
-    matches!(model, dicta_asr_doubao::DEFAULT_MODEL | "doubao-asr")
-}
-
-fn is_qianwen_model_alias(model: &str) -> bool {
-    matches!(model, QIANWEN_DEFAULT_MODEL | "qianwen-asr")
 }
 
 #[cfg(test)]
@@ -5631,13 +5394,6 @@ mod tests {
             provider: None,
             provider_config: None,
             src: None,
-            doubao_credential_path: None,
-            doubao_device_id: None,
-            doubao_token: None,
-            qianwen_runtime_path: None,
-            qianwen_host_bundle_path: None,
-            qianwen_wsg_impl_path: None,
-            qianwen_asr_query_sign: None,
             dst: None,
             native_adapter: None,
             input: None,
@@ -5657,16 +5413,6 @@ mod tests {
             provider_dir: None,
             command: None,
         }
-    }
-
-    fn fake_qianwen_runtime_path() -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "dicta-qianwen-cli-test-{}-{:?}.dylib",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::write(&path, "").unwrap();
-        path
     }
 
     fn test_audio_report() -> AudioReport {
@@ -5897,7 +5643,7 @@ expected_latency_ms = 5000
     }
 
     #[test]
-    fn auto_uses_doubao_when_apple_on_device_is_unavailable() {
+    fn auto_uses_openai_compatible_when_apple_on_device_is_unavailable() {
         let cli = Cli {
             input: Some(PathBuf::from("audio.wav")),
             ..test_cli()
@@ -5910,7 +5656,7 @@ expected_latency_ms = 5000
 
         assert_eq!(
             resolve_backend_for(&cli, &support).unwrap(),
-            AsrBackend::Doubao
+            AsrBackend::OpenaiCompatible
         );
     }
 
@@ -5933,26 +5679,7 @@ expected_latency_ms = 5000
     }
 
     #[test]
-    fn auto_uses_doubao_when_model_is_doubao_default() {
-        let cli = Cli {
-            api_model: Some(dicta_asr_doubao::DEFAULT_MODEL.to_owned()),
-            input: Some(PathBuf::from("audio.wav")),
-            ..test_cli()
-        };
-        let support = AppleSupport {
-            version: Some("26.0.0".to_owned()),
-            supported: true,
-            reason: "macOS 26+ detected".to_owned(),
-        };
-
-        assert_eq!(
-            resolve_backend_for(&cli, &support).unwrap(),
-            AsrBackend::Doubao
-        );
-    }
-
-    #[test]
-    fn auto_uses_openai_compatible_when_another_model_is_configured() {
+    fn auto_uses_openai_compatible_when_model_is_configured() {
         let cli = Cli {
             api_base: Some("https://example.com".to_owned()),
             api_model: Some("whisper-1".to_owned()),
@@ -5969,83 +5696,6 @@ expected_latency_ms = 5000
             resolve_backend_for(&cli, &support).unwrap(),
             AsrBackend::OpenaiCompatible
         );
-    }
-
-    #[test]
-    fn auto_uses_doubao_when_model_is_compatibility_doubao_alias() {
-        let cli = Cli {
-            api_model: Some("doubao-asr".to_owned()),
-            input: Some(PathBuf::from("audio.wav")),
-            ..test_cli()
-        };
-        let support = AppleSupport {
-            version: Some("26.0.0".to_owned()),
-            supported: true,
-            reason: "macOS 26+ detected".to_owned(),
-        };
-
-        assert_eq!(
-            resolve_backend_for(&cli, &support).unwrap(),
-            AsrBackend::Doubao
-        );
-    }
-
-    #[test]
-    fn auto_uses_qianwen_when_model_is_qianwen_default() {
-        let cli = Cli {
-            api_model: Some(QIANWEN_DEFAULT_MODEL.to_owned()),
-            input: Some(PathBuf::from("audio.wav")),
-            ..test_cli()
-        };
-        let support = AppleSupport {
-            version: Some("26.0.0".to_owned()),
-            supported: true,
-            reason: "macOS 26+ detected".to_owned(),
-        };
-
-        assert_eq!(
-            resolve_backend_for(&cli, &support).unwrap(),
-            AsrBackend::Qianwen
-        );
-    }
-
-    #[test]
-    fn doubao_builds_without_api_base_or_key() {
-        let cli = Cli {
-            asr: AsrBackend::Doubao,
-            input: Some(PathBuf::from("audio.wav")),
-            ..test_cli()
-        };
-
-        assert!(build_provider(AsrBackend::Doubao, &cli).is_ok());
-    }
-
-    #[test]
-    fn doubao_uses_native_ime_model_id() {
-        assert_eq!(dicta_asr_doubao::DEFAULT_MODEL, "doubaoime-asr");
-    }
-
-    #[test]
-    fn qianwen_builds_with_runtime_path() {
-        let cli = Cli {
-            asr: AsrBackend::Qianwen,
-            qianwen_runtime_path: Some(fake_qianwen_runtime_path()),
-            live: true,
-            ..test_cli()
-        };
-
-        assert!(build_provider(AsrBackend::Qianwen, &cli).is_ok());
-    }
-
-    #[test]
-    fn qianwen_backend_config_accepts_runtime_path() {
-        let cli = Cli {
-            asr: AsrBackend::Qianwen,
-            qianwen_runtime_path: Some(fake_qianwen_runtime_path()),
-            ..test_cli()
-        };
-
-        assert!(validate_backend_config(AsrBackend::Qianwen, &cli).is_none());
     }
 
     #[test]
@@ -6168,7 +5818,7 @@ expected_latency_ms = 5000
             resolve_live_backend(&cli)
                 .unwrap_err()
                 .to_string()
-                .contains("--asr qianwen")
+                .contains("installed live provider")
         );
     }
 
@@ -6229,39 +5879,6 @@ expected_latency_ms = 5000
     }
 
     #[test]
-    fn doubao_live_rejects_apple_only_flags() {
-        let cli = Cli {
-            live: true,
-            asr: AsrBackend::Doubao,
-            select_device: true,
-            ..test_cli()
-        };
-
-        assert!(
-            validate_live_options(&cli, "doubao", &doubao_live_capabilities())
-                .unwrap_err()
-                .to_string()
-                .contains("--select-device")
-        );
-    }
-
-    #[test]
-    fn doubao_live_uses_configured_chunk_duration() {
-        let cli = Cli {
-            live: true,
-            asr: AsrBackend::Doubao,
-            live_chunk: Some(3.0),
-            ..test_cli()
-        };
-        let capabilities = doubao_live_capabilities();
-
-        validate_live_options(&cli, "doubao", &capabilities).unwrap();
-        let options = live_options_from_cli(&cli, &capabilities);
-
-        assert_eq!(options.chunk_duration, Duration::from_secs(3));
-    }
-
-    #[test]
     fn streaming_live_rejects_chunk_duration() {
         let cli = Cli {
             live: true,
@@ -6294,81 +5911,6 @@ expected_latency_ms = 5000
         if std::env::consts::OS == "macos" {
             assert!(report.system.apple_on_device_reason.contains("macOS"));
         }
-    }
-
-    #[test]
-    fn doctor_reports_native_doubao_without_api_requirement() {
-        let cli = Cli {
-            asr: AsrBackend::Doubao,
-            json: true,
-            doctor: true,
-            ..test_cli()
-        };
-
-        let report = gather_doctor_report_with_audio(&cli, test_audio_report());
-
-        assert_eq!(report.backend.resolved.as_deref(), Some("doubao"));
-        assert_eq!(report.backend.model, dicta_asr_doubao::DEFAULT_MODEL);
-        assert!(!report.backend.api_base_configured);
-        assert!(!report.backend.api_key_configured);
-        assert!(report.backend.doubao_credential_path.is_some());
-        assert!(report.backend.error.is_none());
-        assert_eq!(report.live.backend.as_deref(), Some("doubao"));
-        assert_eq!(report.live.mode.as_deref(), Some("chunked"));
-        assert!(report.live.mic);
-        assert!(!report.live.speaker);
-        assert!(!report.live.partial_results);
-        assert!(report.live.finalized_results);
-        assert_eq!(report.live.expected_latency.as_deref(), Some("~5s"));
-    }
-
-    #[test]
-    fn capabilities_report_includes_doubao_batch_and_live_flags() {
-        let cli = Cli {
-            asr: AsrBackend::Doubao,
-            capabilities: true,
-            ..test_cli()
-        };
-        let support = AppleSupport {
-            version: Some("15.6.1".to_owned()),
-            supported: false,
-            reason: "macOS 15.6.1 is below 26".to_owned(),
-        };
-
-        let report = gather_capabilities_report_with_support(&cli, &support);
-
-        assert_eq!(report.resolved.as_deref(), Some("doubao"));
-        assert!(report.local_config_ok);
-        assert!(report.batch.as_ref().is_some_and(|batch| batch.batch_file));
-        let live = report.live.as_ref().expect("doubao live capabilities");
-        assert_eq!(live.mode, "chunked");
-        assert!(live.mic);
-        assert!(!live.speaker);
-        assert!(!live.partial_results);
-        assert!(live.finalized_results);
-        assert_eq!(live.expected_latency.as_deref(), Some("~5s"));
-    }
-
-    #[test]
-    fn capabilities_report_marks_qianwen_as_live_runtime() {
-        let cli = Cli {
-            asr: AsrBackend::Qianwen,
-            qianwen_runtime_path: Some(fake_qianwen_runtime_path()),
-            capabilities: true,
-            ..test_cli()
-        };
-
-        let report = gather_capabilities_report(&cli);
-
-        assert_eq!(report.resolved.as_deref(), Some("qianwen"));
-        assert!(report.local_config_ok);
-        assert!(report.batch.as_ref().is_some_and(|batch| !batch.batch_file));
-        let live = report.live.as_ref().expect("qianwen live capabilities");
-        assert_eq!(live.mode, "streaming");
-        assert!(live.mic);
-        assert!(!live.speaker);
-        assert!(live.partial_results);
-        assert!(live.finalized_results);
     }
 
     #[test]
@@ -6508,55 +6050,30 @@ live_enabled = false
     }
 
     #[test]
-    fn builtin_doubao_profile_resolves_live_capabilities() {
-        let cli = Cli {
-            provider: Some("doubao".to_owned()),
-            capabilities: true,
-            ..test_cli()
-        };
-        let support = AppleSupport {
-            version: Some("15.6.1".to_owned()),
-            supported: false,
-            reason: "macOS 15.6.1 is below 26".to_owned(),
-        };
-
-        let report = gather_capabilities_report_with_support(&cli, &support);
-
-        assert_eq!(report.resolved.as_deref(), Some("doubao"));
-        assert_eq!(report.provider.as_deref(), Some("doubao"));
-        assert!(report.local_config_ok);
-        assert!(report.live.is_some());
-    }
-
-    #[test]
-    fn builtin_qianwen_profile_supports_live() {
-        let cli = Cli {
-            provider: Some("qianwen".to_owned()),
-            qianwen_runtime_path: Some(fake_qianwen_runtime_path()),
-            capabilities: true,
-            ..test_cli()
-        };
-
-        let report = gather_capabilities_report(&cli);
-
-        assert_eq!(report.resolved.as_deref(), Some("qianwen"));
-        assert_eq!(report.provider.as_deref(), Some("qianwen"));
-        assert_eq!(report.model, QIANWEN_DEFAULT_MODEL);
-        assert!(report.local_config_ok);
-        assert!(report.batch.as_ref().is_some_and(|batch| !batch.batch_file));
-        assert!(report.live.is_some());
-    }
-
-    #[test]
     fn active_provider_state_resolves_provider_profile() {
+        let source_dir = temp_test_dir("dicta-provider-source");
+        let provider_dir = temp_test_dir("dicta-provider-install");
         let state = temp_provider_state_path();
+        write_test_provider_source(&source_dir, "local-asr", "0.1.0");
         let cli = Cli {
             provider: Some("active".to_owned()),
             provider_state: Some(state.clone()),
+            provider_dir: Some(provider_dir.clone()),
             capabilities: true,
             ..test_cli()
         };
-        write_active_provider_name(&cli, "doubao").unwrap();
+        let source = ProviderInstallSource {
+            description: source_dir.display().to_string(),
+            package: ProviderInstallPackage::Directory(source_dir.clone()),
+            metadata: provider_install_metadata(
+                ProviderInstallSourceKind::Directory,
+                None,
+                None,
+                None,
+            ),
+        };
+        install_provider_from_source(&cli, source, false).unwrap();
+        write_active_provider_name(&cli, "local-asr").unwrap();
         let support = AppleSupport {
             version: Some("15.6.1".to_owned()),
             supported: false,
@@ -6564,14 +6081,17 @@ live_enabled = false
         };
 
         let report = gather_capabilities_report_with_support(&cli, &support);
+        let _ = std::fs::remove_dir_all(source_dir);
+        let _ = std::fs::remove_dir_all(provider_dir);
         let _ = std::fs::remove_file(state);
 
-        assert_eq!(report.provider.as_deref(), Some("doubao"));
-        assert_eq!(report.resolved.as_deref(), Some("doubao"));
+        assert_eq!(report.provider.as_deref(), Some("local-asr"));
+        assert_eq!(report.resolved.as_deref(), Some("external"));
+        assert!(report.live.is_some());
     }
 
     #[test]
-    fn active_provider_defaults_to_doubao_when_state_is_missing_and_apple_is_unavailable() {
+    fn active_provider_has_no_default_when_state_is_missing_and_apple_is_unavailable() {
         let state = temp_provider_state_path();
         let cli = Cli {
             provider: Some("active".to_owned()),
@@ -6587,10 +6107,15 @@ live_enabled = false
 
         let report = gather_capabilities_report_with_support(&cli, &support);
 
-        assert_eq!(report.provider.as_deref(), Some("doubao"));
-        assert_eq!(report.resolved.as_deref(), Some("doubao"));
-        assert!(report.local_config_ok);
-        assert!(report.live.is_some());
+        assert_eq!(report.provider, None);
+        assert_eq!(report.resolved, None);
+        assert!(!report.local_config_ok);
+        assert!(
+            report
+                .resolution_error
+                .as_deref()
+                .is_some_and(|error| error.contains("no active provider is set"))
+        );
     }
 
     #[test]
@@ -6642,12 +6167,6 @@ live_enabled = false
         let _ = std::fs::remove_file(state);
 
         assert_eq!(report.current.as_deref(), Some("siliconflow"));
-        assert!(
-            report
-                .providers
-                .iter()
-                .any(|provider| provider.name == "doubao" && provider.live)
-        );
         assert!(
             report
                 .providers
@@ -6761,10 +6280,10 @@ live_enabled = false
     #[test]
     fn provider_update_uses_npm_metadata_and_skips_local_sources() {
         let npm_provider = test_installed_provider(
-            "qianwenime-asr",
+            "example-asr",
             Some(provider_install_metadata(
                 ProviderInstallSourceKind::Npm,
-                Some("@dicta-asr/qianwenime-asr".to_owned()),
+                Some("@dicta-asr/example-asr".to_owned()),
                 Some(DEFAULT_NPM_REGISTRY.to_owned()),
                 Some("0.1.0".to_owned()),
             )),
@@ -6778,39 +6297,39 @@ live_enabled = false
                 None,
             )),
         );
-        let legacy_provider = test_installed_provider("doubaoime-asr", None);
+        let legacy_provider = test_installed_provider("legacy-asr", None);
 
         assert_eq!(
             provider_update_package(&npm_provider).as_deref(),
-            Some("@dicta-asr/qianwenime-asr")
+            Some("@dicta-asr/example-asr")
         );
         assert_eq!(provider_update_package(&local_provider), None);
         assert_eq!(
             provider_update_package(&legacy_provider).as_deref(),
-            Some("@dicta-asr/doubaoime-asr")
+            Some("@dicta-asr/legacy-asr")
         );
     }
 
     #[test]
     fn provider_package_names_use_logical_scope_and_npm_platform_terms() {
         assert_eq!(
-            canonical_provider_package_name("qianwenime-asr"),
-            "@dicta-asr/qianwenime-asr"
+            canonical_provider_package_name("example-asr"),
+            "@dicta-asr/example-asr"
         );
         assert_eq!(
-            canonical_provider_package_name("@dicta-asr/qianwenime-asr"),
-            "@dicta-asr/qianwenime-asr"
+            canonical_provider_package_name("@dicta-asr/example-asr"),
+            "@dicta-asr/example-asr"
         );
         assert_eq!(
-            provider_id_from_package_name("@dicta-asr/qianwenime-asr"),
-            "qianwenime-asr"
+            provider_id_from_package_name("@dicta-asr/example-asr"),
+            "example-asr"
         );
         assert!(is_probable_provider_platform_package(
-            "@dicta-asr/qianwenime-asr",
-            "@dicta-asr/qianwenime-asr-darwin-arm64"
+            "@dicta-asr/example-asr",
+            "@dicta-asr/example-asr-darwin-arm64"
         ));
         assert!(!is_probable_provider_platform_package(
-            "@dicta-asr/qianwenime-asr",
+            "@dicta-asr/example-asr",
             "@dicta-asr/other-asr-darwin-arm64"
         ));
         assert_ne!(npm_current_os(), "macos");
@@ -6846,7 +6365,7 @@ live_enabled = false
     }
 
     #[test]
-    fn current_provider_reports_default_provider_when_state_is_missing() {
+    fn current_provider_reports_none_when_state_is_missing_and_no_platform_default_exists() {
         let state = temp_provider_state_path();
         let cli = Cli {
             provider_state: Some(state),
@@ -6855,8 +6374,14 @@ live_enabled = false
 
         let report = gather_current_provider_report(&cli).unwrap();
 
-        assert!(report.provider.is_some());
-        assert!(report.live);
+        assert_eq!(report.provider, None);
+        assert!(!report.live);
+        assert!(
+            report
+                .local_config_error
+                .as_deref()
+                .is_some_and(|error| error.contains("no active provider is set"))
+        );
     }
 
     #[test]

@@ -39,7 +39,6 @@ The Rust code is organized as:
 | `crates/dicta-core` | Shared transcript schema and audio input types. Keep this portable and low-dependency so future Web/WASM or server code can reuse it. |
 | `crates/dicta-asr` | Provider trait, ASR options, capabilities, and provider-level errors. |
 | `crates/dicta-asr-openai-compatible` | Direct multipart client for OpenAI-compatible `/v1/audio/transcriptions` APIs. |
-| `crates/dicta-asr-doubao` | Rust-native Doubao IME ASR provider. It owns device registration, credential caching, Opus frame encoding, and protobuf WebSocket requests. |
 | `crates/dicta-asr-native-adapter` | Provider-neutral bridge that invokes platform-native adapter binaries and parses JSONL output/events. |
 | `crates/dicta-audio` | Cross-platform default microphone capture. It currently records fixed-duration WAV files through CPAL/Hound. |
 | `crates/dicta-cli` | CLI argument parsing, provider orchestration, live rendering, transcript logging, and exit prompts. |
@@ -50,13 +49,10 @@ The Rust code is organized as:
 ```bash
 dicta --input PATH
    [--mic-duration SECONDS]
-   [--asr auto|openai-compatible|doubao|apple]
+   [--asr auto|openai-compatible|apple]
    [--api-base URL]
    [--api-key KEY]
    [--api-model MODEL]
-   [--doubao-credential-path PATH]
-   [--doubao-device-id ID]
-   [--doubao-token TOKEN]
    [--src LOCALE]
    [--dst LOCALE]
    [--live]
@@ -80,8 +76,8 @@ the default input device to a temporary WAV and then submits that file to the
 selected provider.
 
 Without `--input` or `--mic-duration`, `dicta` enters live mode. Rust owns live TTY
-rendering, finalized JSONL output, transcript logging, and exit prompts for both
-Apple and Doubao.
+rendering, finalized JSONL output, transcript logging, and exit prompts for Apple
+and installed live provider packages.
 
 `--doctor` bypasses audio-source validation and does not call providers. It
 prints system, backend-resolution, API-config, default-input, Apple on-device
@@ -97,24 +93,17 @@ provider capability can supply those results honestly.
 `--transcript PATH` writes the single finalized result after the provider
 returns. With `--json`, it writes one JSONL event plus a trailing newline.
 Without `--json`, it writes plain transcript text plus a trailing newline. In
-live mode, `dicta-cli` owns the incremental renderer and session log for both
-Apple and Doubao; Apple adapter volatile/meta events are internal and only drive
-the TTY view.
+live mode, `dicta-cli` owns the incremental renderer and session log; Apple
+adapter volatile/meta events are internal and only drive the TTY view.
 
-`auto` is platform-aware. In live mode it selects Apple live on macOS 26+ and
-Doubao live where Apple on-device ASR is unavailable. In batch mode it resolves
-to `doubao` on systems where Apple on-device ASR is not available; on macOS 26+
-it keeps the generic `openai-compatible` HTTP path unless
-`--asr apple --native-adapter ...` is selected explicitly.
-`--api-model doubaoime-asr` and compatibility alias `--api-model doubao-asr` also
-resolve to `doubao`; any other explicit model resolves to `openai-compatible`.
-`doubao` is handled by `dicta-asr-doubao` with default model `doubaoime-asr`. It
-does not require `--api-base` or `--api-key`; first use auto-registers
-credentials and caches them at `~/.config/dicta/doubao-credentials.json` unless
-overridden. `apple` is available only when the current OS supports Apple
-on-device ASR and `--native-adapter` / `DICTA_NATIVE_ADAPTER` points to a native
-Apple Speech adapter binary. On systems below macOS 26, `apple` reports that
-Apple on-device mode is unavailable.
+`auto` resolves batch transcription to the generic `openai-compatible` HTTP path
+unless `--asr apple --native-adapter ...` is selected explicitly. In live mode it
+selects Apple live only on supported macOS systems; other live providers must be
+installed and selected through `dicta provider install` and `dicta provider set`.
+`apple` is available only when the current OS supports Apple on-device ASR and
+`--native-adapter` / `DICTA_NATIVE_ADAPTER` points to a native Apple Speech
+adapter binary. On systems below macOS 26, `apple` reports that Apple on-device
+mode is unavailable.
 
 ## Native Adapter Workflow
 
@@ -134,11 +123,11 @@ events; Rust owns TTY rendering, transcript logging, and exit prompts.
 
 ## Python Sidecar Status
 
-`doubao_asr_api.py` is not part of the new runtime architecture. New work should
-not add dependencies on Python, FastAPI, or the Python `doubaoime_asr` package.
-Doubao support lives in `dicta-asr-doubao` as a Rust-native protocol implementation.
-The protocol is unofficial; keep the implementation isolated behind the provider
-crate so OpenAI-compatible and Apple providers do not inherit that risk.
+Python sidecars are not part of the runtime architecture. New work should not
+add dependencies on Python, FastAPI, or provider-specific Python packages.
+Private or unofficial ASR protocols belong in installable provider packages
+outside this main repository so OpenAI-compatible and Apple providers do not
+inherit that risk.
 
 ## Web Direct Mode
 

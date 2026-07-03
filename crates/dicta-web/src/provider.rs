@@ -10,7 +10,6 @@ use dicta_core::{TranscriptConfidence, TranscriptSource};
 #[serde(rename_all = "kebab-case")]
 pub enum WebProviderKind {
     OpenAiCompatible,
-    DoubaoIme,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,12 +54,7 @@ pub async fn transcribe_file(config: JsValue, file: File) -> Result<JsValue, JsV
     let config: WebProviderConfig = json::from_js(&config)?;
     validate_config(&config)?;
 
-    match config.provider {
-        WebProviderKind::OpenAiCompatible => transcribe_openai_compatible(config, file).await,
-        WebProviderKind::DoubaoIme => Err(error::message(
-            "doubao-ime is not available in browser direct mode; use openai-compatible with a CORS-enabled HTTP endpoint",
-        )),
-    }
+    transcribe_openai_compatible(config, file).await
 }
 
 async fn transcribe_openai_compatible(
@@ -132,9 +126,7 @@ fn validate_config(config: &WebProviderConfig) -> Result<(), JsValue> {
     if config.model.trim().is_empty() {
         return Err(error::message("model is required"));
     }
-    if matches!(config.provider, WebProviderKind::OpenAiCompatible)
-        && config.api_base.trim().is_empty()
-    {
+    if config.api_base.trim().is_empty() {
         return Err(error::message("apiBase is required"));
     }
     Ok(())

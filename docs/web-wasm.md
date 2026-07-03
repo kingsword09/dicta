@@ -2,7 +2,7 @@
 
 `crates/dicta-web` is the browser-only WASM crate. It is separate from the Rust CLI
 and native provider crates so browser builds do not pull in `tokio`, `reqwest`,
-`cpal`, platform adapters, or the Doubao native WebSocket stack.
+`cpal`, platform adapters, or external provider runtimes.
 
 The crate shares `dicta-core` transcript schema. A successful transcription returns
 this shape:
@@ -51,10 +51,8 @@ const config = {
 `apiKey`, `language`, and `prompt` are optional. If `apiBase` already ends in
 `/v1`, only `/audio/transcriptions` is appended.
 
-Doubao can be used in web mode when a CORS-enabled HTTP endpoint accepts the
-same OpenAI-compatible multipart contract. The native Doubao IME protocol is not
-available in browser direct mode because the current unofficial WebSocket
-handshake depends on headers that browser WebSocket APIs cannot set.
+Custom ASR services can be used in web mode when a CORS-enabled HTTP endpoint
+accepts the same OpenAI-compatible multipart contract.
 
 ## Audio
 

@@ -5,10 +5,9 @@ transcription. The default release keeps only portable, redistributable pieces
 in the main CLI and lets provider packages supply private or platform-specific
 ASR runtimes when needed.
 
-Built-in providers cover Apple on-device speech on supported macOS systems,
-Doubao IME ASR, and OpenAI-compatible batch APIs. Additional providers can be
-installed from npm-compatible tarballs without running `npm install` or creating
-`node_modules`.
+Built-in providers cover Apple on-device speech on supported macOS systems and
+OpenAI-compatible batch APIs. Provider packages cover services that need custom
+protocols, private libraries, or platform-specific binaries.
 
 ## Install
 
@@ -79,7 +78,7 @@ protocol details, active-provider state, and custom OpenAI-compatible profiles.
 Live mode:
 
 ```console
-$ dicta                                  # macOS 26: Apple on-device; otherwise Doubao
+$ dicta                                  # Uses the active live provider
 $ dicta --src en-US --dst ja-JP          # Transcribe and translate
 $ dicta --no-speaker                     # Mic only
 $ dicta --no-mic --src en-US --dst ja-JP # Speaker only on Apple mode
@@ -94,29 +93,18 @@ Status bar mode:
 ```console
 $ dicta --ui                             # Open the status bar provider switcher
 $ dicta --ui --live                      # Open the switcher and start live mode
-$ dicta --ui --provider doubao --live    # Set the initial provider, then start live
+$ dicta --ui --provider active --live    # Use the saved active provider
 ```
 
 The status bar UI is the Rust `dicta-tray` companion binary. Left-clicking the
 status item opens a compact provider panel; right-clicking keeps a native menu
 fallback. It lists built-in and configured provider profiles and runs live
 transcription as a supervised `dicta --provider active --live` worker. Without a
-saved active provider, `active` defaults to Apple on supported macOS systems and
-Doubao elsewhere. Switching providers from the panel stores the active selection
-in `~/.config/dicta/active-provider.json` and restarts the worker, so a failed
-provider can be replaced without leaving the status bar UI.
-
-Doubao does not require an API key:
-
-```console
-$ dicta --asr doubao --src zh-CN
-$ dicta --asr doubao --json
-$ dicta --asr doubao --src zh-CN --live-chunk 3
-$ dicta --input meeting.wav --asr doubao --src zh-CN
-$ dicta --mic-duration 5 \
-    --asr doubao \
-    --src zh-CN
-```
+saved active provider, `active` defaults to Apple only on supported macOS
+systems. On other systems, install a live provider package and select it with
+`dicta provider set <provider-name>`. Switching providers from the panel stores
+the active selection in `~/.config/dicta/active-provider.json` and restarts the
+worker, so a failed provider can be replaced without leaving the status bar UI.
 
 OpenAI-compatible transcription:
 
@@ -183,11 +171,10 @@ $ dicta --input meeting.wav --json --transcript meeting.jsonl
 $ dicta --doctor
 $ dicta --doctor --json
 $ dicta --capabilities
-$ dicta --capabilities --asr doubao --json
 $ dicta --capabilities --provider openai --json
 $ dicta provider list
 $ dicta provider current
-$ dicta provider set doubao
+$ dicta provider set openai
 ```
 
 `--input` and `--mic-duration` are mutually exclusive. Without either flag, `dicta`
@@ -242,10 +229,8 @@ Provider implementations declare their maximum batch and live capabilities.
 Named profiles can narrow those capabilities for OpenAI-compatible services
 without new Rust code. Installed provider packages run as separate processes
 through the same JSONL provider protocol used by the CLI. Apple live is
-streaming and can emit partial/final/translation events. Doubao live is chunked
-microphone transcription with chunk status and finalized text only; use
-`--capabilities` to inspect the resolved provider and `--doctor` for full
-environment diagnostics.
+streaming and can emit partial/final/translation events; use `--capabilities` to
+inspect the resolved provider and `--doctor` for full environment diagnostics.
 
 ## License
 

@@ -287,7 +287,7 @@
 
         <div class="field">
           <label for="model">Model</label>
-          <input id="model" name="model" type="text" value="doubao-asr" required>
+          <input id="model" name="model" type="text" value="whisper-1" required>
         </div>
 
         <div class="field">
@@ -320,7 +320,7 @@ import { createDictaAudioRecordedHandler } from "./dicta-transcriber.js";
 const transcribeWithDicta = createDictaAudioRecordedHandler({
   apiBase: "https://api.example.com",
   apiKey: "...",
-  model: "doubao-asr",
+  model: "whisper-1",
   language: "zh-CN",
 });
 
@@ -341,7 +341,7 @@ export function Composer() {
 &lt;dicta-speech-recorder
   api-base="https://api.example.com"
   api-key="..."
-  model="doubao-asr"
+  model="whisper-1"
   language="zh-CN"
 &gt;&lt;/dicta-speech-recorder&gt;
 
@@ -360,7 +360,7 @@ export function Composer() {
 const result = await transcribeAudio(audioBlob, {
   apiBase: "https://api.example.com",
   apiKey: "...",
-  model: "doubao-asr",
+  model: "whisper-1",
 });
 
 console.log(result.text);</code></pre>
@@ -384,7 +384,7 @@ console.log(result.text);</code></pre>
       return {
         apiBase: String(data.get("apiBase") || ""),
         apiKey: String(data.get("apiKey") || ""),
-        model: String(data.get("model") || "doubao-asr"),
+        model: String(data.get("model") || "whisper-1"),
         language: String(data.get("language") || ""),
         prompt: String(data.get("prompt") || ""),
       };

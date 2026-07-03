@@ -58,7 +58,7 @@ import { transcribeAudio } from "./dicta-transcriber.js";
 const result = await transcribeAudio(audioBlob, {
   apiBase: "https://api.example.com",
   apiKey: "...",
-  model: "doubao-asr",
+  model: "whisper-1",
   language: "zh-CN",
 });
 
@@ -83,7 +83,7 @@ import { createDictaAudioRecordedHandler } from "./dicta-transcriber.js";
 const transcribeWithDicta = createDictaAudioRecordedHandler({
   apiBase: "https://api.example.com",
   apiKey: "...",
-  model: "doubao-asr",
+  model: "whisper-1",
   language: "zh-CN",
 });
 
@@ -118,7 +118,7 @@ Importing the module registers `<dicta-speech-recorder>` automatically.
 <dicta-speech-recorder
   api-base="https://api.example.com"
   api-key="..."
-  model="doubao-asr"
+  model="whisper-1"
   language="zh-CN"
 ></dicta-speech-recorder>
 
@@ -148,8 +148,6 @@ dicta-state-change
 - The target provider must allow browser CORS requests.
 - The API key is present in the browser process. This is acceptable for a local
   personal tool, but not for a public hosted site.
-- Doubao direct mode expects a Doubao endpoint that speaks the same
-  OpenAI-compatible transcription contract.
 - Browser microphone access usually requires a secure context. `file://` and
   `http://localhost` are accepted by modern desktop browsers; arbitrary
   non-local HTTP origins are not.
