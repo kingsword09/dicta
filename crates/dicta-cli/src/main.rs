@@ -3790,7 +3790,14 @@ fn gather_provider_list_report(cli: &Cli) -> Result<ProviderListReport> {
 
 fn gather_current_provider_report(cli: &Cli) -> Result<CurrentProviderReport> {
     let apple_support = apple_support();
-    let current = active_or_default_provider_name(cli, &apple_support)?;
+    gather_current_provider_report_with_support(cli, &apple_support)
+}
+
+fn gather_current_provider_report_with_support(
+    cli: &Cli,
+    apple_support: &AppleSupport,
+) -> Result<CurrentProviderReport> {
+    let current = active_or_default_provider_name(cli, apple_support)?;
     let Some(provider) = current else {
         return Ok(CurrentProviderReport {
             provider: None,
@@ -3807,8 +3814,8 @@ fn gather_current_provider_report(cli: &Cli) -> Result<CurrentProviderReport> {
         });
     };
     let current_cli = cli.with_provider_name(Some(provider.clone()));
-    let report = gather_capabilities_report(&current_cli);
-    let effective = effective_provider_for(&current_cli, &apple_support, true).ok();
+    let report = gather_capabilities_report_with_support(&current_cli, apple_support);
+    let effective = effective_provider_for(&current_cli, apple_support, true).ok();
     Ok(CurrentProviderReport {
         provider: Some(provider),
         state_path: provider_state_path(cli).map(|path| path.display().to_string()),
@@ -6371,8 +6378,13 @@ live_enabled = false
             provider_state: Some(state),
             ..test_cli()
         };
+        let support = AppleSupport {
+            version: Some("15.6.1".to_owned()),
+            supported: false,
+            reason: "macOS 15.6.1 is below 26".to_owned(),
+        };
 
-        let report = gather_current_provider_report(&cli).unwrap();
+        let report = gather_current_provider_report_with_support(&cli, &support).unwrap();
 
         assert_eq!(report.provider, None);
         assert!(!report.live);
