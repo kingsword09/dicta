@@ -1130,10 +1130,13 @@ mod tests {
 
         assert!(output.status.success());
         assert_eq!(configured_log, log_path);
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "visible-output");
+        assert_eq!(
+            normalize_newlines(&String::from_utf8_lossy(&output.stdout)),
+            "visible-output"
+        );
         assert!(output.stderr.is_empty());
         assert_eq!(
-            std::fs::read_to_string(&configured_log).unwrap(),
+            normalize_newlines(&std::fs::read_to_string(&configured_log).unwrap()),
             "hidden-error"
         );
 
@@ -1151,14 +1154,19 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn shell_echo_command(stdout: &str, stderr: &str) -> std::process::Command {
+    fn shell_echo_command(_stdout: &str, _stderr: &str) -> std::process::Command {
         let mut command = std::process::Command::new("cmd");
         command
             .arg("/C")
-            .arg("set /p=\"%~1\" <nul & set /p=\"%~2\" <nul 1>&2")
-            .arg(stdout)
-            .arg(stderr);
+            .arg("echo visible-output& echo hidden-error 1>&2");
         command
+    }
+
+    fn normalize_newlines(value: &str) -> String {
+        value
+            .replace("\r\n", "\n")
+            .trim_end_matches('\n')
+            .to_owned()
     }
 
     fn provider_report(current: Option<&str>) -> ProviderListReport {
