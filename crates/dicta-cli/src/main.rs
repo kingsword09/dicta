@@ -1394,17 +1394,37 @@ async fn run_ui(cli: &Cli) -> Result<()> {
     command.env("DICTA_UI_LIVE_ARGS", live_args_for_ui(cli).join("\n"));
     command.env("DICTA_UI_AUTOSTART", if cli.live { "1" } else { "0" });
     command.env(ENV_LIVE_APPEND_ONLY, "1");
-    command
-        .status()
-        .await
-        .with_context(|| format!("failed to launch tray UI with {description}"))
-        .and_then(|status| {
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to launch tray UI with {description}"))?;
+    let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
+
+    tokio::select! {
+        status = child.wait() => {
+            let status = status.with_context(|| format!("failed to wait for tray UI with {description}"))?;
             if status.success() {
                 Ok(())
             } else {
                 bail!("tray UI exited with status {status}")
             }
-        })
+        }
+        signal = &mut ctrl_c => {
+            signal.context("failed to listen for Ctrl-C while tray UI was running")?;
+            request_external_provider_shutdown(&mut child).await;
+            let shutdown_timer = time::sleep(Duration::from_secs(30));
+            tokio::pin!(shutdown_timer);
+            tokio::select! {
+                status = child.wait() => {
+                    let _ = status;
+                }
+                _ = &mut shutdown_timer => {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
