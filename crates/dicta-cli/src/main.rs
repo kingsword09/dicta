@@ -49,6 +49,7 @@ const DEFAULT_PROVIDER_SCOPE: &str = "dicta-asr";
 const DEFAULT_PROVIDER_KEYWORD: &str = "dicta-provider";
 const PROVIDER_INSTALL_METADATA_FILE: &str = ".dicta-provider-install.json";
 const PROVIDER_STDERR_TAIL_LINES: usize = 20;
+const ENV_LIVE_APPEND_ONLY: &str = "DICTA_LIVE_APPEND_ONLY";
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "dicta")]
@@ -1373,6 +1374,7 @@ async fn run_ui(cli: &Cli) -> Result<()> {
     }
     command.env("DICTA_UI_LIVE_ARGS", live_args_for_ui(cli).join("\n"));
     command.env("DICTA_UI_AUTOSTART", if cli.live { "1" } else { "0" });
+    command.env(ENV_LIVE_APPEND_ONLY, "1");
     command
         .status()
         .await
@@ -1732,6 +1734,7 @@ struct LiveRenderer {
     status: Option<LiveStatusEvent>,
     volatile: Vec<LiveVolatileEvent>,
     live_region_lines: usize,
+    append_only: bool,
 }
 
 impl LiveRenderer {
@@ -1743,6 +1746,25 @@ impl LiveRenderer {
         dst: Option<String>,
     ) -> Result<Self> {
         let json_mode = json_forced || !std::io::stdout().is_terminal();
+        let append_only = live_append_only_from_env();
+        Self::new_with_rendering(
+            json_mode,
+            append_only,
+            transcript,
+            show_channel_label,
+            src,
+            dst,
+        )
+    }
+
+    fn new_with_rendering(
+        json_mode: bool,
+        append_only: bool,
+        transcript: Option<PathBuf>,
+        show_channel_label: bool,
+        src: Option<String>,
+        dst: Option<String>,
+    ) -> Result<Self> {
         let session_log = LiveSessionLog::open(transcript, json_mode)?;
         Ok(Self {
             json_mode,
@@ -1758,6 +1780,7 @@ impl LiveRenderer {
             status: None,
             volatile: Vec::new(),
             live_region_lines: 0,
+            append_only,
         })
     }
 
@@ -1969,7 +1992,7 @@ impl LiveRenderer {
     }
 
     fn live_region_lines(&self) -> Vec<String> {
-        if self.json_mode {
+        if self.json_mode || self.append_only {
             return Vec::new();
         }
         let mut lines = Vec::new();
@@ -2025,7 +2048,7 @@ impl LiveRenderer {
     }
 
     fn redraw_live_region(&mut self) {
-        if self.json_mode {
+        if self.json_mode || self.append_only {
             return;
         }
         self.clear_live_region();
@@ -2038,7 +2061,7 @@ impl LiveRenderer {
     }
 
     fn clear_live_region(&mut self) {
-        if self.json_mode || self.live_region_lines == 0 {
+        if self.json_mode || self.append_only || self.live_region_lines == 0 {
             return;
         }
         for _ in 0..self.live_region_lines {
@@ -2222,6 +2245,10 @@ fn transcript_stamp() -> String {
 
 fn can_prompt_for_log() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+fn live_append_only_from_env() -> bool {
+    env::var(ENV_LIVE_APPEND_ONLY).is_ok_and(|value| value == "1")
 }
 
 fn confirm_overwrite(path: &PathBuf) -> Result<bool> {
@@ -6724,6 +6751,36 @@ live_enabled = false
         assert!(!written.contains(r#""type":"status""#));
         assert!(!written.contains("recording 3s chunk"));
         assert!(written.contains(r#""text":"hello""#));
+    }
+
+    #[test]
+    fn live_renderer_append_only_suppresses_live_region() {
+        let mut renderer = LiveRenderer::new_with_rendering(
+            false,
+            true,
+            None,
+            false,
+            Some("en-US".to_owned()),
+            None,
+        )
+        .unwrap();
+
+        renderer
+            .handle_live_event(LiveEvent::Status(LiveStatusEvent {
+                phase: dicta_core::LiveStatusPhase::Recording,
+                message: "recording".to_owned(),
+                detail: None,
+            }))
+            .unwrap();
+        renderer
+            .handle_live_event(LiveEvent::Volatile(LiveVolatileEvent {
+                channel: AudioChannel::Mic,
+                text: "partial".to_owned(),
+            }))
+            .unwrap();
+
+        assert!(renderer.live_region_lines().is_empty());
+        assert_eq!(renderer.live_region_lines, 0);
     }
 
     #[test]
