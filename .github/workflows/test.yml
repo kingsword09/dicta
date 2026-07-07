@@ -36,7 +36,7 @@ jobs:
         include:
           - os: ubuntu-latest
           - os: ubuntu-24.04-arm
-          - os: macos-latest
+          - os: macos-15
           - os: windows-latest
           - os: windows-11-arm
     runs-on: ${{ matrix.os }}
@@ -56,7 +56,14 @@ jobs:
       - name: Fetch Rust dependencies
         run: cargo fetch --locked
 
+      - name: Test macOS
+        if: runner.os == 'macOS'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "15.0"
+        run: cargo test --workspace --locked
+
       - name: Test
+        if: runner.os != 'macOS'
         run: cargo test --workspace --locked
 
       - name: Format

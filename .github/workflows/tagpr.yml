@@ -64,7 +64,7 @@ jobs:
             exe_name: dicta
             tray_exe_name: dicta-tray
             archive_ext: tar.gz
-          - os: macos-26
+          - os: macos-15
             archive_suffix: darwin_arm64
             bin: target/release/dicta
             tray_bin: target/release/dicta-tray
@@ -107,8 +107,34 @@ jobs:
       - name: Fetch Rust dependencies
         run: cargo fetch --locked
 
-      - name: Build release binary
+      - name: Build macOS release binary
+        if: matrix.archive_suffix == 'darwin_arm64'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "15.0"
         run: cargo build --release -p dicta-cli -p dicta-tray --locked
+
+      - name: Build release binary
+        if: matrix.archive_suffix != 'darwin_arm64'
+        run: cargo build --release -p dicta-cli -p dicta-tray --locked
+
+      - name: Verify macOS release compatibility metadata
+        if: matrix.archive_suffix == 'darwin_arm64'
+        run: |
+          ./target/release/dicta --version
+          file target/release/dicta target/release/dicta-tray
+          otool -l target/release/dicta | grep -A4 LC_BUILD_VERSION
+          otool -l target/release/dicta-tray | grep -A4 LC_BUILD_VERSION
+
+      - name: Select Xcode 26 for Apple Speech adapter
+        if: matrix.archive_suffix == 'darwin_arm64'
+        run: |
+          XCODE_26="$(find /Applications -maxdepth 1 -name 'Xcode_26*.app' -print | sort | tail -n 1)"
+          if [ "$XCODE_26" = "" ]; then
+            echo "Xcode 26 is required to build the Apple Speech adapter" >&2
+            exit 1
+          fi
+          sudo xcode-select -s "$XCODE_26"
+          xcodebuild -version
 
       - name: Build Apple Speech adapter
         if: matrix.archive_suffix == 'darwin_arm64'
