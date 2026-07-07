@@ -335,8 +335,8 @@ impl TrayApp {
         let log_path = match configure_live_worker_stdio(&mut command, &provider) {
             Ok(path) => Some(path),
             Err(error) => {
-                eprintln!("dicta-tray: failed to open live worker log: {error}");
-                command.stdout(Stdio::null()).stderr(Stdio::null());
+                eprintln!("dicta-tray: failed to open live worker stderr log: {error}");
+                command.stderr(Stdio::null());
                 None
             }
         };
@@ -346,7 +346,7 @@ impl TrayApp {
             Ok(child) => {
                 self.live_child = Some(child);
                 if let Some(path) = log_path {
-                    eprintln!("dicta-tray: live worker log: {}", path.display());
+                    eprintln!("dicta-tray: live worker stderr log: {}", path.display());
                 }
                 self.set_status(format!("Live running with {provider}"));
             }
@@ -664,13 +664,8 @@ fn create_tray_icon(app: &mut TrayApp) -> Result<TrayIcon> {
 
 fn configure_live_worker_stdio(command: &mut Command, provider: &str) -> Result<PathBuf> {
     let path = live_worker_log_path(provider);
-    let stdout = open_live_worker_log(&path)?;
-    let stderr = stdout
-        .try_clone()
-        .with_context(|| format!("failed to clone live worker log {}", path.display()))?;
-    command
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
+    let stderr = open_live_worker_log(&path)?;
+    command.stderr(Stdio::from(stderr));
     Ok(path)
 }
 
@@ -1117,6 +1112,53 @@ mod tests {
                 .any(|provider| provider.name == "openai")
         );
         assert_eq!(first_switchable_provider(&report), Some("live-asr"));
+    }
+
+    #[test]
+    fn live_worker_keeps_stdout_visible_and_logs_stderr() {
+        let provider = format!(
+            "stdio-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
+        let log_path = live_worker_log_path(&provider);
+        let _ = std::fs::remove_file(&log_path);
+
+        let mut command = shell_echo_command("visible-output", "hidden-error");
+        let configured_log = configure_live_worker_stdio(&mut command, &provider).unwrap();
+        let output = command.output().unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(configured_log, log_path);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "visible-output");
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&configured_log).unwrap(),
+            "hidden-error"
+        );
+
+        let _ = std::fs::remove_file(configured_log);
+    }
+
+    #[cfg(unix)]
+    fn shell_echo_command(stdout: &str, stderr: &str) -> std::process::Command {
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("printf '%s' \"$1\"; printf '%s' \"$2\" >&2");
+        command.arg("sh").arg(stdout).arg(stderr);
+        command
+    }
+
+    #[cfg(windows)]
+    fn shell_echo_command(stdout: &str, stderr: &str) -> std::process::Command {
+        let mut command = std::process::Command::new("cmd");
+        command
+            .arg("/C")
+            .arg("set /p=\"%~1\" <nul & set /p=\"%~2\" <nul 1>&2")
+            .arg(stdout)
+            .arg(stderr);
+        command
     }
 
     fn provider_report(current: Option<&str>) -> ProviderListReport {

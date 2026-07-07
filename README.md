@@ -85,7 +85,7 @@ $ dicta --no-mic --src en-US --dst ja-JP # Speaker only on Apple mode
 $ dicta --select-device                  # Pick and pin mic / speaker at startup
 $ dicta --json | jq                      # JSONL output for piping
 $ dicta --capabilities                   # ASR capability diagnostics
-$ dicta --doctor                         # Environment diagnostics
+$ dicta doctor                           # Environment diagnostics
 ```
 
 Status bar mode:
@@ -168,8 +168,8 @@ Output:
 $ dicta --input meeting.wav --json
 $ dicta --input meeting.wav --transcript meeting.txt
 $ dicta --input meeting.wav --json --transcript meeting.jsonl
-$ dicta --doctor
-$ dicta --doctor --json
+$ dicta doctor
+$ dicta --json doctor
 $ dicta --capabilities
 $ dicta --capabilities --provider openai --json
 $ dicta provider list
@@ -179,7 +179,7 @@ $ dicta provider set openai
 
 `--input` and `--mic-duration` are mutually exclusive. Without either flag, `dicta`
 enters live mode. Environment variables mirror the provider flags; run
-`dicta --help`, `dicta --capabilities`, and `dicta --doctor` for local details.
+`dicta --help`, `dicta --capabilities`, and `dicta doctor` for local details.
 
 ## Web
 
@@ -230,7 +230,7 @@ Named profiles can narrow those capabilities for OpenAI-compatible services
 without new Rust code. Installed provider packages run as separate processes
 through the same JSONL provider protocol used by the CLI. Apple live is
 streaming and can emit partial/final/translation events; use `--capabilities` to
-inspect the resolved provider and `--doctor` for full environment diagnostics.
+inspect the resolved provider and `dicta doctor` for full environment diagnostics.
 
 ## License
 

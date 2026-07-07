@@ -16,7 +16,7 @@ cargo test --workspace
 ./scripts/build.sh
 ./scripts/test.sh
 target/debug/dicta --help
-target/debug/dicta --doctor
+target/debug/dicta doctor
 ```
 
 `dicta serve` exposes the selected batch ASR provider as a local
@@ -63,7 +63,6 @@ dicta --input PATH
    [--native-adapter PATH]
    [--json]
    [--transcript PATH]
-   [--doctor]
 dicta serve
    [--host HOST]
    [--port PORT]
@@ -79,9 +78,9 @@ Without `--input` or `--mic-duration`, `dicta` enters live mode. Rust owns live 
 rendering, finalized JSONL output, transcript logging, and exit prompts for Apple
 and installed live provider packages.
 
-`--doctor` bypasses audio-source validation and does not call providers. It
+`dicta doctor` bypasses audio-source validation and does not call providers. It
 prints system, backend-resolution, API-config, default-input, Apple on-device
-support, and runtime diagnostics. With `--json`, it emits a single
+support, and runtime diagnostics. With `--json` before the command, it emits a single
 pretty-printed JSON object.
 
 `serve` bypasses CLI audio-source validation and does not enter live mode. It

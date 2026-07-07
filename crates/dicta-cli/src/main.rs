@@ -155,9 +155,6 @@ struct Cli {
     #[arg(long, help = "Write the finalized transcript to this path")]
     transcript: Option<PathBuf>,
 
-    #[arg(long, help = "Print environment and backend diagnostics")]
-    doctor: bool,
-
     #[arg(long, help = "Print ASR provider capability diagnostics")]
     capabilities: bool,
 
@@ -196,7 +193,6 @@ impl Cli {
             select_device: self.select_device,
             json: self.json,
             transcript: self.transcript.clone(),
-            doctor: self.doctor,
             capabilities: self.capabilities,
             ui: self.ui,
             provider_state: self.provider_state.clone(),
@@ -208,6 +204,10 @@ impl Cli {
 
 #[derive(Debug, Clone, Subcommand)]
 enum Command {
+    #[command(about = "Print environment and backend diagnostics")]
+    Doctor,
+    #[command(about = "Print ASR provider capability diagnostics")]
+    Capabilities,
     #[command(about = "Serve an OpenAI-compatible ASR HTTP API")]
     Serve(ServeCommand),
     #[command(about = "Manage named ASR provider selections")]
@@ -757,11 +757,6 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    if cli.doctor {
-        run_doctor(&cli)?;
-        return Ok(());
-    }
-
     if should_run_live(&cli) {
         run_live(&cli).await?;
         return Ok(());
@@ -804,6 +799,8 @@ async fn main() -> Result<()> {
 
 async fn run_command(cli: &Cli, command: &Command) -> Result<()> {
     match command {
+        Command::Doctor => run_doctor(cli),
+        Command::Capabilities => run_capabilities(cli),
         Command::Serve(command) => run_serve(cli, command).await,
         Command::Provider(command) => run_provider_command(cli, command).await,
         Command::Update(command) => run_update_command(command).await,
@@ -5457,7 +5454,6 @@ mod tests {
             select_device: false,
             json: false,
             transcript: None,
-            doctor: false,
             capabilities: false,
             ui: false,
             provider_state: None,
@@ -5592,6 +5588,25 @@ expected_latency_ms = 5000
         assert_eq!(command.port, 4777);
         assert_eq!(command.max_upload_mb, 25);
         assert!(command.cors_origins.is_empty());
+    }
+
+    #[test]
+    fn doctor_command_is_available() {
+        let cli = Cli::try_parse_from(["dicta", "doctor"]).unwrap();
+
+        assert!(matches!(cli.command, Some(Command::Doctor)));
+    }
+
+    #[test]
+    fn doctor_flag_is_not_available() {
+        assert!(Cli::try_parse_from(["dicta", "--doctor"]).is_err());
+    }
+
+    #[test]
+    fn capabilities_command_is_available() {
+        let cli = Cli::try_parse_from(["dicta", "capabilities"]).unwrap();
+
+        assert!(matches!(cli.command, Some(Command::Capabilities)));
     }
 
     #[test]
@@ -5791,7 +5806,6 @@ expected_latency_ms = 5000
         let cli = Cli {
             asr: AsrBackend::Apple,
             json: true,
-            doctor: true,
             ..test_cli()
         };
         let support = AppleSupport {
@@ -5950,7 +5964,6 @@ expected_latency_ms = 5000
     fn doctor_reports_no_python_sidecar_requirement() {
         let cli = Cli {
             json: true,
-            doctor: true,
             ..test_cli()
         };
 
@@ -6084,7 +6097,6 @@ live_enabled = false
         let cli = Cli {
             provider: Some("local-key".to_owned()),
             provider_config: Some(config.clone()),
-            doctor: true,
             ..test_cli()
         };
 
@@ -6523,7 +6535,6 @@ live_enabled = false
             api_key: Some("".to_owned()),
             api_model: Some("  ".to_owned()),
             json: true,
-            doctor: true,
             ..test_cli()
         };
 
