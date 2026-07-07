@@ -1,8 +1,10 @@
 use anyhow::{Context, Result, bail};
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState, hotkey::HotKey};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -63,6 +65,9 @@ const ACTION_QUIT: &str = "quit";
 struct AppConfig {
     dicta_bin: String,
     live_args: Vec<String>,
+    ptt_args: Vec<String>,
+    activation: ActivationPreference,
+    hotkey: Option<ConfiguredHotkey>,
     provider_config: Option<String>,
     provider_state: Option<String>,
     autostart: bool,
@@ -75,7 +80,62 @@ struct TrayApp {
     provider_report: Option<ProviderListReport>,
     provider_actions: BTreeMap<String, String>,
     live_child: Option<Child>,
+    worker_mode: Option<WorkerMode>,
+    ptt_recording: bool,
+    hotkey_down: bool,
     status: String,
+}
+
+#[derive(Debug, Clone)]
+struct ConfiguredHotkey {
+    hotkey: HotKey,
+    label: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerMode {
+    Live,
+    Ptt,
+}
+
+impl WorkerMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Ptt => "PTT",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Live => "Live",
+            Self::Ptt => "PTT",
+        }
+    }
+
+    fn state_name(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Ptt => "ptt",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivationPreference {
+    Auto,
+    Live,
+    Ptt,
+}
+
+impl ActivationPreference {
+    fn ready_label(self) -> &'static str {
+        match self {
+            Self::Auto => "realtime-ready",
+            Self::Live => "live-ready",
+            Self::Ptt => "PTT-ready",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +143,7 @@ enum UserEvent {
     Menu(MenuEvent),
     Tray(TrayIconEvent),
     Panel(PanelMessage),
+    Hotkey { id: u32, state: HotKeyState },
     ShutdownSignal,
 }
 
@@ -101,6 +162,8 @@ struct ProviderListEntry {
     #[serde(default)]
     live: bool,
     #[serde(default)]
+    ptt: bool,
+    #[serde(default)]
     local_config_ok: bool,
     local_config_error: Option<String>,
     model: String,
@@ -117,6 +180,10 @@ struct PanelState<'a> {
     status: &'a str,
     current: Option<&'a str>,
     live_running: bool,
+    worker_mode: Option<&'static str>,
+    ptt_recording: bool,
+    selected_ptt: bool,
+    hotkey: Option<&'a str>,
     selected_ready: bool,
     providers: &'a [ProviderListEntry],
 }
@@ -136,6 +203,13 @@ impl Default for AppConfig {
                 "active".to_owned(),
                 "--live".to_owned(),
             ],
+            ptt_args: vec![
+                "--provider".to_owned(),
+                "active".to_owned(),
+                "--ptt".to_owned(),
+            ],
+            activation: ActivationPreference::Auto,
+            hotkey: None,
             provider_config: None,
             provider_state: None,
             autostart: false,
@@ -161,6 +235,30 @@ impl AppConfig {
                 .collect();
             if !args.is_empty() {
                 config.live_args = args;
+            }
+        }
+        if let Ok(value) = env::var("DICTA_UI_PTT_ARGS") {
+            let args: Vec<String> = value
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+            if !args.is_empty() {
+                config.ptt_args = args;
+            }
+        }
+        if let Ok(value) = env::var("DICTA_UI_ACTIVATION") {
+            config.activation = match value.trim().to_ascii_lowercase().as_str() {
+                "live" => ActivationPreference::Live,
+                "ptt" => ActivationPreference::Ptt,
+                _ => ActivationPreference::Auto,
+            };
+        }
+        if let Ok(value) = env::var("DICTA_UI_HOTKEY") {
+            match parse_hotkey_config(&value) {
+                Ok(hotkey) => config.hotkey = hotkey,
+                Err(error) => eprintln!("dicta-tray: hotkey disabled: {error}"),
             }
         }
         config.provider_config = non_empty_env("DICTA_PROVIDER_CONFIG");
@@ -189,6 +287,9 @@ impl TrayApp {
             provider_report: None,
             provider_actions: BTreeMap::new(),
             live_child: None,
+            worker_mode: None,
+            ptt_recording: false,
+            hotkey_down: false,
             status: "Starting".to_owned(),
         }
     }
@@ -229,7 +330,11 @@ impl TrayApp {
 
     fn selected_provider_ready(&self) -> bool {
         self.selected_provider_entry()
-            .is_some_and(provider_switchable)
+            .is_some_and(|provider| self.provider_ready_for_activation(provider))
+    }
+
+    fn selected_provider_mode(&self) -> Option<WorkerMode> {
+        selected_provider_mode(self.selected_provider_entry()?, self.config.activation)
     }
 
     fn provider_by_name(&self, name: &str) -> Option<&ProviderListEntry> {
@@ -241,7 +346,13 @@ impl TrayApp {
     }
 
     fn provider_switchable(&self, name: &str) -> bool {
-        self.provider_by_name(name).is_some_and(provider_switchable)
+        self.provider_by_name(name)
+            .is_some_and(|provider| self.provider_ready_for_activation(provider))
+    }
+
+    fn provider_ready_for_activation(&self, provider: &ProviderListEntry) -> bool {
+        provider.local_config_ok
+            && selected_provider_mode(provider, self.config.activation).is_some()
     }
 
     fn load_provider_report(&self) -> Result<ProviderListReport> {
@@ -261,12 +372,20 @@ impl TrayApp {
 
     fn load_provider_report_with_live_default(&self) -> Result<(ProviderListReport, String)> {
         let report = self.load_provider_report()?;
-        if report_current_switchable(&report) {
+        if report_current_switchable_for(&report, self.config.activation) {
             return Ok((report, "Ready".to_owned()));
         }
 
-        let Some(name) = first_switchable_provider(&report).map(ToOwned::to_owned) else {
-            return Ok((report, "No live-ready providers found".to_owned()));
+        let Some(name) =
+            first_switchable_provider_for(&report, self.config.activation).map(ToOwned::to_owned)
+        else {
+            return Ok((
+                report,
+                format!(
+                    "No {} providers found",
+                    self.config.activation.ready_label()
+                ),
+            ));
         };
         self.remember_provider(&name)?;
         let report = self.load_provider_report()?;
@@ -302,7 +421,7 @@ impl TrayApp {
                 let switched_status = format!("Provider switched to {name}");
                 let was_running = self.live_child.is_some();
                 if was_running {
-                    self.stop_live();
+                    self.shutdown_live_worker();
                 }
                 self.refresh();
                 self.set_status(switched_status);
@@ -317,10 +436,6 @@ impl TrayApp {
     }
 
     fn start_live(&mut self) {
-        if self.live_child.is_some() {
-            self.set_status("Live already running");
-            return;
-        }
         if !self.selected_provider_ready() {
             let status = match self.selected_provider_entry() {
                 Some(provider) => unavailable_provider_status(provider),
@@ -329,12 +444,25 @@ impl TrayApp {
             self.set_status(status);
             return;
         }
+        let mode = self.selected_provider_mode().unwrap_or(WorkerMode::Live);
+        if self.live_child.is_some() {
+            match (self.worker_mode, mode, self.ptt_recording) {
+                (Some(WorkerMode::Ptt), WorkerMode::Ptt, false) => {
+                    self.start_ptt_recording();
+                }
+                (Some(WorkerMode::Ptt), WorkerMode::Ptt, true) => {
+                    self.set_status("PTT is already recording");
+                }
+                _ => self.set_status("Live already running"),
+            }
+            return;
+        }
 
         let provider = self
             .selected_provider()
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| "active provider".to_owned());
-        self.set_status(format!("Starting live with {provider}"));
+        self.set_status(format!("Starting {} with {provider}", mode.label()));
 
         let mut command = self.config.dicta_command();
         configure_live_worker_process(&mut command);
@@ -346,36 +474,103 @@ impl TrayApp {
                 None
             }
         };
-        command.args(&self.config.live_args).stdin(Stdio::null());
+        match mode {
+            WorkerMode::Live => {
+                command.args(&self.config.live_args).stdin(Stdio::null());
+            }
+            WorkerMode::Ptt => {
+                command.args(&self.config.ptt_args).stdin(Stdio::piped());
+            }
+        }
 
         match command.spawn() {
             Ok(child) => {
                 self.live_child = Some(child);
+                self.worker_mode = Some(mode);
+                self.ptt_recording = false;
                 if let Some(path) = log_path {
                     eprintln!("dicta-tray: live worker stderr log: {}", path.display());
                 }
-                self.set_status(format!("Live running with {provider}"));
+                match mode {
+                    WorkerMode::Live => self.set_status(format!("Live running with {provider}")),
+                    WorkerMode::Ptt => self.start_ptt_recording(),
+                }
             }
             Err(error) => {
-                self.set_status(format!("Live start failed: {error}"));
+                self.set_status(format!("{} start failed: {error}", mode.label()));
             }
         }
     }
 
     fn stop_live(&mut self) {
+        if self.worker_mode == Some(WorkerMode::Ptt) && self.ptt_recording {
+            self.stop_ptt_recording();
+            return;
+        }
+        self.shutdown_live_worker();
+    }
+
+    fn start_ptt_recording(&mut self) {
+        match self.write_ptt_toggle() {
+            Ok(()) => {
+                self.ptt_recording = true;
+                let provider = self.selected_provider().unwrap_or("active provider");
+                self.set_status(format!("PTT recording with {provider}"));
+            }
+            Err(error) => {
+                self.set_status(format!("PTT start failed: {error}"));
+                self.shutdown_live_worker();
+            }
+        }
+    }
+
+    fn stop_ptt_recording(&mut self) {
+        match self.write_ptt_toggle() {
+            Ok(()) => {
+                self.ptt_recording = false;
+                let provider = self.selected_provider().unwrap_or("active provider");
+                self.set_status(format!("PTT finalizing with {provider}"));
+            }
+            Err(error) => {
+                self.set_status(format!("PTT stop failed: {error}"));
+                self.shutdown_live_worker();
+            }
+        }
+    }
+
+    fn write_ptt_toggle(&mut self) -> std::io::Result<()> {
+        let Some(child) = self.live_child.as_mut() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "PTT worker is not running",
+            ));
+        };
+        let Some(stdin) = child.stdin.as_mut() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "PTT worker stdin is not available",
+            ));
+        };
+        stdin.write_all(b"\n")?;
+        stdin.flush()
+    }
+
+    fn shutdown_live_worker(&mut self) {
         let Some(mut child) = self.live_child.take() else {
             self.set_status("Live is not running");
             return;
         };
+        let mode = self.worker_mode.take().unwrap_or(WorkerMode::Live);
+        self.ptt_recording = false;
 
-        self.set_status("Stopping live");
+        self.set_status(format!("Stopping {}", mode.label()));
         if let Err(error) = request_live_worker_shutdown(&mut child) {
             eprintln!("dicta-tray: failed to request live worker shutdown: {error}");
         }
         match wait_live_worker_exit(&mut child, LIVE_WORKER_SHUTDOWN_TIMEOUT) {
             Ok(Some(status)) => {
                 eprintln!("dicta-tray: live worker exited with {status}");
-                self.set_status("Live stopped");
+                self.set_status(format!("{} stopped", mode.title()));
                 return;
             }
             Ok(None) => {
@@ -393,7 +588,7 @@ impl TrayApp {
         match child.wait() {
             Ok(status) => {
                 eprintln!("dicta-tray: live worker exited with {status}");
-                self.set_status("Live stopped");
+                self.set_status(format!("{} stopped", mode.title()));
             }
             Err(error) => {
                 self.set_status(format!("Live stop wait failed: {error}"));
@@ -404,7 +599,7 @@ impl TrayApp {
     fn restart_live(&mut self) {
         self.set_status("Restarting live");
         if self.live_child.is_some() {
-            self.stop_live();
+            self.shutdown_live_worker();
         } else {
             eprintln!("dicta-tray: live was not running; starting selected provider");
         }
@@ -418,12 +613,16 @@ impl TrayApp {
         match child.try_wait() {
             Ok(Some(status)) => {
                 self.live_child = None;
+                self.worker_mode = None;
+                self.ptt_recording = false;
                 self.status = format!("Live exited with {status}");
                 true
             }
             Ok(None) => false,
             Err(error) => {
                 self.live_child = None;
+                self.worker_mode = None;
+                self.ptt_recording = false;
                 self.status = format!("Live status failed: {error}");
                 true
             }
@@ -444,7 +643,7 @@ impl TrayApp {
 
         if let Some(report) = &self.provider_report {
             if report.providers.is_empty() {
-                let item = MenuItem::new("No live providers found", false, None);
+                let item = MenuItem::new("No realtime providers found", false, None);
                 menu.append(&item)?;
             } else {
                 for (index, provider) in report.providers.iter().enumerate() {
@@ -452,7 +651,7 @@ impl TrayApp {
                     self.provider_actions
                         .insert(id.clone(), provider.name.clone());
                     let label = provider_label(provider);
-                    let enabled = provider_switchable(provider);
+                    let enabled = self.provider_ready_for_activation(provider);
                     let item = CheckMenuItem::with_id(
                         MenuId::new(&id),
                         label,
@@ -471,20 +670,20 @@ impl TrayApp {
         menu.append(&PredefinedMenuItem::separator())?;
         let start = MenuItem::with_id(
             MenuId::new(MENU_START),
-            "Start Live",
-            self.live_child.is_none() && self.selected_provider_ready(),
+            self.start_menu_label(),
+            self.can_start_selected_worker(),
             None,
         );
         let stop = MenuItem::with_id(
             MenuId::new(MENU_STOP),
-            "Stop Live",
-            self.live_child.is_some(),
+            self.stop_menu_label(),
+            self.can_stop_selected_worker(),
             None,
         );
         let restart = MenuItem::with_id(
             MenuId::new(MENU_RESTART),
-            "Restart Live",
-            self.selected_provider_ready(),
+            "Restart Worker",
+            self.live_child.is_some() || self.selected_provider_ready(),
             None,
         );
         let refresh = MenuItem::with_id(MenuId::new(MENU_REFRESH), "Refresh Providers", true, None);
@@ -520,8 +719,85 @@ impl TrayApp {
             status: &self.status,
             current: self.selected_provider(),
             live_running: self.live_child.is_some(),
+            worker_mode: self.worker_mode.map(WorkerMode::state_name),
+            ptt_recording: self.ptt_recording,
+            selected_ptt: self.selected_provider_mode() == Some(WorkerMode::Ptt),
+            hotkey: self
+                .config
+                .hotkey
+                .as_ref()
+                .map(|hotkey| hotkey.label.as_str()),
             selected_ready: self.selected_provider_ready(),
             providers,
+        }
+    }
+
+    fn can_start_selected_worker(&self) -> bool {
+        if !self.selected_provider_ready() {
+            return false;
+        }
+        match (
+            self.live_child.is_some(),
+            self.worker_mode,
+            self.ptt_recording,
+        ) {
+            (false, _, _) => true,
+            (true, Some(WorkerMode::Ptt), false) => true,
+            _ => false,
+        }
+    }
+
+    fn can_stop_selected_worker(&self) -> bool {
+        match self.worker_mode {
+            Some(WorkerMode::Ptt) => self.ptt_recording,
+            Some(WorkerMode::Live) => self.live_child.is_some(),
+            None => false,
+        }
+    }
+
+    fn start_menu_label(&self) -> &'static str {
+        match self.selected_provider_mode() {
+            Some(WorkerMode::Ptt) => "Start PTT",
+            _ => "Start Live",
+        }
+    }
+
+    fn stop_menu_label(&self) -> &'static str {
+        match self.worker_mode {
+            Some(WorkerMode::Ptt) => "Stop PTT",
+            _ => "Stop Live",
+        }
+    }
+
+    fn handle_hotkey(&mut self, id: u32, state: HotKeyState) {
+        let Some(configured) = &self.config.hotkey else {
+            return;
+        };
+        if configured.hotkey.id() != id {
+            return;
+        }
+        match state {
+            HotKeyState::Pressed => {
+                if self.hotkey_down {
+                    return;
+                }
+                self.hotkey_down = true;
+                if self.selected_provider_mode() == Some(WorkerMode::Ptt) {
+                    if !self.ptt_recording {
+                        self.start_live();
+                    }
+                } else if self.live_child.is_some() {
+                    self.shutdown_live_worker();
+                } else {
+                    self.start_live();
+                }
+            }
+            HotKeyState::Released => {
+                self.hotkey_down = false;
+                if self.worker_mode == Some(WorkerMode::Ptt) && self.ptt_recording {
+                    self.stop_ptt_recording();
+                }
+            }
         }
     }
 }
@@ -544,6 +820,7 @@ fn main() -> Result<()> {
 
     let mut app = TrayApp::new(config);
     app.refresh();
+    let _hotkey_registration = install_global_hotkey(&app.config, event_loop.create_proxy());
     if app.config.autostart {
         app.start_live();
     }
@@ -585,7 +862,7 @@ fn main() -> Result<()> {
                         MENU_RESTART => app.restart_live(),
                         MENU_REFRESH => app.refresh(),
                         MENU_QUIT => {
-                            app.stop_live();
+                            app.shutdown_live_worker();
                             *control_flow = ControlFlow::Exit;
                         }
                         _ => {}
@@ -611,8 +888,13 @@ fn main() -> Result<()> {
                     *control_flow = ControlFlow::Exit;
                 }
             }
+            Event::UserEvent(UserEvent::Hotkey { id, state }) => {
+                app.handle_hotkey(id, state);
+                app.reap_live();
+                refresh_shell(&mut app, tray_icon.as_ref(), panel.as_ref());
+            }
             Event::UserEvent(UserEvent::ShutdownSignal) => {
-                app.stop_live();
+                app.shutdown_live_worker();
                 *control_flow = ControlFlow::Exit;
             }
             Event::WindowEvent {
@@ -630,7 +912,7 @@ fn main() -> Result<()> {
                 }
             }
             Event::LoopDestroyed => {
-                app.stop_live();
+                app.shutdown_live_worker();
             }
             _ => {}
         }
@@ -646,6 +928,43 @@ fn install_shutdown_signal_handler(proxy: tao::event_loop::EventLoopProxy<UserEv
     }) {
         eprintln!("dicta-tray: failed to install shutdown signal handler: {error}");
     }
+}
+
+struct HotkeyRegistration {
+    _manager: GlobalHotKeyManager,
+    _hotkey: HotKey,
+}
+
+fn install_global_hotkey(
+    config: &AppConfig,
+    proxy: tao::event_loop::EventLoopProxy<UserEvent>,
+) -> Option<HotkeyRegistration> {
+    let configured = config.hotkey.as_ref()?;
+    let manager = match GlobalHotKeyManager::new() {
+        Ok(manager) => manager,
+        Err(error) => {
+            eprintln!("dicta-tray: failed to initialize global hotkey: {error}");
+            return None;
+        }
+    };
+    if let Err(error) = manager.register(configured.hotkey) {
+        eprintln!(
+            "dicta-tray: failed to register hotkey {}: {error}",
+            configured.label
+        );
+        return None;
+    }
+    GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
+        let _ = proxy.send_event(UserEvent::Hotkey {
+            id: event.id,
+            state: event.state,
+        });
+    }));
+    eprintln!("dicta-tray: registered hotkey {}", configured.label);
+    Some(HotkeyRegistration {
+        _manager: manager,
+        _hotkey: configured.hotkey,
+    })
 }
 
 fn handle_panel_message(
@@ -669,7 +988,7 @@ fn handle_panel_message(
             }
         }
         ACTION_QUIT => {
-            app.stop_live();
+            app.shutdown_live_worker();
             return true;
         }
         _ => {}
@@ -1100,23 +1419,54 @@ fn native_panel_glass_available() -> bool {
 
 fn provider_label(provider: &ProviderListEntry) -> String {
     let mut label = format!("{} ({}, {})", provider.name, provider.kind, provider.model);
-    if !provider.live {
-        label.push_str(" - no live");
+    if !provider.live && !provider.ptt {
+        label.push_str(" - no realtime");
     } else if !provider.local_config_ok {
         match &provider.local_config_error {
             Some(error) => label.push_str(&format!(" - {error}")),
             None => label.push_str(" - config needed"),
         }
+    } else if provider.ptt {
+        label.push_str(" - PTT");
     }
     label
 }
 
-fn provider_switchable(provider: &ProviderListEntry) -> bool {
-    provider.live && provider.local_config_ok
+fn provider_visible_in_tray(provider: &ProviderListEntry) -> bool {
+    provider.live || provider.ptt
 }
 
-fn provider_visible_in_tray(provider: &ProviderListEntry) -> bool {
-    provider.live
+fn selected_provider_mode(
+    provider: &ProviderListEntry,
+    preference: ActivationPreference,
+) -> Option<WorkerMode> {
+    match preference {
+        ActivationPreference::Ptt if provider.ptt => Some(WorkerMode::Ptt),
+        ActivationPreference::Live if provider.live => Some(WorkerMode::Live),
+        ActivationPreference::Ptt | ActivationPreference::Live => None,
+        ActivationPreference::Auto if provider.ptt => Some(WorkerMode::Ptt),
+        ActivationPreference::Auto if provider.live => Some(WorkerMode::Live),
+        ActivationPreference::Auto => None,
+    }
+}
+
+fn parse_hotkey_config(value: &str) -> Result<Option<ConfiguredHotkey>> {
+    let value = value.trim();
+    if value.is_empty()
+        || matches!(
+            value.to_ascii_lowercase().as_str(),
+            "none" | "off" | "false" | "disabled"
+        )
+    {
+        return Ok(None);
+    }
+    let hotkey: HotKey = value
+        .parse()
+        .with_context(|| format!("invalid hotkey `{value}`"))?;
+    Ok(Some(ConfiguredHotkey {
+        hotkey,
+        label: hotkey.to_string(),
+    }))
 }
 
 fn filter_provider_report_for_tray(mut report: ProviderListReport) -> ProviderListReport {
@@ -1124,27 +1474,46 @@ fn filter_provider_report_for_tray(mut report: ProviderListReport) -> ProviderLi
     report
 }
 
+#[cfg(test)]
 fn report_current_switchable(report: &ProviderListReport) -> bool {
+    report_current_switchable_for(report, ActivationPreference::Auto)
+}
+
+fn report_current_switchable_for(
+    report: &ProviderListReport,
+    preference: ActivationPreference,
+) -> bool {
     let Some(current) = report.current.as_deref() else {
         return false;
     };
-    report
-        .providers
-        .iter()
-        .any(|provider| provider.name == current && provider_switchable(provider))
+    report.providers.iter().any(|provider| {
+        provider.name == current
+            && provider.local_config_ok
+            && selected_provider_mode(provider, preference).is_some()
+    })
 }
 
+#[cfg(test)]
 fn first_switchable_provider(report: &ProviderListReport) -> Option<&str> {
+    first_switchable_provider_for(report, ActivationPreference::Auto)
+}
+
+fn first_switchable_provider_for(
+    report: &ProviderListReport,
+    preference: ActivationPreference,
+) -> Option<&str> {
     report
         .providers
         .iter()
-        .find(|provider| provider_switchable(provider))
+        .find(|provider| {
+            provider.local_config_ok && selected_provider_mode(provider, preference).is_some()
+        })
         .map(|provider| provider.name.as_str())
 }
 
 fn unavailable_provider_status(provider: &ProviderListEntry) -> String {
-    if !provider.live {
-        format!("{} does not support live mode", provider.name)
+    if !provider.live && !provider.ptt {
+        format!("{} does not support realtime mode", provider.name)
     } else {
         provider
             .local_config_error
@@ -1218,6 +1587,43 @@ mod tests {
                 .any(|provider| provider.name == "openai")
         );
         assert_eq!(first_switchable_provider(&report), Some("live-asr"));
+    }
+
+    #[test]
+    fn auto_activation_prefers_ptt_provider() {
+        let ptt = provider("ptt-asr", true, true).with_ptt();
+        assert_eq!(
+            selected_provider_mode(&ptt, ActivationPreference::Auto),
+            Some(WorkerMode::Ptt)
+        );
+        assert_eq!(
+            selected_provider_mode(&ptt, ActivationPreference::Live),
+            Some(WorkerMode::Live)
+        );
+    }
+
+    #[test]
+    fn ptt_activation_skips_live_only_provider() {
+        let report = provider_report(Some("live-asr"));
+
+        assert!(!report_current_switchable_for(
+            &report,
+            ActivationPreference::Ptt
+        ));
+        assert_eq!(
+            first_switchable_provider_for(&report, ActivationPreference::Ptt),
+            None
+        );
+    }
+
+    #[test]
+    fn hotkey_config_parses_or_disables_shortcut() {
+        let parsed = parse_hotkey_config("ctrl+alt+space").unwrap().unwrap();
+        assert_eq!(parsed.label, "control+alt+Space");
+
+        assert!(parse_hotkey_config("off").unwrap().is_none());
+        assert!(parse_hotkey_config("").unwrap().is_none());
+        assert!(parse_hotkey_config("ctrl+space+alt").is_err());
     }
 
     #[test]
@@ -1321,9 +1727,21 @@ mod tests {
             kind: name.to_owned(),
             selected: false,
             live,
+            ptt: false,
             local_config_ok,
             local_config_error: None,
             model: name.to_owned(),
+        }
+    }
+
+    trait ProviderListEntryTestExt {
+        fn with_ptt(self) -> Self;
+    }
+
+    impl ProviderListEntryTestExt for ProviderListEntry {
+        fn with_ptt(mut self) -> Self {
+            self.ptt = true;
+            self
         }
     }
 }

@@ -22,16 +22,16 @@
       node.title = value || '';
     };
 
-    const providerSwitchable = (provider) => provider.live && provider.local_config_ok;
+    const providerSwitchable = (provider) => (provider.live || provider.ptt) && provider.local_config_ok;
 
     const providerReason = (provider) => {
-      if (!provider.live) return `${provider.name} does not support live mode`;
+      if (!provider.live && !provider.ptt) return `${provider.name} does not support realtime mode`;
       if (!provider.local_config_ok) return provider.local_config_error || `${provider.name} needs configuration`;
       return `Switch to ${provider.name}`;
     };
 
     const unavailableBadge = (provider) => {
-      if (!provider.live) return 'No Live';
+      if (!provider.live && !provider.ptt) return 'No Realtime';
       if (!provider.local_config_ok) return 'Not Ready';
       return 'Unavailable';
     };
@@ -39,7 +39,7 @@
     const providerBadge = (provider, liveRunning) => {
       if (provider.selected && liveRunning) return ['Active', 'ready'];
       if (provider.selected) return ['Selected', 'warn'];
-      return ['Ready', 'ready'];
+      return [provider.ptt ? 'PTT' : 'Ready', 'ready'];
     };
 
     const updateProviderScrollState = () => {
@@ -73,7 +73,7 @@
       if (!state.providers.length) {
         const empty = document.createElement('div');
         empty.className = 'empty';
-        empty.textContent = 'No live providers found';
+        empty.textContent = 'No realtime providers found';
         providers.append(empty);
         return;
       }
@@ -132,9 +132,15 @@
       window.__dictaState = state;
       switchingProvider = null;
       setText(current, state.current ? state.current : 'No provider');
-      setText(status, state.status);
+      setText(status, state.hotkey ? `${state.status} / ${state.hotkey}` : state.status);
       liveChip.className = state.live_running ? 'chip live' : 'chip';
-      liveChip.textContent = state.live_running ? 'Live' : 'Idle';
+      if (state.ptt_recording) {
+        liveChip.textContent = 'PTT';
+      } else if (state.live_running && state.worker_mode === 'ptt') {
+        liveChip.textContent = 'Ready';
+      } else {
+        liveChip.textContent = state.live_running ? 'Live' : 'Idle';
+      }
 
       renderProviders(state);
 
@@ -142,12 +148,19 @@
       const stopIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" class="btn-icon"><rect x="5" y="5" width="14" height="14" rx="1.5" ry="1.5"></rect></svg>';
       const restartIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" class="btn-icon"><path d="M21 3v6h-6"></path><path d="M20.5 14.5a8.5 8.5 0 1 1-2.2-8.1L21 9"></path></svg>';
 
-      startStop.innerHTML = state.live_running ? (stopIcon + '<span>Stop Live</span>') : (playIcon + '<span>Start Live</span>');
-      startStop.className = state.live_running ? 'control danger' : 'control primary';
-      startStop.disabled = switchingProvider !== null || (!state.live_running && !state.selected_ready);
+      const pttSelected = state.selected_ptt || state.worker_mode === 'ptt';
+      const recording = Boolean(state.ptt_recording);
+      const canStart = state.selected_ready && (!state.live_running || (state.worker_mode === 'ptt' && !recording));
+      const canStop = state.live_running && (state.worker_mode !== 'ptt' || recording);
+      const stopActive = state.live_running && (!pttSelected || recording);
+      startStop.innerHTML = stopActive
+        ? (stopIcon + `<span>${pttSelected ? 'Stop PTT' : 'Stop Live'}</span>`)
+        : (playIcon + `<span>${pttSelected ? 'Start PTT' : 'Start Live'}</span>`);
+      startStop.className = stopActive ? 'control danger' : 'control primary';
+      startStop.disabled = switchingProvider !== null || (stopActive ? !canStop : !canStart);
       startStop.onclick = () => sendPanelAction(
-        state.live_running ? 'stop_live' : 'start_live',
-        state.live_running ? 'Stopping live' : 'Starting live'
+        stopActive ? 'stop_live' : 'start_live',
+        stopActive ? (pttSelected ? 'Stopping PTT' : 'Stopping live') : (pttSelected ? 'Starting PTT' : 'Starting live')
       );
 
       restart.style.display = state.live_running ? 'inline-flex' : 'none';

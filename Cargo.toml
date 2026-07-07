@@ -27,6 +27,7 @@ clap = { version = "4.5.40", features = ["derive", "env"] }
 cpal = "0.16.0"
 ctrlc = "3.5.1"
 flate2 = "1.1.5"
+global-hotkey = "0.8.0"
 hound = "3.5.1"
 jiff = { version = "0.2.31", default-features = false, features = ["std", "serde", "tz-system"] }
 libc = "0.2.177"
