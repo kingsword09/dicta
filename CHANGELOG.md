@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.10.11](https://github.com/kingsword09/dicta/compare/v0.10.10...v0.10.11) - 2026-07-07
+
+### Other Changes
+- fix: sign macOS CLI during install by @kingsword09 in https://github.com/kingsword09/dicta/pull/41
+
 ## [v0.10.10](https://github.com/kingsword09/dicta/compare/v0.10.9...v0.10.10) - 2026-07-07
 
 ### Other Changes
