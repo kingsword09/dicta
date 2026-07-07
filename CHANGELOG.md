@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.10.14](https://github.com/kingsword09/dicta/compare/v0.10.13...v0.10.14) - 2026-07-07
+
+### Other Changes
+- feat(cli): add external provider ptt mode by @kingsword09 in https://github.com/kingsword09/dicta/pull/47
+
 ## [v0.10.13](https://github.com/kingsword09/dicta/compare/v0.10.12...v0.10.13) - 2026-07-07
 
 ### Other Changes
