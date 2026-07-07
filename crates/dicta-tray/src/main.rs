@@ -2,6 +2,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
+use std::fs::{File, OpenOptions};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use tao::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
@@ -330,15 +332,22 @@ impl TrayApp {
         self.set_status(format!("Starting live with {provider}"));
 
         let mut command = self.config.dicta_command();
-        command
-            .args(&self.config.live_args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
+        let log_path = match configure_live_worker_stdio(&mut command, &provider) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                eprintln!("dicta-tray: failed to open live worker log: {error}");
+                command.stdout(Stdio::null()).stderr(Stdio::null());
+                None
+            }
+        };
+        command.args(&self.config.live_args).stdin(Stdio::null());
 
         match command.spawn() {
             Ok(child) => {
                 self.live_child = Some(child);
+                if let Some(path) = log_path {
+                    eprintln!("dicta-tray: live worker log: {}", path.display());
+                }
                 self.set_status(format!("Live running with {provider}"));
             }
             Err(error) => {
@@ -463,14 +472,10 @@ impl TrayApp {
     }
 
     fn tray_title(&self) -> String {
-        let prefix = if self.live_child.is_some() {
-            "dicta *"
+        if self.live_child.is_some() {
+            "dicta *".to_owned()
         } else {
-            "dicta"
-        };
-        match self.selected_provider() {
-            Some(provider) => format!("{prefix} {provider}"),
-            None => prefix.to_owned(),
+            "dicta".to_owned()
         }
     }
 
@@ -655,6 +660,52 @@ fn create_tray_icon(app: &mut TrayApp) -> Result<TrayIcon> {
         .with_title(app.tray_title())
         .build()
         .context("tray icon build failed")
+}
+
+fn configure_live_worker_stdio(command: &mut Command, provider: &str) -> Result<PathBuf> {
+    let path = live_worker_log_path(provider);
+    let stdout = open_live_worker_log(&path)?;
+    let stderr = stdout
+        .try_clone()
+        .with_context(|| format!("failed to clone live worker log {}", path.display()))?;
+    command
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    Ok(path)
+}
+
+fn open_live_worker_log(path: &PathBuf) -> Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open live worker log {}", path.display()))
+}
+
+fn live_worker_log_path(provider: &str) -> PathBuf {
+    let provider = sanitize_log_name(provider);
+    std::env::temp_dir().join(format!(
+        "dicta-tray-live-{provider}-{}.log",
+        std::process::id()
+    ))
+}
+
+fn sanitize_log_name(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "provider".to_owned()
+    } else {
+        sanitized
+    }
 }
 
 fn update_tray_icon(icon: &TrayIcon, app: &mut TrayApp) -> Result<()> {
@@ -862,23 +913,60 @@ fn monitor_bounds(panel: &Panel, panel_size: PhysicalSize<i32>) -> (i32, i32, i3
 
 fn tray_icon_image() -> Result<Icon> {
     let size = 32;
-    let mut rgba = Vec::with_capacity(size * size * 4);
-    let center = (size as f32 - 1.0) / 2.0;
+    let mut rgba = vec![0; size * size * 4];
     for y in 0..size {
         for x in 0..size {
-            let dx = x as f32 - center;
-            let dy = y as f32 - center;
-            let distance = (dx * dx + dy * dy).sqrt();
-            if distance <= 13.0 {
-                rgba.extend_from_slice(&[24, 24, 24, 255]);
-            } else if distance <= 15.0 {
-                rgba.extend_from_slice(&[24, 24, 24, 96]);
-            } else {
-                rgba.extend_from_slice(&[0, 0, 0, 0]);
+            let in_capsule = (11..=20).contains(&x)
+                && (5..=18).contains(&y)
+                && rounded_rect_contains(x, y, 11, 5, 10, 14, 5);
+            let in_stem = (15..=16).contains(&x) && (19..=24).contains(&y);
+            let in_base = (9..=22).contains(&x) && (25..=27).contains(&y);
+            let in_left_wave = (7..=8).contains(&x) && (12..=18).contains(&y);
+            let in_right_wave = (23..=24).contains(&x) && (12..=18).contains(&y);
+            if in_capsule || in_stem || in_base || in_left_wave || in_right_wave {
+                set_icon_pixel(&mut rgba, size, x, y, 255);
             }
         }
     }
     Icon::from_rgba(rgba, size as u32, size as u32).context("failed to build tray icon image")
+}
+
+fn rounded_rect_contains(
+    x: usize,
+    y: usize,
+    left: usize,
+    top: usize,
+    width: usize,
+    height: usize,
+    radius: usize,
+) -> bool {
+    let right = left + width - 1;
+    let bottom = top + height - 1;
+    let cx = if x < left + radius {
+        left + radius
+    } else if x > right - radius {
+        right - radius
+    } else {
+        x
+    };
+    let cy = if y < top + radius {
+        top + radius
+    } else if y > bottom - radius {
+        bottom - radius
+    } else {
+        y
+    };
+    let dx = x.abs_diff(cx);
+    let dy = y.abs_diff(cy);
+    dx * dx + dy * dy <= radius * radius
+}
+
+fn set_icon_pixel(rgba: &mut [u8], size: usize, x: usize, y: usize, alpha: u8) {
+    let index = (y * size + x) * 4;
+    rgba[index] = 0;
+    rgba[index + 1] = 0;
+    rgba[index + 2] = 0;
+    rgba[index + 3] = alpha;
 }
 
 const PANEL_HTML: &str = include_str!("../assets/panel.html");
