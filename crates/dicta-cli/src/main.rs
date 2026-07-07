@@ -166,8 +166,18 @@ struct Cli {
     #[arg(long, help = "Print ASR provider capability diagnostics")]
     capabilities: bool,
 
-    #[arg(long, help = "Launch the status bar UI for live provider switching")]
+    #[arg(
+        long,
+        help = "Launch the status bar UI for realtime provider switching"
+    )]
     ui: bool,
+
+    #[arg(
+        long,
+        env = "DICTA_UI_HOTKEY",
+        help = "Global hotkey for the status bar UI, for example ctrl+alt+space"
+    )]
+    hotkey: Option<String>,
 
     #[arg(long = "provider-state", env = "DICTA_PROVIDER_STATE", hide = true)]
     provider_state: Option<PathBuf>,
@@ -204,6 +214,7 @@ impl Cli {
             transcript: self.transcript.clone(),
             capabilities: self.capabilities,
             ui: self.ui,
+            hotkey: self.hotkey.clone(),
             provider_state: self.provider_state.clone(),
             provider_dir: self.provider_dir.clone(),
             command: self.command.clone(),
@@ -707,6 +718,7 @@ struct ProviderListEntry {
     model: String,
     batch_file: bool,
     live: bool,
+    ptt: bool,
     local_config_ok: bool,
     local_config_error: Option<String>,
     notes: Vec<String>,
@@ -754,9 +766,6 @@ impl EffectiveProvider {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    if cli.ptt && cli.ui {
-        bail!("--ptt cannot be combined with --ui yet");
-    }
     if cli.ui {
         run_ui(&cli).await?;
         return Ok(());
@@ -1392,7 +1401,24 @@ async fn run_ui(cli: &Cli) -> Result<()> {
         command.env("DICTA_PROVIDER_STATE", state);
     }
     command.env("DICTA_UI_LIVE_ARGS", live_args_for_ui(cli).join("\n"));
-    command.env("DICTA_UI_AUTOSTART", if cli.live { "1" } else { "0" });
+    command.env("DICTA_UI_PTT_ARGS", ptt_args_for_ui(cli).join("\n"));
+    command.env(
+        "DICTA_UI_AUTOSTART",
+        if cli.live || cli.ptt { "1" } else { "0" },
+    );
+    command.env(
+        "DICTA_UI_ACTIVATION",
+        if cli.ptt {
+            "ptt"
+        } else if cli.live {
+            "live"
+        } else {
+            "auto"
+        },
+    );
+    if let Some(hotkey) = non_empty(&cli.hotkey) {
+        command.env("DICTA_UI_HOTKEY", hotkey);
+    }
     command.env(ENV_LIVE_APPEND_ONLY, "1");
     let mut child = command
         .spawn()
@@ -1564,6 +1590,45 @@ fn live_args_for_ui(cli: &Cli) -> Vec<String> {
     args
 }
 
+fn ptt_args_for_ui(cli: &Cli) -> Vec<String> {
+    let mut args = Vec::new();
+    args.push("--provider".to_owned());
+    args.push("active".to_owned());
+    args.push("--ptt".to_owned());
+    if let Some(src) = non_empty(&cli.src) {
+        args.push("--src".to_owned());
+        args.push(src);
+    }
+    if let Some(dst) = non_empty(&cli.dst) {
+        args.push("--dst".to_owned());
+        args.push(dst);
+    }
+    if let Some(chunk) = cli.live_chunk {
+        args.push("--live-chunk".to_owned());
+        args.push(chunk.to_string());
+    }
+    if cli.no_mic {
+        args.push("--no-mic".to_owned());
+    }
+    if cli.no_speaker {
+        args.push("--no-speaker".to_owned());
+    }
+    if cli.voice_processing {
+        args.push("--voice-processing".to_owned());
+    }
+    if cli.select_device {
+        args.push("--select-device".to_owned());
+    }
+    if cli.json {
+        args.push("--json".to_owned());
+    }
+    if let Some(path) = &cli.transcript {
+        args.push("--transcript".to_owned());
+        args.push(path.display().to_string());
+    }
+    args
+}
+
 fn should_run_live(cli: &Cli) -> bool {
     cli.live || (cli.input.is_none() && cli.mic_duration.is_none())
 }
@@ -1579,60 +1644,45 @@ fn validate_batch_options(cli: &Cli) -> Result<()> {
 }
 
 async fn run_live(cli: &Cli) -> Result<()> {
-    let backend = resolve_live_backend(cli)?;
-
-    match backend {
-        AsrBackend::Apple => {
-            let provider = build_native_adapter(cli)?;
-            run_live_provider(cli, &provider).await
-        }
-        AsrBackend::External => {
-            let provider = build_external_provider(cli)?;
-            run_live_provider(cli, &provider).await
-        }
-        AsrBackend::OpenaiCompatible | AsrBackend::Auto => {
-            bail!(
-                "interactive live mode requires Apple on-device ASR or an installed live provider"
-            )
-        }
-    }
+    run_realtime(cli, RealtimeActivation::Continuous).await
 }
 
-fn validate_live_options(
+async fn run_ptt(cli: &Cli) -> Result<()> {
+    run_realtime(cli, RealtimeActivation::Toggle).await
+}
+
+fn validate_realtime_options(
     cli: &Cli,
     provider_name: &str,
     capabilities: &LiveCapabilities,
+    activation: RealtimeActivation,
 ) -> Result<()> {
-    if cli.input.is_some() || cli.mic_duration.is_some() {
-        bail!("--live cannot be combined with --input or --mic-duration");
-    }
-    if cli.no_mic && cli.no_speaker {
-        bail!("--live cannot disable both --no-mic and --no-speaker");
-    }
-    if let Some(seconds) = cli.live_chunk {
-        if !seconds.is_finite() || seconds <= 0.0 {
-            bail!("--live-chunk must be greater than zero seconds");
-        }
+    validate_realtime_cli_options(cli, activation)?;
+    if cli.live_chunk.is_some() {
         if capabilities.mode != LiveModeKind::Chunked {
             bail!("--live-chunk requires a chunked live provider");
         }
     }
-    if let Some(path) = &cli.transcript {
-        validate_transcript_path(path)?;
-    }
     if cli.dst.is_some() && !capabilities.translation {
-        bail!("--dst requires a live provider with translation support");
+        bail!("--dst requires a realtime provider with translation support");
     }
     if cli.no_mic && !capabilities.speaker {
         bail!(
-            "{provider_name} live mode requires microphone input; speaker capture is not supported"
+            "{provider_name} {} mode requires microphone input; speaker capture is not supported",
+            activation.label()
         );
     }
     if cli.voice_processing && !capabilities.voice_processing {
-        bail!("--voice-processing is not supported by {provider_name} live mode");
+        bail!(
+            "--voice-processing is not supported by {provider_name} {} mode",
+            activation.label()
+        );
     }
     if cli.select_device && !capabilities.device_selection {
-        bail!("--select-device is not supported by {provider_name} live mode");
+        bail!(
+            "--select-device is not supported by {provider_name} {} mode",
+            activation.label()
+        );
     }
     Ok(())
 }
@@ -1673,97 +1723,194 @@ fn resolve_live_backend_for(cli: &Cli, apple_support: &AppleSupport) -> Result<A
     }
 }
 
-async fn run_live_provider<P>(cli: &Cli, provider: &P) -> Result<()>
-where
-    P: LiveAsrProvider,
-{
-    let capabilities = provider.live_capabilities();
-    let provider_name = provider.live_name();
-    validate_live_options(cli, provider_name, &capabilities)?;
-    let options = live_options_from_cli(cli, &capabilities);
-    let mut renderer = LiveRenderer::new(
-        cli.json,
-        cli.transcript.clone(),
-        options.mic && options.speaker,
-        cli.src.clone(),
-        cli.dst.clone(),
-    )?;
-
-    provider
-        .run_live(options, &mut |event| {
-            renderer.handle_live_event(event).map_err(|err| {
-                dicta_asr::AsrError::Request(format!(
-                    "failed to render {provider_name} live event: {err}"
-                ))
-            })
-        })
-        .await
-        .with_context(|| format!("{provider_name} live transcription failed"))?;
-
-    renderer.finalize_session_log()?;
-    renderer.print_summary();
-    Ok(())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RealtimeActivation {
+    Continuous,
+    Toggle,
 }
 
-async fn run_ptt(cli: &Cli) -> Result<()> {
-    let ptt_cli = cli_for_ptt(cli);
-    validate_ptt_options(&ptt_cli)?;
+impl RealtimeActivation {
+    fn flag(self) -> &'static str {
+        match self {
+            Self::Continuous => "--live",
+            Self::Toggle => "--ptt",
+        }
+    }
 
+    fn label(self) -> &'static str {
+        match self {
+            Self::Continuous => "live",
+            Self::Toggle => "PTT",
+        }
+    }
+
+    fn requires_ptt(self) -> bool {
+        matches!(self, Self::Toggle)
+    }
+
+    fn defaults_to_active_provider(self) -> bool {
+        matches!(self, Self::Toggle)
+    }
+}
+
+enum RealtimeProvider {
+    Apple(NativeAdapterAsr),
+    External(ExternalProvider),
+}
+
+impl RealtimeProvider {
+    fn live_name(&self) -> &'static str {
+        match self {
+            Self::Apple(provider) => provider.live_name(),
+            Self::External(provider) => provider.live_name(),
+        }
+    }
+
+    fn config_name(&self) -> &str {
+        match self {
+            Self::Apple(_) => "apple",
+            Self::External(provider) => &provider.id,
+        }
+    }
+
+    fn live_capabilities(&self) -> LiveCapabilities {
+        match self {
+            Self::Apple(provider) => provider.live_capabilities(),
+            Self::External(provider) => provider.live_capabilities(),
+        }
+    }
+
+    async fn run(
+        &self,
+        activation: RealtimeActivation,
+        options: LiveAsrOptions,
+        on_event: LiveEventCallback<'_>,
+    ) -> dicta_asr::AsrResult<()> {
+        match (self, activation) {
+            (Self::Apple(provider), RealtimeActivation::Continuous) => {
+                LiveAsrProvider::run_live(provider, options, on_event).await
+            }
+            (Self::External(provider), RealtimeActivation::Continuous) => {
+                provider.run_live(options, on_event).await
+            }
+            (Self::External(provider), RealtimeActivation::Toggle) => {
+                provider.run_ptt(options, on_event).await
+            }
+            (Self::Apple(_), RealtimeActivation::Toggle) => Err(dicta_asr::AsrError::Request(
+                "--ptt requires an installed external provider with PTT support".to_owned(),
+            )),
+        }
+    }
+}
+
+fn build_realtime_provider(cli: &Cli, activation: RealtimeActivation) -> Result<RealtimeProvider> {
+    let backend = match activation {
+        RealtimeActivation::Continuous => resolve_live_backend(cli)?,
+        RealtimeActivation::Toggle => resolve_ptt_backend(cli)?,
+    };
+
+    match backend {
+        AsrBackend::Apple => Ok(RealtimeProvider::Apple(build_native_adapter(cli)?)),
+        AsrBackend::External => Ok(RealtimeProvider::External(build_external_provider(cli)?)),
+        AsrBackend::OpenaiCompatible | AsrBackend::Auto => {
+            bail!(
+                "interactive realtime mode requires Apple on-device ASR or an installed live provider"
+            )
+        }
+    }
+}
+
+fn resolve_ptt_backend(cli: &Cli) -> Result<AsrBackend> {
     let apple_support = apple_support();
-    let effective = effective_provider_for(&ptt_cli, &apple_support, false)?;
+    let effective = effective_provider_for(cli, &apple_support, false)?;
     if effective.backend != AsrBackend::External {
         bail!("--ptt requires an installed external provider with PTT support");
     }
+    Ok(AsrBackend::External)
+}
 
-    let provider = build_external_provider(&ptt_cli)?;
+async fn run_realtime(cli: &Cli, activation: RealtimeActivation) -> Result<()> {
+    let realtime_cli = cli_for_realtime(cli, activation);
+    validate_realtime_cli_options(&realtime_cli, activation)?;
+
+    let provider = build_realtime_provider(&realtime_cli, activation)?;
     let capabilities = provider.live_capabilities();
-    if !capabilities.ptt {
+    if activation.requires_ptt() && !capabilities.ptt {
         bail!(
             "provider '{}' does not support PTT; update the provider or choose one with live.ptt = true",
-            provider.id
+            provider.config_name()
         );
     }
-    validate_live_options(&ptt_cli, provider.live_name(), &capabilities)?;
-    let options = live_options_from_cli(&ptt_cli, &capabilities);
+    validate_realtime_options(
+        &realtime_cli,
+        provider.live_name(),
+        &capabilities,
+        activation,
+    )?;
+    let options = live_options_from_cli(&realtime_cli, &capabilities);
     let mut renderer = LiveRenderer::new(
-        ptt_cli.json,
-        ptt_cli.transcript.clone(),
+        realtime_cli.json,
+        realtime_cli.transcript.clone(),
         options.mic && options.speaker,
-        ptt_cli.src.clone(),
-        ptt_cli.dst.clone(),
+        realtime_cli.src.clone(),
+        realtime_cli.dst.clone(),
     )?;
 
     provider
-        .run_ptt(options, &mut |event| {
+        .run(activation, options, &mut |event| {
             renderer.handle_live_event(event).map_err(|err| {
                 dicta_asr::AsrError::Request(format!(
-                    "failed to render {} PTT event: {err}",
-                    provider.live_name()
+                    "failed to render {} {} event: {err}",
+                    provider.live_name(),
+                    activation.label()
                 ))
             })
         })
         .await
-        .with_context(|| format!("{} PTT transcription failed", provider.live_name()))?;
+        .with_context(|| {
+            format!(
+                "{} {} transcription failed",
+                provider.live_name(),
+                activation.label()
+            )
+        })?;
 
     renderer.finalize_session_log()?;
     renderer.print_summary();
     Ok(())
 }
 
-fn cli_for_ptt(cli: &Cli) -> Cli {
-    if cli.provider.is_none() && cli.asr == AsrBackend::Auto {
+fn cli_for_realtime(cli: &Cli, activation: RealtimeActivation) -> Cli {
+    if activation.defaults_to_active_provider()
+        && cli.provider.is_none()
+        && cli.asr == AsrBackend::Auto
+    {
         cli.with_provider_name(Some("active".to_owned()))
     } else {
         cli.clone()
     }
 }
 
-fn validate_ptt_options(cli: &Cli) -> Result<()> {
+fn validate_realtime_cli_options(cli: &Cli, activation: RealtimeActivation) -> Result<()> {
     if cli.input.is_some() || cli.mic_duration.is_some() {
-        bail!("--ptt cannot be combined with --input or --mic-duration");
+        bail!(
+            "{} cannot be combined with --input or --mic-duration",
+            activation.flag()
+        );
     }
-    if !io::stdin().is_terminal() {
-        bail!("--ptt requires interactive stdin so Enter can start and stop recording");
+    if cli.no_mic && cli.no_speaker {
+        bail!(
+            "{} cannot disable both --no-mic and --no-speaker",
+            activation.flag()
+        );
+    }
+    if let Some(seconds) = cli.live_chunk {
+        if !seconds.is_finite() || seconds <= 0.0 {
+            bail!("--live-chunk must be greater than zero seconds");
+        }
+    }
+    if let Some(path) = &cli.transcript {
+        validate_transcript_path(path)?;
     }
     Ok(())
 }
@@ -3882,6 +4029,7 @@ fn gather_provider_list_report(cli: &Cli) -> Result<ProviderListReport> {
     for (name, profile) in profiles {
         let profile_cli = cli.with_provider_name(Some(name.clone()));
         let report = gather_capabilities_report_with_support(&profile_cli, &apple_support);
+        let ptt = report.live.as_ref().is_some_and(|live| live.ptt);
         let effective = effective_provider_for(&profile_cli, &apple_support, true).ok();
         let installed_provider = effective
             .as_ref()
@@ -3903,6 +4051,7 @@ fn gather_provider_list_report(cli: &Cli) -> Result<ProviderListReport> {
                 .as_ref()
                 .is_some_and(|capabilities| capabilities.batch_file),
             live: report.live.is_some(),
+            ptt,
             local_config_ok: report.local_config_ok,
             local_config_error: report.local_config_error.or(report.resolution_error),
             notes: report.notes,
@@ -3989,6 +4138,7 @@ fn print_provider_list_text(report: &ProviderListReport) {
         );
         println!("    Batch file: {}", yes_no(provider.batch_file));
         println!("    Live: {}", yes_no(provider.live));
+        println!("    Live PTT: {}", yes_no(provider.ptt));
         println!("    Local config ok: {}", yes_no(provider.local_config_ok));
         if let Some(version) = &provider.installed_version {
             println!("    Installed version: {version}");
@@ -5774,6 +5924,7 @@ mod tests {
             transcript: None,
             capabilities: false,
             ui: false,
+            hotkey: None,
             provider_state: None,
             provider_dir: None,
             command: None,
@@ -6253,9 +6404,17 @@ expected_latency_ms = 5000
     }
 
     #[test]
+    fn ui_hotkey_flag_is_available() {
+        let cli = Cli::try_parse_from(["dicta", "--ui", "--hotkey", "ctrl+alt+space"]).unwrap();
+
+        assert!(cli.ui);
+        assert_eq!(cli.hotkey.as_deref(), Some("ctrl+alt+space"));
+    }
+
+    #[test]
     fn ptt_defaults_to_active_provider() {
         let cli = test_cli();
-        let cli = cli_for_ptt(&cli);
+        let cli = cli_for_realtime(&cli, RealtimeActivation::Toggle);
 
         assert_eq!(cli.provider.as_deref(), Some("active"));
     }
@@ -6266,9 +6425,39 @@ expected_latency_ms = 5000
             provider: Some("qianwenime-asr".to_owned()),
             ..test_cli()
         };
-        let cli = cli_for_ptt(&cli);
+        let cli = cli_for_realtime(&cli, RealtimeActivation::Toggle);
 
         assert_eq!(cli.provider.as_deref(), Some("qianwenime-asr"));
+    }
+
+    #[test]
+    fn ptt_validation_uses_ptt_activation_label() {
+        let cli = Cli {
+            input: Some(PathBuf::from("audio.wav")),
+            ..test_cli()
+        };
+
+        assert!(
+            validate_realtime_cli_options(&cli, RealtimeActivation::Toggle)
+                .unwrap_err()
+                .to_string()
+                .contains("--ptt cannot be combined")
+        );
+    }
+
+    #[test]
+    fn ptt_backend_rejects_batch_only_provider() {
+        let cli = Cli {
+            provider: Some("openai".to_owned()),
+            ..test_cli()
+        };
+
+        assert!(
+            resolve_ptt_backend(&cli)
+                .unwrap_err()
+                .to_string()
+                .contains("external provider")
+        );
     }
 
     #[test]
@@ -6311,10 +6500,15 @@ ptt = true
         };
 
         assert!(
-            validate_live_options(&cli, "apple", &native_adapter_live_capabilities())
-                .unwrap_err()
-                .to_string()
-                .contains("--no-mic")
+            validate_realtime_options(
+                &cli,
+                "apple",
+                &native_adapter_live_capabilities(),
+                RealtimeActivation::Continuous,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("--no-mic")
         );
     }
 
@@ -6328,10 +6522,15 @@ ptt = true
         };
 
         assert!(
-            validate_live_options(&cli, "apple", &native_adapter_live_capabilities())
-                .unwrap_err()
-                .to_string()
-                .contains("--live-chunk")
+            validate_realtime_options(
+                &cli,
+                "apple",
+                &native_adapter_live_capabilities(),
+                RealtimeActivation::Continuous,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("--live-chunk")
         );
     }
 

@@ -182,13 +182,27 @@ install a live provider package and select it with `dicta provider set <name>`.
 The state file stores only the selected provider name; secrets remain in CLI
 flags, environment variables, or `providers.toml`.
 
+`dicta --ptt` and `dicta --live` both use the live provider capability model but
+different activation modes. PTT is a foreground, utterance-scoped dictation
+session driven by Enter start/stop controls. Continuous live mode keeps the
+provider running for captioning, translation, or providers that expose a stable
+stream. Installed IME-style providers should set `live.ptt = true` when they can
+start and stop a single utterance without keeping the microphone open between
+utterances.
+
 `dicta --ui` launches the Rust `dicta-tray` companion binary. The status item opens a
 compact provider panel on left click and keeps a right-click native menu as a
-fallback. The companion reads the same provider list and starts live
-transcription as a supervised `dicta --provider active --live` worker. When a
-provider is selected from the panel, the companion updates the active provider
-and restarts the worker if it is running. This gives immediate recovery when the
-current provider is unavailable without forcing every ASR provider
+fallback. The companion reads the same provider list and starts transcription as
+a supervised `dicta --provider active ...` worker. In automatic activation mode,
+PTT-capable providers use `--ptt`; other live providers use `--live`. Pass
+`dicta --ui --live` to force continuous live mode or `dicta --ui --ptt` to force
+PTT. `dicta --ui --hotkey <shortcut>` registers a global UI hotkey without
+changing the provider protocol. PTT providers treat the hotkey as hold-to-talk;
+continuous live providers treat it as a start/stop toggle. The shortcut is
+disabled by default to avoid stealing system or input-method key combinations.
+When a provider is selected from the panel, the companion updates the active
+provider and restarts the worker if it is running. This gives immediate recovery
+when the current provider is unavailable without forcing every ASR provider
 implementation to support an in-process hot-swap protocol.
 
 Release archives install `dicta-tray` next to `dicta`. In a source checkout, `dicta --ui`

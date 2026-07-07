@@ -75,38 +75,51 @@ protocol details, active-provider state, and custom OpenAI-compatible profiles.
 
 ## Usage
 
-Live mode:
+Realtime transcription:
 
 ```console
-$ dicta                                  # Uses the active live provider
-$ dicta --src en-US --dst ja-JP          # Transcribe and translate
-$ dicta --no-speaker                     # Mic only
-$ dicta --no-mic --src en-US --dst ja-JP # Speaker only on Apple mode
+$ dicta --ptt                            # Push-to-talk using the active provider
+$ dicta                                  # Continuous live mode using the active live provider
+$ dicta --src en-US --dst ja-JP          # Continuous transcribe and translate
+$ dicta --no-speaker                     # Mic-only continuous mode
+$ dicta --no-mic --src en-US --dst ja-JP # Speaker-only continuous mode on Apple
 $ dicta --select-device                  # Pick and pin mic / speaker at startup
 $ dicta --json | jq                      # JSONL output for piping
-$ dicta --ptt                            # Push-to-talk using the active provider
 $ dicta --capabilities                   # ASR capability diagnostics
 $ dicta doctor                           # Environment diagnostics
 ```
 
-Push-to-talk mode is a foreground external-provider mode. Press Enter once to
-start an utterance and again to stop/finalize it; press Ctrl-C to quit. When no
-provider is passed, `dicta --ptt` resolves `--provider active`.
+Push-to-talk mode is the recommended foreground dictation path for installed IME
+providers such as Qianwen and Doubao. Press Enter once to start an utterance and
+again to stop/finalize it; press Ctrl-C to quit. When no provider is passed,
+`dicta --ptt` resolves `--provider active`. Continuous live mode remains
+available for captioning, Apple translation, and providers that expose a stable
+long-running stream.
 
 Status bar mode:
 
 ```console
 $ dicta --ui                             # Open the status bar provider switcher
-$ dicta --ui --live                      # Open the switcher and start live mode
+$ dicta --ui --ptt                       # Open the switcher and start PTT
+$ dicta --ui --live                      # Open the switcher and start continuous live mode
+$ dicta --ui --hotkey ctrl+alt+space     # Enable a global tray hotkey
 $ dicta --ui --provider active --live    # Use the saved active provider
 ```
 
 The status bar UI is the Rust `dicta-tray` companion binary. Left-clicking the
 status item opens a compact provider panel; right-clicking keeps a native menu
 fallback. It lists built-in and configured provider profiles and runs live
-transcription as a supervised `dicta --provider active --live` worker. Without a
-saved active provider, `active` defaults to Apple only on supported macOS
-systems. On other systems, install a live provider package and select it with
+or PTT transcription as a supervised `dicta --provider active ...` worker. The
+plain `dicta --ui` panel stays idle until you start recording. Its default
+activation is automatic: PTT-capable providers use `--ptt`, and other live
+providers use `--live`. Pass `--ui --live` to force continuous live mode or
+`--ui --ptt` to force PTT. Global hotkeys are disabled unless `--hotkey` or
+`DICTA_UI_HOTKEY` is set. The hotkey syntax is the same as
+`ctrl+alt+space`, `shift+alt+KeyD`, or `cmd+shift+KeyD`; use `off` to disable
+an inherited environment value. With PTT providers the hotkey is hold-to-talk;
+with continuous live providers it toggles the worker. Without a saved active
+provider, `active` defaults to Apple only on supported macOS systems. On other
+systems, install a live provider package and select it with
 `dicta provider set <provider-name>`. Switching providers from the panel stores
 the active selection in `~/.config/dicta/active-provider.json` and restarts the
 worker, so a failed provider can be replaced without leaving the status bar UI.
