@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{File, OpenOptions};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -40,6 +42,8 @@ use wry::WebViewBuilderExtUnix;
 
 const PANEL_WIDTH: f64 = 380.0;
 const PANEL_HEIGHT: f64 = 448.0;
+const LIVE_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+const LIVE_WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 
 const MENU_START: &str = "start";
 const MENU_STOP: &str = "stop";
@@ -79,6 +83,7 @@ enum UserEvent {
     Menu(MenuEvent),
     Tray(TrayIconEvent),
     Panel(PanelMessage),
+    ShutdownSignal,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -332,6 +337,7 @@ impl TrayApp {
         self.set_status(format!("Starting live with {provider}"));
 
         let mut command = self.config.dicta_command();
+        configure_live_worker_process(&mut command);
         let log_path = match configure_live_worker_stdio(&mut command, &provider) {
             Ok(path) => Some(path),
             Err(error) => {
@@ -363,9 +369,27 @@ impl TrayApp {
         };
 
         self.set_status("Stopping live");
-        if let Err(error) = child.kill() {
-            eprintln!("dicta-tray: failed to stop live worker: {error}");
+        if let Err(error) = request_live_worker_shutdown(&mut child) {
+            eprintln!("dicta-tray: failed to request live worker shutdown: {error}");
         }
+        match wait_live_worker_exit(&mut child, LIVE_WORKER_SHUTDOWN_TIMEOUT) {
+            Ok(Some(status)) => {
+                eprintln!("dicta-tray: live worker exited with {status}");
+                self.set_status("Live stopped");
+                return;
+            }
+            Ok(None) => {
+                eprintln!("dicta-tray: live worker did not exit after graceful shutdown request");
+                if let Err(error) = force_live_worker_shutdown(&mut child) {
+                    eprintln!("dicta-tray: failed to force live worker shutdown: {error}");
+                }
+            }
+            Err(error) => {
+                self.set_status(format!("Live stop wait failed: {error}"));
+                return;
+            }
+        }
+
         match child.wait() {
             Ok(status) => {
                 eprintln!("dicta-tray: live worker exited with {status}");
@@ -516,6 +540,8 @@ fn main() -> Result<()> {
         let _ = proxy.send_event(UserEvent::Tray(event));
     }));
 
+    install_shutdown_signal_handler(event_loop.create_proxy());
+
     let mut app = TrayApp::new(config);
     app.refresh();
     if app.config.autostart {
@@ -585,6 +611,10 @@ fn main() -> Result<()> {
                     *control_flow = ControlFlow::Exit;
                 }
             }
+            Event::UserEvent(UserEvent::ShutdownSignal) => {
+                app.stop_live();
+                *control_flow = ControlFlow::Exit;
+            }
             Event::WindowEvent {
                 window_id, event, ..
             } => {
@@ -608,6 +638,14 @@ fn main() -> Result<()> {
             update_control_flow(&app, control_flow);
         }
     });
+}
+
+fn install_shutdown_signal_handler(proxy: tao::event_loop::EventLoopProxy<UserEvent>) {
+    if let Err(error) = ctrlc::set_handler(move || {
+        let _ = proxy.send_event(UserEvent::ShutdownSignal);
+    }) {
+        eprintln!("dicta-tray: failed to install shutdown signal handler: {error}");
+    }
 }
 
 fn handle_panel_message(
@@ -667,6 +705,74 @@ fn configure_live_worker_stdio(command: &mut Command, provider: &str) -> Result<
     let stderr = open_live_worker_log(&path)?;
     command.stderr(Stdio::from(stderr));
     Ok(path)
+}
+
+#[cfg(unix)]
+fn configure_live_worker_process(command: &mut Command) {
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_live_worker_process(_command: &mut Command) {}
+
+fn wait_live_worker_exit(
+    child: &mut Child,
+    timeout: Duration,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(LIVE_WORKER_SHUTDOWN_POLL);
+    }
+}
+
+#[cfg(unix)]
+fn request_live_worker_shutdown(child: &mut Child) -> std::io::Result<()> {
+    signal_live_worker_process_group(child, libc::SIGINT)
+}
+
+#[cfg(not(unix))]
+fn request_live_worker_shutdown(child: &mut Child) -> std::io::Result<()> {
+    child.kill()
+}
+
+#[cfg(unix)]
+fn force_live_worker_shutdown(child: &mut Child) -> std::io::Result<()> {
+    signal_live_worker_process_group(child, libc::SIGKILL)
+}
+
+#[cfg(not(unix))]
+fn force_live_worker_shutdown(child: &mut Child) -> std::io::Result<()> {
+    child.kill()
+}
+
+#[cfg(unix)]
+fn signal_live_worker_process_group(child: &mut Child, signal: libc::c_int) -> std::io::Result<()> {
+    let pid = child.id() as libc::pid_t;
+    if pid <= 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "live worker pid is unavailable",
+        ));
+    }
+    let result = unsafe { libc::kill(-pid, signal) };
+    if result == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn open_live_worker_log(path: &PathBuf) -> Result<File> {
@@ -1141,6 +1247,35 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(configured_log);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_worker_shutdown_uses_sigint_process_group() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("trap 'exit 42' INT; while true; do sleep 10; done")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_live_worker_process(&mut command);
+        let mut child = command.spawn().unwrap();
+
+        request_live_worker_shutdown(&mut child).unwrap();
+        let status = wait_live_worker_exit(&mut child, Duration::from_secs(5))
+            .unwrap()
+            .unwrap_or_else(|| {
+                let _ = force_live_worker_shutdown(&mut child);
+                child.wait().unwrap()
+            });
+
+        assert!(
+            status.code() == Some(42) || status.signal() == Some(libc::SIGINT),
+            "expected graceful INT handling or SIGINT termination, got {status}"
+        );
     }
 
     #[cfg(unix)]
