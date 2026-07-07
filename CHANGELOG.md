@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.10.12](https://github.com/kingsword09/dicta/compare/v0.10.11...v0.10.12) - 2026-07-07
+
+### Other Changes
+- fix: use doctor as a command only by @kingsword09 in https://github.com/kingsword09/dicta/pull/43
+
 ## [v0.10.11](https://github.com/kingsword09/dicta/compare/v0.10.10...v0.10.11) - 2026-07-07
 
 ### Other Changes
