@@ -1158,7 +1158,7 @@ mod tests {
         let mut command = std::process::Command::new("cmd");
         command
             .arg("/C")
-            .arg("echo visible-output& echo hidden-error 1>&2");
+            .arg("echo visible-output& 1>&2 echo hidden-error");
         command
     }
 
