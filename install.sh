@@ -117,6 +117,19 @@ if [ "$os" = "darwin" ] && [ "$arch" != "arm64" ]; then
   fail "no prebuilt archive is published for darwin_$arch"
 fi
 
+darwin_major_version() {
+  if [ "$os" != "darwin" ]; then
+    echo 0
+    return
+  fi
+  sw_vers -productVersion 2>/dev/null | awk -F. '{print $1}'
+}
+
+supports_apple_adapter() {
+  [ "$os" = "darwin" ] || return 1
+  [ "$(darwin_major_version)" -ge 26 ] 2>/dev/null
+}
+
 need_url_tool=""
 if command -v curl >/dev/null 2>&1; then
   need_url_tool="curl"
@@ -241,10 +254,12 @@ fi
 if [ -z "$adapter_path" ]; then
   adapter_path="$(find "$tmp/extract" -type f -name "$adapter_name" | head -n 1)"
 fi
-if [ -n "$adapter_path" ]; then
+if [ -n "$adapter_path" ] && { [ "$os" != "darwin" ] || supports_apple_adapter; }; then
   adapter_target="$install_dir/$adapter_name"
   cp "$adapter_path" "$adapter_target"
   chmod 755 "$adapter_target"
+elif [ -n "$adapter_path" ] && [ "$os" = "darwin" ]; then
+  echo "dicta install: skipped $adapter_name (requires macOS 26+)"
 fi
 
 tray_path="$(find "$tmp/extract" -type f -name "$tray_name" -perm -u+x | head -n 1)"
@@ -259,11 +274,18 @@ fi
 
 if [ "$os" = "darwin" ] && command -v xattr >/dev/null 2>&1; then
   xattr -cr "$target" >/dev/null 2>&1 || true
+  if [ -n "${tray_target:-}" ]; then
+    xattr -cr "$tray_target" >/dev/null 2>&1 || true
+  fi
   if [ -n "${adapter_target:-}" ]; then
     xattr -cr "$adapter_target" >/dev/null 2>&1 || true
   fi
+fi
+
+if [ "$os" = "darwin" ] && command -v codesign >/dev/null 2>&1; then
+  codesign --force --sign - "$target" >/dev/null 2>&1 || true
   if [ -n "${tray_target:-}" ]; then
-    xattr -cr "$tray_target" >/dev/null 2>&1 || true
+    codesign --force --sign - "$tray_target" >/dev/null 2>&1 || true
   fi
 fi
 
