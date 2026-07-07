@@ -56,6 +56,7 @@ pub struct LiveCapabilities {
     pub translation: bool,
     pub voice_processing: bool,
     pub device_selection: bool,
+    pub ptt: bool,
     pub requires_network: bool,
     pub expected_latency: Option<Duration>,
 }

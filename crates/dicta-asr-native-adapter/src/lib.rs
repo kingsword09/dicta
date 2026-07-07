@@ -287,6 +287,7 @@ pub fn native_adapter_live_capabilities() -> LiveCapabilities {
         translation: true,
         voice_processing: true,
         device_selection: true,
+        ptt: false,
         requires_network: false,
         expected_latency: None,
     }

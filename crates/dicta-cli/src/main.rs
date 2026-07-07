@@ -37,7 +37,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{cmp, env};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::{self, Instant as TokioInstant};
 use tower_http::cors::{Any, CorsLayer};
 
@@ -123,6 +123,13 @@ struct Cli {
     live: bool,
 
     #[arg(
+        long = "ptt",
+        alias = "push-to-talk",
+        help = "Run push-to-talk mode; press Enter to start/stop each utterance"
+    )]
+    ptt: bool,
+
+    #[arg(
         long = "live-chunk",
         env = "DICTA_LIVE_CHUNK",
         help = "Chunk duration in seconds for chunked live providers"
@@ -187,6 +194,7 @@ impl Cli {
             input: self.input.clone(),
             mic_duration: self.mic_duration,
             live: self.live,
+            ptt: self.ptt,
             live_chunk: self.live_chunk,
             no_mic: self.no_mic,
             no_speaker: self.no_speaker,
@@ -622,6 +630,8 @@ struct ProviderLiveManifest {
     #[serde(default)]
     device_selection: bool,
     #[serde(default)]
+    ptt: bool,
+    #[serde(default)]
     requires_network: bool,
     #[serde(default)]
     expected_latency_ms: Option<u64>,
@@ -639,6 +649,7 @@ impl ProviderLiveManifest {
             translation: self.translation,
             voice_processing: self.voice_processing,
             device_selection: self.device_selection,
+            ptt: self.ptt,
             requires_network: self.requires_network,
             expected_latency: self.expected_latency_ms.map(Duration::from_millis),
         }
@@ -743,6 +754,9 @@ impl EffectiveProvider {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.ptt && cli.ui {
+        bail!("--ptt cannot be combined with --ui yet");
+    }
     if cli.ui {
         run_ui(&cli).await?;
         return Ok(());
@@ -755,6 +769,11 @@ async fn main() -> Result<()> {
 
     if cli.capabilities {
         run_capabilities(&cli)?;
+        return Ok(());
+    }
+
+    if cli.ptt {
+        run_ptt(&cli).await?;
         return Ok(());
     }
 
@@ -1666,6 +1685,69 @@ where
     Ok(())
 }
 
+async fn run_ptt(cli: &Cli) -> Result<()> {
+    let ptt_cli = cli_for_ptt(cli);
+    validate_ptt_options(&ptt_cli)?;
+
+    let apple_support = apple_support();
+    let effective = effective_provider_for(&ptt_cli, &apple_support, false)?;
+    if effective.backend != AsrBackend::External {
+        bail!("--ptt requires an installed external provider with PTT support");
+    }
+
+    let provider = build_external_provider(&ptt_cli)?;
+    let capabilities = provider.live_capabilities();
+    if !capabilities.ptt {
+        bail!(
+            "provider '{}' does not support PTT; update the provider or choose one with live.ptt = true",
+            provider.id
+        );
+    }
+    validate_live_options(&ptt_cli, provider.live_name(), &capabilities)?;
+    let options = live_options_from_cli(&ptt_cli, &capabilities);
+    let mut renderer = LiveRenderer::new(
+        ptt_cli.json,
+        ptt_cli.transcript.clone(),
+        options.mic && options.speaker,
+        ptt_cli.src.clone(),
+        ptt_cli.dst.clone(),
+    )?;
+
+    provider
+        .run_ptt(options, &mut |event| {
+            renderer.handle_live_event(event).map_err(|err| {
+                dicta_asr::AsrError::Request(format!(
+                    "failed to render {} PTT event: {err}",
+                    provider.live_name()
+                ))
+            })
+        })
+        .await
+        .with_context(|| format!("{} PTT transcription failed", provider.live_name()))?;
+
+    renderer.finalize_session_log()?;
+    renderer.print_summary();
+    Ok(())
+}
+
+fn cli_for_ptt(cli: &Cli) -> Cli {
+    if cli.provider.is_none() && cli.asr == AsrBackend::Auto {
+        cli.with_provider_name(Some("active".to_owned()))
+    } else {
+        cli.clone()
+    }
+}
+
+fn validate_ptt_options(cli: &Cli) -> Result<()> {
+    if cli.input.is_some() || cli.mic_duration.is_some() {
+        bail!("--ptt cannot be combined with --input or --mic-duration");
+    }
+    if !io::stdin().is_terminal() {
+        bail!("--ptt requires interactive stdin so Enter can start and stop recording");
+    }
+    Ok(())
+}
+
 fn live_options_from_cli(cli: &Cli, capabilities: &LiveCapabilities) -> LiveAsrOptions {
     LiveAsrOptions {
         src: cli.src.clone(),
@@ -2448,6 +2530,7 @@ struct LiveReport {
     translation: bool,
     voice_processing: bool,
     device_selection: bool,
+    ptt: bool,
     requires_network: bool,
     expected_latency: Option<String>,
     error: Option<String>,
@@ -2487,6 +2570,7 @@ struct LiveCapabilitiesReport {
     translation: bool,
     voice_processing: bool,
     device_selection: bool,
+    ptt: bool,
     requires_network: bool,
     expected_latency: Option<String>,
 }
@@ -4233,6 +4317,7 @@ fn live_capabilities_report(capabilities: LiveCapabilities) -> LiveCapabilitiesR
         translation: capabilities.translation,
         voice_processing: capabilities.voice_processing,
         device_selection: capabilities.device_selection,
+        ptt: capabilities.ptt,
         requires_network: capabilities.requires_network,
         expected_latency: capabilities.expected_latency.map(format_duration),
     }
@@ -4260,6 +4345,7 @@ fn gather_live_report(cli: &Cli, apple_support: &AppleSupport) -> LiveReport {
                 translation: capabilities.translation,
                 voice_processing: capabilities.voice_processing,
                 device_selection: capabilities.device_selection,
+                ptt: capabilities.ptt,
                 requires_network: capabilities.requires_network,
                 expected_latency: live_expected_latency(cli, &capabilities).map(format_duration),
                 error: None,
@@ -4276,6 +4362,7 @@ fn gather_live_report(cli: &Cli, apple_support: &AppleSupport) -> LiveReport {
             translation: false,
             voice_processing: false,
             device_selection: false,
+            ptt: false,
             requires_network: false,
             expected_latency: None,
             error: Some(err.to_string()),
@@ -4304,6 +4391,7 @@ fn live_capabilities_for_backend(backend: AsrBackend) -> LiveCapabilities {
                 translation: false,
                 voice_processing: false,
                 device_selection: false,
+                ptt: false,
                 requires_network: false,
                 expected_latency: None,
             }
@@ -4497,6 +4585,7 @@ fn print_capabilities_text(report: &CapabilitiesReport) {
         println!("  Live translation: {}", yes_no(live.translation));
         println!("  Live voice processing: {}", yes_no(live.voice_processing));
         println!("  Live device selection: {}", yes_no(live.device_selection));
+        println!("  Live PTT: {}", yes_no(live.ptt));
         println!("  Live requires network: {}", yes_no(live.requires_network));
         if let Some(latency) = &live.expected_latency {
             println!("  Live expected latency: {latency}");
@@ -5062,6 +5151,204 @@ impl ExternalProvider {
             .env("DICTA_PROVIDER_ROOT", &self.root);
         command
     }
+
+    async fn run_ptt(
+        &self,
+        options: LiveAsrOptions,
+        on_event: LiveEventCallback<'_>,
+    ) -> dicta_asr::AsrResult<()> {
+        let mut command = self.command();
+        append_external_live_args(&mut command, &options);
+        command.arg("--json").arg("--ptt-json");
+
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|err| {
+                dicta_asr::AsrError::Request(format!(
+                    "failed to run provider {} at {}: {err}",
+                    self.id,
+                    self.command.display()
+                ))
+            })?;
+        let child_stdin = child.stdin.take().ok_or_else(|| {
+            dicta_asr::AsrError::Request(format!("provider {} stdin was not piped", self.id))
+        })?;
+        let mut child_stdin = Some(child_stdin);
+        let stdout = child.stdout.take().ok_or_else(|| {
+            dicta_asr::AsrError::Request(format!("provider {} stdout was not piped", self.id))
+        })?;
+        let stderr_task = child.stderr.take().map(drain_external_provider_stderr);
+        let mut provider_lines = BufReader::new(stdout).lines();
+        let mut input_lines = BufReader::new(tokio::io::stdin()).lines();
+        let mut recording = false;
+        let mut interrupted = false;
+        let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
+        let shutdown_timer = time::sleep(Duration::from_secs(0));
+        tokio::pin!(shutdown_timer);
+        let mut shutdown_requested = false;
+
+        ptt_prompt("press Enter to start/stop recording; Ctrl-C to quit");
+
+        loop {
+            tokio::select! {
+                biased;
+                signal = &mut ctrl_c, if !shutdown_requested => {
+                    signal.map_err(|err| {
+                        dicta_asr::AsrError::Request(format!("failed to listen for Ctrl-C: {err}"))
+                    })?;
+                    interrupted = true;
+                    shutdown_requested = true;
+                    let event = if recording {
+                        PttControlEvent::StopUtterance
+                    } else {
+                        PttControlEvent::CancelUtterance
+                    };
+                    if let Some(stdin) = child_stdin.as_mut() {
+                        send_ptt_control(&self.id, stdin, event).await.ok();
+                    }
+                    child_stdin.take();
+                    shutdown_timer
+                        .as_mut()
+                        .reset(TokioInstant::now() + Duration::from_secs(30));
+                }
+                _ = &mut shutdown_timer, if shutdown_requested => {
+                    let _ = child.start_kill();
+                    on_event(LiveEvent::Eof)?;
+                    break;
+                }
+                input = input_lines.next_line(), if !shutdown_requested => {
+                    let Some(_) = input.map_err(|err| {
+                        dicta_asr::AsrError::Request(format!("failed to read PTT stdin: {err}"))
+                    })? else {
+                        shutdown_requested = true;
+                        if let Some(stdin) = child_stdin.as_mut() {
+                            send_ptt_control(&self.id, stdin, PttControlEvent::CancelUtterance).await.ok();
+                        }
+                        child_stdin.take();
+                        shutdown_timer
+                            .as_mut()
+                            .reset(TokioInstant::now() + Duration::from_secs(30));
+                        continue;
+                    };
+                    let event = if recording {
+                        PttControlEvent::StopUtterance
+                    } else {
+                        PttControlEvent::StartUtterance
+                    };
+                    let stdin = child_stdin.as_mut().ok_or_else(|| {
+                        dicta_asr::AsrError::Request(format!("provider {} stdin is closed", self.id))
+                    })?;
+                    send_ptt_control(&self.id, stdin, event).await?;
+                    recording = !recording;
+                    if recording {
+                        ptt_prompt("recording; press Enter to stop");
+                    } else {
+                        ptt_prompt("finalizing; press Enter to start next utterance");
+                    }
+                }
+                line = provider_lines.next_line() => {
+                    let Some(line) = line.map_err(|err| {
+                        dicta_asr::AsrError::Request(format!("failed to read provider {} stdout: {err}", self.id))
+                    })? else {
+                        break;
+                    };
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let event = parse_external_live_event(line)?;
+                    let eof = matches!(event, LiveEvent::Eof);
+                    on_event(event)?;
+                    if eof {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let status = child.wait().await.map_err(|err| {
+            dicta_asr::AsrError::Request(format!(
+                "failed to wait for provider {} at {}: {err}",
+                self.id,
+                self.command.display()
+            ))
+        })?;
+        if !interrupted && !status.success() {
+            let stderr_tail = external_provider_stderr_tail(stderr_task).await;
+            let detail = if stderr_tail.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", stderr_tail.join("\n"))
+            };
+            return Err(dicta_asr::AsrError::Request(format!(
+                "provider {} exited with {status}{detail}",
+                self.id,
+            )));
+        }
+        let _ = external_provider_stderr_tail(stderr_task).await;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum PttControlEvent {
+    StartUtterance,
+    StopUtterance,
+    CancelUtterance,
+}
+
+fn append_external_live_args(command: &mut tokio::process::Command, options: &LiveAsrOptions) {
+    if let Some(src) = &options.src {
+        command.arg("--src").arg(src);
+    }
+    if let Some(dst) = &options.dst {
+        command.arg("--dst").arg(dst);
+    }
+    if !options.mic {
+        command.arg("--no-mic");
+    }
+    if !options.speaker {
+        command.arg("--no-speaker");
+    }
+    if options.voice_processing {
+        command.arg("--voice-processing");
+    }
+    if options.select_device {
+        command.arg("--select-device");
+    }
+}
+
+async fn send_ptt_control(
+    provider_id: &str,
+    stdin: &mut tokio::process::ChildStdin,
+    event: PttControlEvent,
+) -> dicta_asr::AsrResult<()> {
+    let mut line = serde_json::to_string(&event).map_err(|err| {
+        dicta_asr::AsrError::InvalidResponse(format!(
+            "failed to serialize PTT control event: {err}"
+        ))
+    })?;
+    line.push('\n');
+    stdin.write_all(line.as_bytes()).await.map_err(|err| {
+        dicta_asr::AsrError::Request(format!(
+            "failed to write provider {provider_id} stdin: {err}"
+        ))
+    })?;
+    stdin.flush().await.map_err(|err| {
+        dicta_asr::AsrError::Request(format!(
+            "failed to flush provider {provider_id} stdin: {err}"
+        ))
+    })
+}
+
+fn ptt_prompt(message: &str) {
+    if io::stderr().is_terminal() {
+        eprintln!("dicta ptt: {message}");
+    }
 }
 
 #[async_trait]
@@ -5126,25 +5413,8 @@ impl LiveAsrProvider for ExternalProvider {
         on_event: LiveEventCallback<'_>,
     ) -> dicta_asr::AsrResult<()> {
         let mut command = self.command();
-        if let Some(src) = options.src {
-            command.arg("--src").arg(src);
-        }
-        if let Some(dst) = options.dst {
-            command.arg("--dst").arg(dst);
-        }
+        append_external_live_args(&mut command, &options);
         command.arg("--json").arg("--event-json");
-        if !options.mic {
-            command.arg("--no-mic");
-        }
-        if !options.speaker {
-            command.arg("--no-speaker");
-        }
-        if options.voice_processing {
-            command.arg("--voice-processing");
-        }
-        if options.select_device {
-            command.arg("--select-device");
-        }
 
         let mut child = command
             .stdin(Stdio::inherit())
@@ -5474,6 +5744,7 @@ mod tests {
             input: None,
             mic_duration: None,
             live: false,
+            ptt: false,
             live_chunk: None,
             no_mic: false,
             no_speaker: false,
@@ -5950,6 +6221,63 @@ expected_latency_ms = 5000
         };
 
         assert!(!should_run_live(&cli));
+    }
+
+    #[test]
+    fn ptt_flag_and_alias_are_available() {
+        let cli = Cli::try_parse_from(["dicta", "--ptt"]).unwrap();
+        assert!(cli.ptt);
+
+        let cli = Cli::try_parse_from(["dicta", "--push-to-talk"]).unwrap();
+        assert!(cli.ptt);
+    }
+
+    #[test]
+    fn ptt_defaults_to_active_provider() {
+        let cli = test_cli();
+        let cli = cli_for_ptt(&cli);
+
+        assert_eq!(cli.provider.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn explicit_ptt_provider_is_preserved() {
+        let cli = Cli {
+            provider: Some("qianwenime-asr".to_owned()),
+            ..test_cli()
+        };
+        let cli = cli_for_ptt(&cli);
+
+        assert_eq!(cli.provider.as_deref(), Some("qianwenime-asr"));
+    }
+
+    #[test]
+    fn ptt_control_event_uses_provider_protocol_names() {
+        let encoded = serde_json::to_string(&PttControlEvent::StartUtterance).unwrap();
+
+        assert_eq!(encoded, r#"{"type":"start_utterance"}"#);
+    }
+
+    #[test]
+    fn provider_manifest_reads_ptt_capability() {
+        let manifest: ProviderPackageManifest = toml::from_str(
+            r#"
+id = "ptt-asr"
+protocol = "dicta-provider-jsonl-v1"
+command = "bin/ptt-asr"
+
+[live]
+ptt = true
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            manifest
+                .live
+                .as_ref()
+                .is_some_and(|live| live.capabilities().ptt)
+        );
     }
 
     #[test]
