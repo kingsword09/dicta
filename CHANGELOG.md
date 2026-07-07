@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.10.10](https://github.com/kingsword09/dicta/compare/v0.10.9...v0.10.10) - 2026-07-07
+
+### Other Changes
+- ci: build macOS release for deployment target 15 by @kingsword09 in https://github.com/kingsword09/dicta/pull/39
+
 ## [v0.10.9](https://github.com/kingsword09/dicta/compare/v0.10.8...v0.10.9) - 2026-07-07
 
 ### Other Changes
