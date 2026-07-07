@@ -28,7 +28,7 @@ use dicta_core::{
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, IsTerminal, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -48,6 +48,7 @@ const DEFAULT_NPM_REGISTRY: &str = "https://registry.npmjs.org";
 const DEFAULT_PROVIDER_SCOPE: &str = "dicta-asr";
 const DEFAULT_PROVIDER_KEYWORD: &str = "dicta-provider";
 const PROVIDER_INSTALL_METADATA_FILE: &str = ".dicta-provider-install.json";
+const PROVIDER_STDERR_TAIL_LINES: usize = 20;
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "dicta")]
@@ -5124,7 +5125,7 @@ impl LiveAsrProvider for ExternalProvider {
         let mut child = command
             .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|err| {
                 dicta_asr::AsrError::Request(format!(
@@ -5136,6 +5137,7 @@ impl LiveAsrProvider for ExternalProvider {
         let stdout = child.stdout.take().ok_or_else(|| {
             dicta_asr::AsrError::Request(format!("provider {} stdout was not piped", self.id))
         })?;
+        let stderr_task = child.stderr.take().map(drain_external_provider_stderr);
         let mut lines = BufReader::new(stdout).lines();
         let mut interrupted = false;
         let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
@@ -5186,11 +5188,18 @@ impl LiveAsrProvider for ExternalProvider {
             ))
         })?;
         if !interrupted && !status.success() {
+            let stderr_tail = external_provider_stderr_tail(stderr_task).await;
+            let detail = if stderr_tail.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", stderr_tail.join("\n"))
+            };
             return Err(dicta_asr::AsrError::Request(format!(
-                "provider {} exited with {status}",
-                self.id
+                "provider {} exited with {status}{detail}",
+                self.id,
             )));
         }
+        let _ = external_provider_stderr_tail(stderr_task).await;
         Ok(())
     }
 
@@ -5203,6 +5212,41 @@ impl LiveAsrProvider for ExternalProvider {
             .live
             .clone()
             .unwrap_or_else(|| live_capabilities_for_backend(AsrBackend::External))
+    }
+}
+
+fn drain_external_provider_stderr<R>(stderr: R) -> tokio::task::JoinHandle<Vec<String>>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        let mut tail = VecDeque::with_capacity(PROVIDER_STDERR_TAIL_LINES);
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    let line = line.trim().to_owned();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if tail.len() == PROVIDER_STDERR_TAIL_LINES {
+                        tail.pop_front();
+                    }
+                    tail.push_back(line);
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        tail.into_iter().collect()
+    })
+}
+
+async fn external_provider_stderr_tail(
+    task: Option<tokio::task::JoinHandle<Vec<String>>>,
+) -> Vec<String> {
+    match task {
+        Some(task) => task.await.unwrap_or_default(),
+        None => Vec::new(),
     }
 }
 
