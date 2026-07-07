@@ -9,9 +9,9 @@
     <key>CFBundleExecutable</key>
     <string>dicta</string>
     <key>CFBundleVersion</key>
-    <string>0.10.14</string>
+    <string>0.10.15</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.10.14</string>
+    <string>0.10.15</string>
     <key>CFBundleDevelopmentRegion</key>
     <string>ja</string>
     <key>LSMinimumSystemVersion</key>

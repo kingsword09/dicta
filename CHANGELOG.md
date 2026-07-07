@@ -1,5 +1,11 @@
 # Changelog
 
+## [v0.10.15](https://github.com/kingsword09/dicta/compare/v0.10.14...v0.10.15) - 2026-07-07
+
+### Other Changes
+- fix: gracefully stop live UI worker on shutdown by @kingsword09 in https://github.com/kingsword09/dicta/pull/49
+- feat: add realtime activation modes for tray UI by @kingsword09 in https://github.com/kingsword09/dicta/pull/50
+
 ## [v0.10.14](https://github.com/kingsword09/dicta/compare/v0.10.13...v0.10.14) - 2026-07-07
 
 ### Other Changes
