@@ -171,6 +171,7 @@ $ dicta provider list
 $ dicta provider set <provider-name>
 $ dicta provider current
 $ dicta --provider active --live
+$ dicta --ptt
 ```
 
 `dicta provider set <name>` writes `~/.config/dicta/active-provider.json` by default.
@@ -236,13 +237,24 @@ mode = "streaming"
 mic = true
 partial_results = true
 finalized_results = true
+ptt = true
 requires_network = true
 ```
 
 The command is run as a separate provider process. Batch mode receives
 `--input`, `--json`, and optional `--src`. Live mode receives `--json`,
-`--event-json`, source/target language flags, and capture flags. The provider
-prints `dicta-core` compatible JSONL events.
+`--event-json`, source/target language flags, and capture flags. Push-to-talk
+mode receives `--json`, `--ptt-json`, the same language/capture flags, and JSONL
+control events on stdin:
+
+```jsonl
+{"type":"start_utterance"}
+{"type":"stop_utterance"}
+{"type":"cancel_utterance"}
+```
+
+The provider prints `dicta-core` compatible JSONL events on stdout and keeps
+diagnostics on stderr.
 
 Capability diagnostics are local and explicit. `dicta --capabilities` resolves the
 selected backend, checks local configuration requirements such as a native

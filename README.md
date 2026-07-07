@@ -84,9 +84,14 @@ $ dicta --no-speaker                     # Mic only
 $ dicta --no-mic --src en-US --dst ja-JP # Speaker only on Apple mode
 $ dicta --select-device                  # Pick and pin mic / speaker at startup
 $ dicta --json | jq                      # JSONL output for piping
+$ dicta --ptt                            # Push-to-talk using the active provider
 $ dicta --capabilities                   # ASR capability diagnostics
 $ dicta doctor                           # Environment diagnostics
 ```
+
+Push-to-talk mode is a foreground external-provider mode. Press Enter once to
+start an utterance and again to stop/finalize it; press Ctrl-C to quit. When no
+provider is passed, `dicta --ptt` resolves `--provider active`.
 
 Status bar mode:
 
@@ -228,9 +233,11 @@ API keys are only appropriate for personal/local workflows.
 Provider implementations declare their maximum batch and live capabilities.
 Named profiles can narrow those capabilities for OpenAI-compatible services
 without new Rust code. Installed provider packages run as separate processes
-through the same JSONL provider protocol used by the CLI. Apple live is
-streaming and can emit partial/final/translation events; use `--capabilities` to
-inspect the resolved provider and `dicta doctor` for full environment diagnostics.
+through the same JSONL provider protocol used by the CLI. External providers can
+also declare `live.ptt = true` and implement the `--ptt-json` control protocol.
+Apple live is streaming and can emit partial/final/translation events; use
+`--capabilities` to inspect the resolved provider and `dicta doctor` for full
+environment diagnostics.
 
 ## License
 
