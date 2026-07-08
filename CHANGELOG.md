@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.10.16](https://github.com/kingsword09/dicta/compare/v0.10.15...v0.10.16) - 2026-07-08
+
+### Other Changes
+- fix(cli): keep ptt transcript prompt cancellable by @kingsword09 in https://github.com/kingsword09/dicta/pull/52
+
 ## [v0.10.15](https://github.com/kingsword09/dicta/compare/v0.10.14...v0.10.15) - 2026-07-07
 
 ### Other Changes
