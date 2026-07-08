@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.10.17](https://github.com/kingsword09/dicta/compare/v0.10.16...v0.10.17) - 2026-07-08
+
+### Other Changes
+- fix(ui): detach tray launcher for ptt switching by @kingsword09 in https://github.com/kingsword09/dicta/pull/54
+
 ## [v0.10.16](https://github.com/kingsword09/dicta/compare/v0.10.15...v0.10.16) - 2026-07-08
 
 ### Other Changes
