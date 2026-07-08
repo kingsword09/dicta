@@ -71,6 +71,7 @@ struct AppConfig {
     provider_config: Option<String>,
     provider_state: Option<String>,
     autostart: bool,
+    open_panel: bool,
     native_glass: bool,
 }
 
@@ -213,6 +214,7 @@ impl Default for AppConfig {
             provider_config: None,
             provider_state: None,
             autostart: false,
+            open_panel: false,
             native_glass: false,
         }
     }
@@ -264,6 +266,7 @@ impl AppConfig {
         config.provider_config = non_empty_env("DICTA_PROVIDER_CONFIG");
         config.provider_state = non_empty_env("DICTA_PROVIDER_STATE");
         config.autostart = env::var("DICTA_UI_AUTOSTART").is_ok_and(|value| value == "1");
+        config.open_panel = env::var("DICTA_UI_OPEN_PANEL").is_ok_and(|value| value == "1");
         config.native_glass = env::var("DICTA_UI_NATIVE_GLASS").is_ok_and(|value| value == "1");
         config
     }
@@ -840,7 +843,12 @@ fn main() -> Result<()> {
                     }
                 }
                 match create_panel(_target, panel_proxy.clone(), &app) {
-                    Ok(created_panel) => panel = Some(created_panel),
+                    Ok(mut created_panel) => {
+                        if app.config.open_panel {
+                            show_panel_at_fallback(&mut created_panel);
+                        }
+                        panel = Some(created_panel);
+                    }
                     Err(error) => {
                         eprintln!("dicta-tray: failed to create panel UI: {error}");
                     }
@@ -1028,14 +1036,7 @@ fn configure_live_worker_stdio(command: &mut Command, provider: &str) -> Result<
 
 #[cfg(unix)]
 fn configure_live_worker_process(command: &mut Command) {
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    command.process_group(0);
 }
 
 #[cfg(not(unix))]
@@ -1243,6 +1244,16 @@ fn toggle_panel(panel: &mut Panel, event: &TrayIconEvent) {
 
 fn show_panel(panel: &mut Panel, event: &TrayIconEvent) {
     let position = panel_position(panel, event);
+    show_panel_at(panel, position);
+}
+
+fn show_panel_at_fallback(panel: &mut Panel) {
+    let scale = panel.window.scale_factor();
+    let panel_size = LogicalSize::new(PANEL_WIDTH, PANEL_HEIGHT).to_physical::<i32>(scale);
+    show_panel_at(panel, fallback_anchor(panel, panel_size));
+}
+
+fn show_panel_at(panel: &mut Panel, position: PhysicalPosition<i32>) {
     panel.window.set_outer_position(position);
     panel.window.set_visible(true);
     panel.window.set_focus();

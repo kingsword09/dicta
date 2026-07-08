@@ -106,14 +106,18 @@ $ dicta --ui --hotkey ctrl+alt+space     # Enable a global tray hotkey
 $ dicta --ui --provider active --live    # Use the saved active provider
 ```
 
-The status bar UI is the Rust `dicta-tray` companion binary. Left-clicking the
-status item opens a compact provider panel; right-clicking keeps a native menu
-fallback. It lists built-in and configured provider profiles and runs live
-or PTT transcription as a supervised `dicta --provider active ...` worker. The
-plain `dicta --ui` panel stays idle until you start recording. Its default
-activation is automatic: PTT-capable providers use `--ptt`, and other live
-providers use `--live`. Pass `--ui --live` to force continuous live mode or
-`--ui --ptt` to force PTT. Global hotkeys are disabled unless `--hotkey` or
+The status bar UI is the Rust `dicta-tray` companion binary. `dicta --ui`
+launches it, opens the provider panel, then returns control to the shell; quit
+from the status item menu when you want to stop the tray. Ctrl-C remains the
+foreground `dicta --ptt`/`dicta --live` exit path, but it is not the tray exit
+path after `dicta --ui` has returned. Left-clicking the status item reopens the
+compact provider panel; right-clicking keeps a native menu fallback. It lists
+built-in and configured provider profiles and runs live or PTT transcription as
+a supervised `dicta --provider active ...` worker. The plain `dicta --ui` panel
+stays idle until you start recording. Its default activation is automatic:
+PTT-capable providers use `--ptt`, and other live providers use `--live`. Pass
+`--ui --live` to force continuous live mode or `--ui --ptt` to force PTT. Global
+hotkeys are disabled unless `--hotkey` or
 `DICTA_UI_HOTKEY` is set. The hotkey syntax is the same as
 `ctrl+alt+space`, `shift+alt+KeyD`, or `cmd+shift+KeyD`; use `off` to disable
 an inherited environment value. With PTT providers the hotkey is hold-to-talk;
