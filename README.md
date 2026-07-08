@@ -106,18 +106,21 @@ $ dicta --ui --hotkey ctrl+alt+space     # Enable a global tray hotkey
 $ dicta --ui --provider active --live    # Use the saved active provider
 ```
 
-The status bar UI is the Rust `dicta-tray` companion binary. `dicta --ui`
+The status bar UI is the Rust `dicta-tray` companion binary. Plain `dicta --ui`
 launches it, opens the provider panel, then returns control to the shell; quit
-from the status item menu when you want to stop the tray. Ctrl-C remains the
-foreground `dicta --ptt`/`dicta --live` exit path, but it is not the tray exit
-path after `dicta --ui` has returned. Left-clicking the status item reopens the
-compact provider panel; right-clicking keeps a native menu fallback. It lists
-built-in and configured provider profiles and runs live or PTT transcription as
-a supervised `dicta --provider active ...` worker. The plain `dicta --ui` panel
-stays idle until you start recording. Its default activation is automatic:
-PTT-capable providers use `--ptt`, and other live providers use `--live`. Pass
-`--ui --live` to force continuous live mode or `--ui --ptt` to force PTT. Global
-hotkeys are disabled unless `--hotkey` or
+from the status item menu when you want to stop the tray. `dicta --ptt --ui` and
+`dicta --live --ui` are foreground realtime sessions: the terminal keeps the
+normal PTT or live behavior while the tray controls that same session through a
+small supervisor channel. Left-clicking the status item reopens the compact
+provider panel; right-clicking keeps a native menu fallback. The panel lists
+built-in and configured provider profiles. In plain `dicta --ui`, it can start a
+tray-managed `dicta --provider active ...` worker. In `--ptt --ui` or
+`--live --ui`, provider switching restarts the foreground session worker instead
+of launching a second independent worker. The plain `dicta --ui` panel stays
+idle until you start recording. Its default activation is automatic: PTT-capable
+providers use `--ptt`, and other live providers use `--live`. Pass `--ui --live`
+to force continuous live mode or `--ui --ptt` to force PTT.
+Global hotkeys are disabled unless `--hotkey` or
 `DICTA_UI_HOTKEY` is set. The hotkey syntax is the same as
 `ctrl+alt+space`, `shift+alt+KeyD`, or `cmd+shift+KeyD`; use `off` to disable
 an inherited environment value. With PTT providers the hotkey is hold-to-talk;

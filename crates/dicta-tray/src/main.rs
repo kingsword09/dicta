@@ -3,8 +3,9 @@ use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState, hotkey:
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
-use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Write};
+use std::net::TcpStream;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -45,6 +46,7 @@ use wry::WebViewBuilderExtUnix;
 const PANEL_WIDTH: f64 = 380.0;
 const PANEL_HEIGHT: f64 = 448.0;
 const LIVE_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+const LIVE_WORKER_QUIT_TIMEOUT: Duration = Duration::from_secs(5);
 const LIVE_WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 
 const MENU_START: &str = "start";
@@ -72,6 +74,8 @@ struct AppConfig {
     provider_state: Option<String>,
     autostart: bool,
     open_panel: bool,
+    control_addr: Option<String>,
+    control_state: Option<PathBuf>,
     native_glass: bool,
 }
 
@@ -81,10 +85,21 @@ struct TrayApp {
     provider_report: Option<ProviderListReport>,
     provider_actions: BTreeMap<String, String>,
     live_child: Option<Child>,
+    pending_shutdown: Option<PendingShutdown>,
     worker_mode: Option<WorkerMode>,
     ptt_recording: bool,
+    external_running: bool,
     hotkey_down: bool,
+    quit_requested: bool,
     status: String,
+}
+
+#[derive(Debug)]
+struct PendingShutdown {
+    child: Child,
+    mode: WorkerMode,
+    force_at: Instant,
+    force_sent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +134,14 @@ impl WorkerMode {
             Self::Live => "live",
             Self::Ptt => "ptt",
         }
+    }
+}
+
+fn parse_worker_mode(value: &str) -> Option<WorkerMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "live" | "continuous" => Some(WorkerMode::Live),
+        "ptt" | "push-to-talk" => Some(WorkerMode::Ptt),
+        _ => None,
     }
 }
 
@@ -177,6 +200,13 @@ struct PanelMessage {
 }
 
 #[derive(Debug, Serialize)]
+struct ControlMessage<'a> {
+    action: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
 struct PanelState<'a> {
     status: &'a str,
     current: Option<&'a str>,
@@ -187,6 +217,13 @@ struct PanelState<'a> {
     hotkey: Option<&'a str>,
     selected_ready: bool,
     providers: &'a [ProviderListEntry],
+}
+
+#[derive(Debug, Deserialize)]
+struct ExternalControlState {
+    running: bool,
+    recording: bool,
+    mode: Option<String>,
 }
 
 struct Panel {
@@ -215,6 +252,8 @@ impl Default for AppConfig {
             provider_state: None,
             autostart: false,
             open_panel: false,
+            control_addr: None,
+            control_state: None,
             native_glass: false,
         }
     }
@@ -267,6 +306,8 @@ impl AppConfig {
         config.provider_state = non_empty_env("DICTA_PROVIDER_STATE");
         config.autostart = env::var("DICTA_UI_AUTOSTART").is_ok_and(|value| value == "1");
         config.open_panel = env::var("DICTA_UI_OPEN_PANEL").is_ok_and(|value| value == "1");
+        config.control_addr = non_empty_env("DICTA_UI_CONTROL_ADDR");
+        config.control_state = non_empty_env("DICTA_UI_CONTROL_STATE").map(PathBuf::from);
         config.native_glass = env::var("DICTA_UI_NATIVE_GLASS").is_ok_and(|value| value == "1");
         config
     }
@@ -285,14 +326,18 @@ impl AppConfig {
 
 impl TrayApp {
     fn new(config: AppConfig) -> Self {
+        let external_running = config.control_addr.is_some();
         Self {
             config,
             provider_report: None,
             provider_actions: BTreeMap::new(),
             live_child: None,
+            pending_shutdown: None,
             worker_mode: None,
             ptt_recording: false,
+            external_running,
             hotkey_down: false,
+            quit_requested: false,
             status: "Starting".to_owned(),
         }
     }
@@ -300,6 +345,80 @@ impl TrayApp {
     fn set_status(&mut self, status: impl Into<String>) {
         self.status = status.into();
         eprintln!("dicta-tray: {}", self.status);
+    }
+
+    fn has_external_control(&self) -> bool {
+        self.config.control_addr.is_some()
+    }
+
+    fn sync_external_state(&mut self) -> bool {
+        let Some(path) = &self.config.control_state else {
+            return false;
+        };
+        let state = match fs::read_to_string(path) {
+            Ok(contents) => serde_json::from_str::<ExternalControlState>(&contents).ok(),
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => {
+                eprintln!(
+                    "dicta-tray: failed to read control state {}: {error}",
+                    path.display()
+                );
+                None
+            }
+        };
+
+        let (running, recording, mode) = match state {
+            Some(state) => (
+                state.running,
+                state.recording,
+                state.mode.as_deref().and_then(parse_worker_mode),
+            ),
+            None => (false, false, None),
+        };
+        let mut changed = false;
+        if self.external_running != running {
+            self.external_running = running;
+            changed = true;
+        }
+        if self.ptt_recording != recording {
+            self.ptt_recording = recording;
+            changed = true;
+        }
+        if let Some(mode) = mode
+            && self.worker_mode != Some(mode)
+        {
+            self.worker_mode = Some(mode);
+            changed = true;
+        }
+        changed
+    }
+
+    fn send_control(&mut self, action: &'static str, provider: Option<&str>) {
+        let Some(addr) = &self.config.control_addr else {
+            return;
+        };
+        let message = ControlMessage { action, provider };
+        let payload = match serde_json::to_string(&message) {
+            Ok(mut payload) => {
+                payload.push('\n');
+                payload
+            }
+            Err(error) => {
+                self.set_status(format!("Control message failed: {error}"));
+                return;
+            }
+        };
+        match TcpStream::connect(addr).and_then(|mut stream| stream.write_all(payload.as_bytes())) {
+            Ok(()) => {
+                self.set_status(match provider {
+                    Some(name) => format!("Sent {action} to {name}"),
+                    None => format!("Sent {action}"),
+                });
+            }
+            Err(error) => {
+                self.set_status(format!("Control send failed: {error}"));
+            }
+        }
     }
 
     fn refresh(&mut self) {
@@ -422,6 +541,15 @@ impl TrayApp {
         match self.remember_provider(name) {
             Ok(()) => {
                 let switched_status = format!("Provider switched to {name}");
+                if self.has_external_control() {
+                    self.refresh();
+                    self.external_running = true;
+                    self.ptt_recording = false;
+                    self.worker_mode = self.selected_provider_mode();
+                    self.send_control("set_provider", Some(name));
+                    self.set_status(switched_status);
+                    return;
+                }
                 let was_running = self.live_child.is_some();
                 if was_running {
                     self.shutdown_live_worker();
@@ -439,6 +567,42 @@ impl TrayApp {
     }
 
     fn start_live(&mut self) {
+        if self.has_external_control() {
+            if !self.selected_provider_ready() {
+                let status = match self.selected_provider_entry() {
+                    Some(provider) => unavailable_provider_status(provider),
+                    None => "No live-ready provider is selected".to_owned(),
+                };
+                self.set_status(status);
+                return;
+            }
+            match self.selected_provider_mode().unwrap_or(WorkerMode::Live) {
+                WorkerMode::Ptt => {
+                    if self.ptt_recording {
+                        self.set_status("PTT is already recording");
+                        return;
+                    }
+                    self.external_running = true;
+                    self.ptt_recording = true;
+                    self.worker_mode = Some(WorkerMode::Ptt);
+                    self.send_control("start", None);
+                }
+                WorkerMode::Live => {
+                    if self.external_running {
+                        self.set_status("Realtime worker already running");
+                        return;
+                    }
+                    self.external_running = true;
+                    self.worker_mode = Some(WorkerMode::Live);
+                    self.send_control("start", None);
+                }
+            }
+            return;
+        }
+        if self.pending_shutdown.is_some() {
+            self.set_status("Live shutdown is still in progress");
+            return;
+        }
         if !self.selected_provider_ready() {
             let status = match self.selected_provider_entry() {
                 Some(provider) => unavailable_provider_status(provider),
@@ -506,6 +670,37 @@ impl TrayApp {
     }
 
     fn stop_live(&mut self) {
+        if self.has_external_control() {
+            match self
+                .selected_provider_mode()
+                .or(self.worker_mode)
+                .unwrap_or(WorkerMode::Live)
+            {
+                WorkerMode::Ptt => {
+                    if !self.external_running {
+                        self.set_status("PTT worker is not running");
+                        return;
+                    }
+                    if !self.ptt_recording {
+                        self.set_status("PTT is not recording");
+                        return;
+                    }
+                    self.ptt_recording = false;
+                    self.worker_mode = Some(WorkerMode::Ptt);
+                    self.send_control("stop", None);
+                }
+                WorkerMode::Live => {
+                    if !self.external_running {
+                        self.set_status("Live is not running");
+                        return;
+                    }
+                    self.external_running = false;
+                    self.worker_mode = Some(WorkerMode::Live);
+                    self.send_control("stop", None);
+                }
+            }
+            return;
+        }
         if self.worker_mode == Some(WorkerMode::Ptt) && self.ptt_recording {
             self.stop_ptt_recording();
             return;
@@ -599,7 +794,111 @@ impl TrayApp {
         }
     }
 
+    fn request_quit(&mut self) {
+        self.quit_requested = true;
+        if self.has_external_control() {
+            self.external_running = false;
+            self.send_control("quit", None);
+            self.set_status("Quitting dicta");
+            return;
+        }
+        if self.pending_shutdown.is_some() {
+            self.set_status("Quit is waiting for live worker shutdown");
+            return;
+        }
+        if self.live_child.is_some() {
+            self.begin_live_worker_shutdown(LIVE_WORKER_QUIT_TIMEOUT);
+        } else {
+            self.set_status("Quitting dicta");
+        }
+    }
+
+    fn begin_live_worker_shutdown(&mut self, timeout: Duration) {
+        let Some(mut child) = self.live_child.take() else {
+            self.set_status("Live is not running");
+            return;
+        };
+        let mode = self.worker_mode.take().unwrap_or(WorkerMode::Live);
+        self.ptt_recording = false;
+
+        self.set_status(format!("Stopping {}", mode.label()));
+        if let Err(error) = request_live_worker_shutdown(&mut child) {
+            eprintln!("dicta-tray: failed to request live worker shutdown: {error}");
+        }
+        self.pending_shutdown = Some(PendingShutdown {
+            child,
+            mode,
+            force_at: Instant::now() + timeout,
+            force_sent: false,
+        });
+    }
+
+    fn reap_pending_shutdown(&mut self) -> bool {
+        let Some(shutdown) = self.pending_shutdown.as_mut() else {
+            return false;
+        };
+
+        let mut exited = None;
+        let mut failed = None;
+        let mut forced = None;
+        match shutdown.child.try_wait() {
+            Ok(Some(status)) => {
+                exited = Some((shutdown.mode, status));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                failed = Some(error);
+            }
+        }
+
+        if exited.is_none()
+            && failed.is_none()
+            && Instant::now() >= shutdown.force_at
+            && !shutdown.force_sent
+        {
+            eprintln!("dicta-tray: live worker did not exit after graceful shutdown request");
+            if let Err(error) = force_live_worker_shutdown(&mut shutdown.child) {
+                eprintln!("dicta-tray: failed to force live worker shutdown: {error}");
+            }
+            shutdown.force_sent = true;
+            forced = Some(shutdown.mode);
+        }
+
+        if let Some((mode, status)) = exited {
+            self.pending_shutdown = None;
+            eprintln!("dicta-tray: live worker exited with {status}");
+            self.set_status(format!("{} stopped", mode.title()));
+            return true;
+        }
+        if let Some(error) = failed {
+            self.pending_shutdown = None;
+            self.set_status(format!("Live stop wait failed: {error}"));
+            return true;
+        }
+        if let Some(mode) = forced {
+            self.set_status(format!("Force stopping {}", mode.label()));
+            return true;
+        }
+
+        false
+    }
+
+    fn ready_to_exit(&self) -> bool {
+        self.quit_requested && self.live_child.is_none() && self.pending_shutdown.is_none()
+    }
+
+    fn has_live_process(&self) -> bool {
+        self.live_child.is_some() || self.pending_shutdown.is_some()
+    }
+
     fn restart_live(&mut self) {
+        if self.has_external_control() {
+            self.external_running = true;
+            self.ptt_recording = false;
+            self.worker_mode = self.selected_provider_mode();
+            self.send_control("restart", None);
+            return;
+        }
         self.set_status("Restarting live");
         if self.live_child.is_some() {
             self.shutdown_live_worker();
@@ -610,8 +909,14 @@ impl TrayApp {
     }
 
     fn reap_live(&mut self) -> bool {
+        let mut changed = if self.has_external_control() {
+            self.sync_external_state()
+        } else {
+            false
+        };
+        changed |= self.reap_pending_shutdown();
         let Some(child) = self.live_child.as_mut() else {
-            return false;
+            return changed;
         };
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -619,17 +924,18 @@ impl TrayApp {
                 self.worker_mode = None;
                 self.ptt_recording = false;
                 self.status = format!("Live exited with {status}");
-                true
+                changed = true;
             }
-            Ok(None) => false,
+            Ok(None) => {}
             Err(error) => {
                 self.live_child = None;
                 self.worker_mode = None;
                 self.ptt_recording = false;
                 self.status = format!("Live status failed: {error}");
-                true
+                changed = true;
             }
         }
+        changed
     }
 
     fn build_menu(&mut self) -> Result<Menu> {
@@ -698,7 +1004,7 @@ impl TrayApp {
     }
 
     fn tray_title(&self) -> String {
-        if self.live_child.is_some() {
+        if self.live_child.is_some() || self.external_running {
             "dicta *".to_owned()
         } else {
             "dicta".to_owned()
@@ -721,9 +1027,14 @@ impl TrayApp {
         PanelState {
             status: &self.status,
             current: self.selected_provider(),
-            live_running: self.live_child.is_some(),
-            worker_mode: self.worker_mode.map(WorkerMode::state_name),
-            ptt_recording: self.ptt_recording,
+            live_running: self.live_child.is_some() || self.external_running,
+            worker_mode: self
+                .worker_mode
+                .map(WorkerMode::state_name)
+                .or_else(|| self.selected_provider_mode().map(WorkerMode::state_name)),
+            ptt_recording: self.ptt_recording
+                && self.worker_mode.or_else(|| self.selected_provider_mode())
+                    == Some(WorkerMode::Ptt),
             selected_ptt: self.selected_provider_mode() == Some(WorkerMode::Ptt),
             hotkey: self
                 .config
@@ -739,6 +1050,12 @@ impl TrayApp {
         if !self.selected_provider_ready() {
             return false;
         }
+        if self.has_external_control() {
+            return match self.selected_provider_mode().unwrap_or(WorkerMode::Live) {
+                WorkerMode::Ptt => !self.ptt_recording,
+                WorkerMode::Live => !self.external_running,
+            };
+        }
         match (
             self.live_child.is_some(),
             self.worker_mode,
@@ -751,6 +1068,16 @@ impl TrayApp {
     }
 
     fn can_stop_selected_worker(&self) -> bool {
+        if self.has_external_control() {
+            return match self
+                .selected_provider_mode()
+                .or(self.worker_mode)
+                .unwrap_or(WorkerMode::Live)
+            {
+                WorkerMode::Ptt => self.external_running && self.ptt_recording,
+                WorkerMode::Live => self.external_running,
+            };
+        }
         match self.worker_mode {
             Some(WorkerMode::Ptt) => self.ptt_recording,
             Some(WorkerMode::Live) => self.live_child.is_some(),
@@ -766,7 +1093,7 @@ impl TrayApp {
     }
 
     fn stop_menu_label(&self) -> &'static str {
-        match self.worker_mode {
+        match self.worker_mode.or_else(|| self.selected_provider_mode()) {
             Some(WorkerMode::Ptt) => "Stop PTT",
             _ => "Stop Live",
         }
@@ -789,6 +1116,12 @@ impl TrayApp {
                     if !self.ptt_recording {
                         self.start_live();
                     }
+                } else if self.has_external_control() {
+                    if self.external_running {
+                        self.stop_live();
+                    } else {
+                        self.start_live();
+                    }
                 } else if self.live_child.is_some() {
                     self.shutdown_live_worker();
                 } else {
@@ -797,8 +1130,11 @@ impl TrayApp {
             }
             HotKeyState::Released => {
                 self.hotkey_down = false;
-                if self.worker_mode == Some(WorkerMode::Ptt) && self.ptt_recording {
-                    self.stop_ptt_recording();
+                if self.worker_mode.or_else(|| self.selected_provider_mode())
+                    == Some(WorkerMode::Ptt)
+                    && self.ptt_recording
+                {
+                    self.stop_live();
                 }
             }
         }
@@ -823,6 +1159,7 @@ fn main() -> Result<()> {
 
     let mut app = TrayApp::new(config);
     app.refresh();
+    app.reap_live();
     let _hotkey_registration = install_global_hotkey(&app.config, event_loop.create_proxy());
     if app.config.autostart {
         app.start_live();
@@ -870,8 +1207,7 @@ fn main() -> Result<()> {
                         MENU_RESTART => app.restart_live(),
                         MENU_REFRESH => app.refresh(),
                         MENU_QUIT => {
-                            app.shutdown_live_worker();
-                            *control_flow = ControlFlow::Exit;
+                            app.request_quit();
                         }
                         _ => {}
                     }
@@ -902,8 +1238,7 @@ fn main() -> Result<()> {
                 refresh_shell(&mut app, tray_icon.as_ref(), panel.as_ref());
             }
             Event::UserEvent(UserEvent::ShutdownSignal) => {
-                app.shutdown_live_worker();
-                *control_flow = ControlFlow::Exit;
+                app.request_quit();
             }
             Event::WindowEvent {
                 window_id, event, ..
@@ -919,10 +1254,11 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            Event::LoopDestroyed => {
-                app.shutdown_live_worker();
-            }
+            Event::LoopDestroyed => app.shutdown_live_worker(),
             _ => {}
+        }
+        if app.ready_to_exit() {
+            *control_flow = ControlFlow::Exit;
         }
         if !matches!(*control_flow, ControlFlow::ExitWithCode(_)) {
             update_control_flow(&app, control_flow);
@@ -995,17 +1331,18 @@ fn handle_panel_message(
                 hide_panel(panel);
             }
         }
-        ACTION_QUIT => {
-            app.shutdown_live_worker();
-            return true;
-        }
+        ACTION_QUIT => app.request_quit(),
         _ => {}
     }
     false
 }
 
 fn update_control_flow(app: &TrayApp, control_flow: &mut ControlFlow) {
-    if app.live_child.is_some() {
+    if app.pending_shutdown.is_some() {
+        *control_flow = ControlFlow::WaitUntil(Instant::now() + LIVE_WORKER_SHUTDOWN_POLL);
+    } else if app.has_external_control() {
+        *control_flow = ControlFlow::WaitUntil(Instant::now() + LIVE_WORKER_SHUTDOWN_POLL);
+    } else if app.has_live_process() {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_secs(2));
     } else {
         *control_flow = ControlFlow::Wait;
@@ -1036,7 +1373,14 @@ fn configure_live_worker_stdio(command: &mut Command, provider: &str) -> Result<
 
 #[cfg(unix)]
 fn configure_live_worker_process(command: &mut Command) {
-    command.process_group(0);
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 }
 
 #[cfg(not(unix))]
@@ -1692,6 +2036,89 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn quit_request_does_not_block_on_live_worker_shutdown() {
+        let mut command = std::process::Command::new("sleep");
+        command
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_live_worker_process(&mut command);
+
+        let mut app = TrayApp::new(AppConfig::default());
+        app.live_child = Some(command.spawn().unwrap());
+        app.worker_mode = Some(WorkerMode::Live);
+
+        let started = Instant::now();
+        app.request_quit();
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(app.quit_requested);
+        assert!(app.live_child.is_none());
+        assert!(app.pending_shutdown.is_some());
+
+        if let Some(shutdown) = app.pending_shutdown.as_mut() {
+            let _ = force_live_worker_shutdown(&mut shutdown.child);
+        }
+        let cleanup_deadline = Instant::now() + Duration::from_secs(5);
+        while app.pending_shutdown.is_some() && Instant::now() < cleanup_deadline {
+            app.reap_live();
+            std::thread::sleep(LIVE_WORKER_SHUTDOWN_POLL);
+        }
+        assert!(app.ready_to_exit());
+    }
+
+    #[test]
+    fn external_control_state_drives_ptt_buttons() {
+        let state_path = temp_test_path("dicta-tray-control-state");
+        let mut config = AppConfig {
+            control_addr: Some("127.0.0.1:9".to_owned()),
+            control_state: Some(state_path.clone()),
+            ..AppConfig::default()
+        };
+        config.activation = ActivationPreference::Auto;
+        let mut app = TrayApp::new(config);
+        app.provider_report = Some(ProviderListReport {
+            current: Some("ptt-asr".to_owned()),
+            providers: vec![provider("ptt-asr", true, true).with_ptt()],
+        });
+
+        std::fs::write(
+            &state_path,
+            r#"{"running":true,"recording":false,"mode":"PTT"}"#,
+        )
+        .unwrap();
+        assert!(app.reap_live());
+        assert!(app.panel_state().live_running);
+        assert!(!app.panel_state().ptt_recording);
+        assert!(app.can_start_selected_worker());
+        assert!(!app.can_stop_selected_worker());
+
+        std::fs::write(
+            &state_path,
+            r#"{"running":true,"recording":true,"mode":"PTT"}"#,
+        )
+        .unwrap();
+        assert!(app.reap_live());
+        assert!(app.panel_state().ptt_recording);
+        assert!(!app.can_start_selected_worker());
+        assert!(app.can_stop_selected_worker());
+
+        std::fs::write(
+            &state_path,
+            r#"{"running":false,"recording":false,"mode":"PTT"}"#,
+        )
+        .unwrap();
+        assert!(app.reap_live());
+        assert!(!app.panel_state().live_running);
+        assert!(app.can_start_selected_worker());
+        assert!(!app.can_stop_selected_worker());
+
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[cfg(unix)]
     fn shell_echo_command(stdout: &str, stderr: &str) -> std::process::Command {
         let mut command = std::process::Command::new("sh");
         command
@@ -1715,6 +2142,18 @@ mod tests {
             .replace("\r\n", "\n")
             .trim_end_matches('\n')
             .to_owned()
+    }
+
+    fn temp_test_path(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{:?}-{}",
+            std::process::id(),
+            std::thread::current().id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
     }
 
     fn provider_report(current: Option<&str>) -> ProviderListReport {
