@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, OpenOptions};
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -1848,7 +1848,8 @@ async fn run_realtime(cli: &Cli, activation: RealtimeActivation) -> Result<()> {
         activation,
     )?;
     let options = live_options_from_cli(&realtime_cli, &capabilities);
-    let mut renderer = LiveRenderer::new(
+    let mut renderer = LiveRenderer::new_for_realtime(
+        activation,
         realtime_cli.json,
         realtime_cli.transcript.clone(),
         options.mic && options.speaker,
@@ -1987,6 +1988,27 @@ struct LiveRenderer {
 }
 
 impl LiveRenderer {
+    fn new_for_realtime(
+        activation: RealtimeActivation,
+        json_forced: bool,
+        transcript: Option<PathBuf>,
+        show_channel_label: bool,
+        src: Option<String>,
+        dst: Option<String>,
+    ) -> Result<Self> {
+        let json_mode = json_forced || !std::io::stdout().is_terminal();
+        let append_only = live_append_only_from_env() || activation.requires_ptt();
+        Self::new_with_rendering_and_log(
+            json_mode,
+            append_only,
+            transcript,
+            true,
+            show_channel_label,
+            src,
+            dst,
+        )
+    }
+
     fn new(
         json_forced: bool,
         transcript: Option<PathBuf>,
@@ -2014,7 +2036,27 @@ impl LiveRenderer {
         src: Option<String>,
         dst: Option<String>,
     ) -> Result<Self> {
-        let session_log = LiveSessionLog::open(transcript, json_mode)?;
+        Self::new_with_rendering_and_log(
+            json_mode,
+            append_only,
+            transcript,
+            true,
+            show_channel_label,
+            src,
+            dst,
+        )
+    }
+
+    fn new_with_rendering_and_log(
+        json_mode: bool,
+        append_only: bool,
+        transcript: Option<PathBuf>,
+        implicit_session_log: bool,
+        show_channel_label: bool,
+        src: Option<String>,
+        dst: Option<String>,
+    ) -> Result<Self> {
+        let session_log = LiveSessionLog::open(transcript, json_mode, implicit_session_log)?;
         Ok(Self {
             json_mode,
             banner_printed: false,
@@ -2371,7 +2413,11 @@ struct LiveSessionLog {
 }
 
 impl LiveSessionLog {
-    fn open(explicit_path: Option<PathBuf>, json_mode: bool) -> Result<Option<Self>> {
+    fn open(
+        explicit_path: Option<PathBuf>,
+        json_mode: bool,
+        implicit_log: bool,
+    ) -> Result<Option<Self>> {
         if let Some(path) = explicit_path {
             validate_transcript_path(&path)?;
             if path.is_dir() {
@@ -2397,7 +2443,7 @@ impl LiveSessionLog {
             }));
         }
 
-        if json_mode || !can_prompt_for_log() {
+        if !implicit_log || json_mode || !can_prompt_for_log() {
             return Ok(None);
         }
 
@@ -2503,8 +2549,9 @@ fn live_append_only_from_env() -> bool {
 fn confirm_overwrite(path: &PathBuf) -> Result<bool> {
     print!("{} already exists. Overwrite? [y/N]: ", path.display());
     io::stdout().flush()?;
-    let mut line = String::new();
-    io::stdin().read_line(&mut line)?;
+    let Some(line) = read_prompt_line()? else {
+        return Ok(false);
+    };
     let trimmed = line.trim().to_ascii_lowercase();
     Ok(trimmed == "y" || trimmed == "yes")
 }
@@ -2516,19 +2563,135 @@ fn prompt_for_log_path(default_path: &PathBuf) -> Result<Option<PathBuf>> {
         default_path.display()
     );
     io::stdout().flush()?;
-    let mut line = String::new();
-    io::stdin().read_line(&mut line)?;
+    let Some(line) = read_prompt_line()? else {
+        return Ok(None);
+    };
+    Ok(log_path_from_prompt_input(default_path, &line))
+}
+
+fn log_path_from_prompt_input(default_path: &PathBuf, line: &str) -> Option<PathBuf> {
     let trimmed = line.trim();
     if trimmed.is_empty()
         || trimmed.eq_ignore_ascii_case("y")
         || trimmed.eq_ignore_ascii_case("yes")
     {
-        return Ok(Some(default_path.clone()));
+        return Some(default_path.clone());
     }
     if trimmed.eq_ignore_ascii_case("n") || trimmed.eq_ignore_ascii_case("no") {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
+}
+
+fn read_prompt_line() -> Result<Option<String>> {
+    #[cfg(unix)]
+    {
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            return read_prompt_line_raw();
+        }
+    }
+
+    let mut line = String::new();
+    let bytes = io::stdin().read_line(&mut line)?;
+    if bytes == 0 {
         return Ok(None);
     }
-    Ok(Some(PathBuf::from(trimmed)))
+    Ok(Some(line))
+}
+
+#[cfg(unix)]
+fn read_prompt_line_raw() -> Result<Option<String>> {
+    let fd = libc::STDIN_FILENO;
+    let original = terminal_mode(fd).context("failed to read terminal mode")?;
+    let mut raw = original;
+    raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
+    raw.c_cc[libc::VMIN] = 1;
+    raw.c_cc[libc::VTIME] = 0;
+    set_terminal_mode(fd, &raw).context("failed to set terminal raw mode")?;
+    let _guard = TerminalModeGuard {
+        fd,
+        original,
+        active: true,
+    };
+
+    let mut stdin = io::stdin().lock();
+    let mut stdout = io::stdout();
+    let mut bytes = Vec::new();
+    loop {
+        let mut byte = [0_u8; 1];
+        match stdin.read(&mut byte) {
+            Ok(0) => return Ok(None),
+            Ok(_) => match byte[0] {
+                3 => {
+                    stdout.write_all(b"^C\n")?;
+                    stdout.flush()?;
+                    return Ok(None);
+                }
+                b'\r' | b'\n' => {
+                    stdout.write_all(b"\n")?;
+                    stdout.flush()?;
+                    break;
+                }
+                4 => {
+                    stdout.write_all(b"\n")?;
+                    stdout.flush()?;
+                    return Ok(None);
+                }
+                8 | 127 => {
+                    if bytes.pop().is_some() {
+                        stdout.write_all(b"\x08 \x08")?;
+                        stdout.flush()?;
+                    }
+                }
+                byte if byte >= 0x20 => {
+                    bytes.push(byte);
+                    stdout.write_all(&[byte])?;
+                    stdout.flush()?;
+                }
+                _ => {}
+            },
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+#[cfg(unix)]
+struct TerminalModeGuard {
+    fd: libc::c_int,
+    original: libc::termios,
+    active: bool,
+}
+
+#[cfg(unix)]
+impl Drop for TerminalModeGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = set_terminal_mode(self.fd, &self.original);
+            self.active = false;
+        }
+    }
+}
+
+#[cfg(unix)]
+fn terminal_mode(fd: libc::c_int) -> io::Result<libc::termios> {
+    let mut mode = std::mem::MaybeUninit::<libc::termios>::uninit();
+    let status = unsafe { libc::tcgetattr(fd, mode.as_mut_ptr()) };
+    if status == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { mode.assume_init() })
+}
+
+#[cfg(unix)]
+fn set_terminal_mode(fd: libc::c_int, mode: &libc::termios) -> io::Result<()> {
+    let status = unsafe { libc::tcsetattr(fd, libc::TCSANOW, mode) };
+    if status == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn terminal_width() -> usize {
@@ -7328,6 +7491,69 @@ live_enabled = false
 
         assert!(renderer.live_region_lines().is_empty());
         assert_eq!(renderer.live_region_lines, 0);
+    }
+
+    #[test]
+    fn ptt_renderer_is_append_only() {
+        let renderer = LiveRenderer::new_for_realtime(
+            RealtimeActivation::Toggle,
+            false,
+            None,
+            false,
+            Some("en-US".to_owned()),
+            None,
+        )
+        .unwrap();
+
+        assert!(renderer.append_only);
+    }
+
+    #[test]
+    fn ptt_renderer_keeps_explicit_transcript_log() {
+        let path = std::env::temp_dir().join(format!(
+            "dicta-ptt-renderer-explicit-{}.jsonl",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut renderer = LiveRenderer::new_for_realtime(
+            RealtimeActivation::Toggle,
+            false,
+            Some(path.clone()),
+            false,
+            Some("en-US".to_owned()),
+            None,
+        )
+        .unwrap();
+        renderer
+            .emit_event(&test_event(AudioChannel::Mic, "hello", None))
+            .unwrap();
+        renderer.finalize_session_log().unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(written.contains(r#""text":"hello""#));
+    }
+
+    #[test]
+    fn log_path_prompt_accepts_default_and_rejects_no() {
+        let default_path = PathBuf::from("./dicta-test.jsonl");
+
+        assert_eq!(
+            log_path_from_prompt_input(&default_path, ""),
+            Some(default_path.clone())
+        );
+        assert_eq!(
+            log_path_from_prompt_input(&default_path, "yes"),
+            Some(default_path.clone())
+        );
+        assert_eq!(log_path_from_prompt_input(&default_path, "n"), None);
+        assert_eq!(log_path_from_prompt_input(&default_path, "no"), None);
+        assert_eq!(
+            log_path_from_prompt_input(&default_path, "./custom.jsonl"),
+            Some(PathBuf::from("./custom.jsonl"))
+        );
     }
 
     #[test]
