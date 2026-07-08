@@ -50,6 +50,7 @@ const DEFAULT_PROVIDER_KEYWORD: &str = "dicta-provider";
 const PROVIDER_INSTALL_METADATA_FILE: &str = ".dicta-provider-install.json";
 const PROVIDER_STDERR_TAIL_LINES: usize = 20;
 const ENV_LIVE_APPEND_ONLY: &str = "DICTA_LIVE_APPEND_ONLY";
+const UI_LAUNCH_GRACE: Duration = Duration::from_millis(700);
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "dicta")]
@@ -1404,54 +1405,77 @@ async fn run_ui(cli: &Cli) -> Result<()> {
     command.env("DICTA_UI_PTT_ARGS", ptt_args_for_ui(cli).join("\n"));
     command.env(
         "DICTA_UI_AUTOSTART",
-        if cli.live || cli.ptt { "1" } else { "0" },
+        if ui_autostart(cli) { "1" } else { "0" },
     );
-    command.env(
-        "DICTA_UI_ACTIVATION",
-        if cli.ptt {
-            "ptt"
-        } else if cli.live {
-            "live"
-        } else {
-            "auto"
-        },
-    );
+    command.env("DICTA_UI_ACTIVATION", ui_activation(cli));
+    command.env("DICTA_UI_OPEN_PANEL", "1");
     if let Some(hotkey) = non_empty(&cli.hotkey) {
         command.env("DICTA_UI_HOTKEY", hotkey);
     }
     command.env(ENV_LIVE_APPEND_ONLY, "1");
+    detach_tray_launcher(&mut command);
+    let log_path = tray_launcher_log_path();
+    configure_tray_launcher_stdio(&mut command, &log_path)?;
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to launch tray UI with {description}"))?;
-    let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
-
+    let launch_grace = time::sleep(UI_LAUNCH_GRACE);
+    tokio::pin!(launch_grace);
     tokio::select! {
         status = child.wait() => {
             let status = status.with_context(|| format!("failed to wait for tray UI with {description}"))?;
-            if status.success() {
-                Ok(())
-            } else {
-                bail!("tray UI exited with status {status}")
-            }
+            bail!("tray UI exited during startup with {status}; log: {}", log_path.display())
         }
-        signal = &mut ctrl_c => {
-            signal.context("failed to listen for Ctrl-C while tray UI was running")?;
-            request_external_provider_shutdown(&mut child).await;
-            let shutdown_timer = time::sleep(Duration::from_secs(30));
-            tokio::pin!(shutdown_timer);
-            tokio::select! {
-                status = child.wait() => {
-                    let _ = status;
-                }
-                _ = &mut shutdown_timer => {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                }
-            }
+        _ = &mut launch_grace => {
+            println!(
+                "dicta UI launched ({activation}; log: {log})",
+                activation = ui_activation(cli),
+                log = log_path.display()
+            );
             Ok(())
         }
     }
 }
+
+fn ui_autostart(cli: &Cli) -> bool {
+    cli.live || cli.ptt
+}
+
+fn ui_activation(cli: &Cli) -> &'static str {
+    if cli.ptt {
+        "ptt"
+    } else if cli.live {
+        "live"
+    } else {
+        "auto"
+    }
+}
+
+fn tray_launcher_log_path() -> PathBuf {
+    std::env::temp_dir().join(format!("dicta-ui-{}.log", std::process::id()))
+}
+
+fn configure_tray_launcher_stdio(command: &mut tokio::process::Command, path: &Path) -> Result<()> {
+    let stdout = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open tray UI log {}", path.display()))?;
+    let stderr = stdout
+        .try_clone()
+        .with_context(|| format!("failed to open tray UI log {}", path.display()))?;
+    command.stdout(Stdio::from(stdout));
+    command.stderr(Stdio::from(stderr));
+    Ok(())
+}
+
+#[cfg(unix)]
+fn detach_tray_launcher(command: &mut tokio::process::Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn detach_tray_launcher(_command: &mut tokio::process::Command) {}
 
 #[derive(Debug, Clone)]
 enum TrayLauncher {
@@ -6572,6 +6596,24 @@ expected_latency_ms = 5000
 
         assert!(cli.ui);
         assert_eq!(cli.hotkey.as_deref(), Some("ctrl+alt+space"));
+    }
+
+    #[test]
+    fn ui_ptt_sets_ptt_activation_and_autostart() {
+        let cli = Cli::try_parse_from(["dicta", "--ptt", "--ui"]).unwrap();
+
+        assert!(cli.ui);
+        assert_eq!(ui_activation(&cli), "ptt");
+        assert!(ui_autostart(&cli));
+        assert!(ptt_args_for_ui(&cli).contains(&"--ptt".to_owned()));
+    }
+
+    #[test]
+    fn plain_ui_uses_auto_activation_without_autostart() {
+        let cli = Cli::try_parse_from(["dicta", "--ui"]).unwrap();
+
+        assert_eq!(ui_activation(&cli), "auto");
+        assert!(!ui_autostart(&cli));
     }
 
     #[test]

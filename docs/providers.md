@@ -190,14 +190,17 @@ stream. Installed IME-style providers should set `live.ptt = true` when they can
 start and stop a single utterance without keeping the microphone open between
 utterances.
 
-`dicta --ui` launches the Rust `dicta-tray` companion binary. The status item opens a
-compact provider panel on left click and keeps a right-click native menu as a
-fallback. The companion reads the same provider list and starts transcription as
-a supervised `dicta --provider active ...` worker. In automatic activation mode,
+`dicta --ui` launches the Rust `dicta-tray` companion binary, opens the provider
+panel, and returns control to the shell. The status item opens the compact
+provider panel on left click and keeps a right-click native menu as a fallback.
+The companion reads the same provider list and starts transcription as a
+supervised `dicta --provider active ...` worker. In automatic activation mode,
 PTT-capable providers use `--ptt`; other live providers use `--live`. Pass
 `dicta --ui --live` to force continuous live mode or `dicta --ui --ptt` to force
-PTT. `dicta --ui --hotkey <shortcut>` registers a global UI hotkey without
-changing the provider protocol. PTT providers treat the hotkey as hold-to-talk;
+PTT. Quit the tray from the status item menu; Ctrl-C remains for foreground
+`dicta --ptt`/`dicta --live` sessions, not detached tray sessions.
+`dicta --ui --hotkey <shortcut>` registers a global UI hotkey without changing
+the provider protocol. PTT providers treat the hotkey as hold-to-talk;
 continuous live providers treat it as a start/stop toggle. The shortcut is
 disabled by default to avoid stealing system or input-method key combinations.
 When a provider is selected from the panel, the companion updates the active
