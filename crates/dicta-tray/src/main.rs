@@ -1660,10 +1660,9 @@ mod tests {
     fn live_worker_shutdown_uses_sigint_process_group() {
         use std::os::unix::process::ExitStatusExt;
 
-        let mut command = std::process::Command::new("sh");
+        let mut command = std::process::Command::new("sleep");
         command
-            .arg("-c")
-            .arg("trap 'exit 42' INT; while true; do sleep 10; done")
+            .arg("60")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -1678,10 +1677,7 @@ mod tests {
                 child.wait().unwrap()
             });
 
-        assert!(
-            status.code() == Some(42) || status.signal() == Some(libc::SIGINT),
-            "expected graceful INT handling or SIGINT termination, got {status}"
-        );
+        assert_eq!(status.signal(), Some(libc::SIGINT), "got {status}");
     }
 
     #[cfg(unix)]
