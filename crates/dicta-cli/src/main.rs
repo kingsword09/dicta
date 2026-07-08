@@ -32,12 +32,17 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{cmp, env};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
+use tokio::process::ChildStdin;
+use tokio::sync::mpsc;
 use tokio::time::{self, Instant as TokioInstant};
 use tower_http::cors::{Any, CorsLayer};
 
@@ -767,8 +772,41 @@ impl EffectiveProvider {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.ui && (cli.ptt || cli.live) {
+        validate_realtime_start(
+            &cli,
+            if cli.ptt {
+                RealtimeActivation::Toggle
+            } else {
+                RealtimeActivation::Continuous
+            },
+        )?;
+        let (control_addr, control_rx) = start_ui_control_server().await?;
+        let control_state = ui_control_state_path();
+        run_ui(
+            &cli,
+            Some(UiControlLaunch {
+                control_addr,
+                control_state: control_state.clone(),
+            }),
+        )
+        .await?;
+        if cli.ptt {
+            run_realtime_supervisor(&cli, RealtimeActivation::Toggle, control_rx, control_state)
+                .await?;
+        } else {
+            run_realtime_supervisor(
+                &cli,
+                RealtimeActivation::Continuous,
+                control_rx,
+                control_state,
+            )
+            .await?;
+        }
+        return Ok(());
+    }
     if cli.ui {
-        run_ui(&cli).await?;
+        run_ui(&cli, None).await?;
         return Ok(());
     }
 
@@ -1376,7 +1414,13 @@ fn safe_upload_extension(filename: &str) -> Option<String> {
         .filter(|extension| !extension.is_empty())
 }
 
-async fn run_ui(cli: &Cli) -> Result<()> {
+#[derive(Debug, Clone)]
+struct UiControlLaunch {
+    control_addr: SocketAddr,
+    control_state: PathBuf,
+}
+
+async fn run_ui(cli: &Cli, control: Option<UiControlLaunch>) -> Result<()> {
     if let Some(provider) = non_empty(&cli.provider).filter(|provider| provider != "active") {
         let profiles = available_provider_profiles(cli)?;
         if !profiles.contains_key(&provider) {
@@ -1405,10 +1449,18 @@ async fn run_ui(cli: &Cli) -> Result<()> {
     command.env("DICTA_UI_PTT_ARGS", ptt_args_for_ui(cli).join("\n"));
     command.env(
         "DICTA_UI_AUTOSTART",
-        if ui_autostart(cli) { "1" } else { "0" },
+        if ui_autostart(cli, control.is_none()) {
+            "1"
+        } else {
+            "0"
+        },
     );
     command.env("DICTA_UI_ACTIVATION", ui_activation(cli));
     command.env("DICTA_UI_OPEN_PANEL", "1");
+    if let Some(control) = &control {
+        command.env("DICTA_UI_CONTROL_ADDR", control.control_addr.to_string());
+        command.env("DICTA_UI_CONTROL_STATE", &control.control_state);
+    }
     if let Some(hotkey) = non_empty(&cli.hotkey) {
         command.env("DICTA_UI_HOTKEY", hotkey);
     }
@@ -1437,8 +1489,8 @@ async fn run_ui(cli: &Cli) -> Result<()> {
     }
 }
 
-fn ui_autostart(cli: &Cli) -> bool {
-    cli.live || cli.ptt
+fn ui_autostart(cli: &Cli, tray_owns_worker: bool) -> bool {
+    tray_owns_worker && (cli.live || cli.ptt)
 }
 
 fn ui_activation(cli: &Cli) -> &'static str {
@@ -1464,6 +1516,7 @@ fn configure_tray_launcher_stdio(command: &mut tokio::process::Command, path: &P
     let stderr = stdout
         .try_clone()
         .with_context(|| format!("failed to open tray UI log {}", path.display()))?;
+    command.stdin(Stdio::null());
     command.stdout(Stdio::from(stdout));
     command.stderr(Stdio::from(stderr));
     Ok(())
@@ -1471,11 +1524,311 @@ fn configure_tray_launcher_stdio(command: &mut tokio::process::Command, path: &P
 
 #[cfg(unix)]
 fn detach_tray_launcher(command: &mut tokio::process::Command) {
-    command.process_group(0);
+    unsafe {
+        command.as_std_mut().pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 }
 
 #[cfg(not(unix))]
 fn detach_tray_launcher(_command: &mut tokio::process::Command) {}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum UiControlCommand {
+    SetProvider { provider: String },
+    Start,
+    Stop,
+    Restart,
+    Quit,
+}
+
+#[derive(Debug, Serialize)]
+struct UiControlState {
+    running: bool,
+    recording: bool,
+    mode: &'static str,
+}
+
+fn ui_control_state_path() -> PathBuf {
+    std::env::temp_dir().join(format!("dicta-ui-control-{}.json", std::process::id()))
+}
+
+fn write_ui_control_state(
+    path: &Path,
+    activation: RealtimeActivation,
+    running: bool,
+    recording: bool,
+) {
+    let state = UiControlState {
+        running,
+        recording,
+        mode: activation.label(),
+    };
+    if let Ok(json) = serde_json::to_string(&state) {
+        let _ = fs::write(path, json);
+    }
+}
+
+async fn start_ui_control_server() -> Result<(SocketAddr, mpsc::UnboundedReceiver<UiControlCommand>)>
+{
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .context("failed to bind UI control listener")?;
+    let addr = listener
+        .local_addr()
+        .context("failed to read UI control listener address")?;
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stream).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    match serde_json::from_str::<UiControlCommand>(line) {
+                        Ok(command) => {
+                            let _ = tx.send(command);
+                        }
+                        Err(error) => {
+                            eprintln!("dicta UI control: ignored invalid command: {error}");
+                        }
+                    }
+                }
+            });
+        }
+    });
+    Ok((addr, rx))
+}
+
+async fn run_realtime_supervisor(
+    cli: &Cli,
+    activation: RealtimeActivation,
+    mut control_rx: mpsc::UnboundedReceiver<UiControlCommand>,
+    control_state: PathBuf,
+) -> Result<()> {
+    let args = realtime_worker_args_for_ui(cli, activation);
+    let mut worker = Some(spawn_realtime_worker(&args, activation)?);
+    let mut recording = false;
+    write_ui_control_state(&control_state, activation, true, recording);
+    let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
+    let mut worker_poll = time::interval(Duration::from_millis(200));
+    let mut input_lines = if activation.requires_ptt() {
+        Some(BufReader::new(tokio::io::stdin()).lines())
+    } else {
+        None
+    };
+
+    loop {
+        tokio::select! {
+            signal = &mut ctrl_c => {
+                signal.context("failed to listen for Ctrl-C while realtime worker was running")?;
+                if let Some(mut running) = worker.take() {
+                    shutdown_realtime_worker(&mut running).await;
+                }
+                write_ui_control_state(&control_state, activation, false, false);
+                return Ok(());
+            }
+            input = read_supervisor_stdin(input_lines.as_mut()), if input_lines.is_some() && worker.is_some() => {
+                let Some(()) = input? else {
+                    if let Some(mut running) = worker.take() {
+                        shutdown_realtime_worker(&mut running).await;
+                    }
+                    write_ui_control_state(&control_state, activation, false, false);
+                    return Ok(());
+                };
+                if let Some(running) = worker.as_mut() {
+                    running.toggle_ptt().await?;
+                    recording = !recording;
+                    write_ui_control_state(&control_state, activation, true, recording);
+                }
+            }
+            command = control_rx.recv() => {
+                let Some(command) = command else {
+                    if let Some(mut running) = worker.take() {
+                        let status = running.child.wait().await.context("failed to wait for realtime worker")?;
+                        if status.success() {
+                            write_ui_control_state(&control_state, activation, false, false);
+                            return Ok(());
+                        }
+                        bail!("realtime worker exited with {status}");
+                    }
+                    return Ok(());
+                };
+                match command {
+                    UiControlCommand::SetProvider { provider } => {
+                        eprintln!("dicta UI: switching provider to {provider}");
+                        if let Some(mut running) = worker.take() {
+                            shutdown_realtime_worker(&mut running).await;
+                        }
+                        recording = false;
+                        worker = Some(spawn_realtime_worker(&args, activation)?);
+                        write_ui_control_state(&control_state, activation, true, recording);
+                    }
+                    UiControlCommand::Start if activation.requires_ptt() => {
+                        if let Some(running) = worker.as_mut() {
+                            if recording {
+                                write_ui_control_state(&control_state, activation, true, recording);
+                                continue;
+                            }
+                            running.toggle_ptt().await?;
+                            recording = true;
+                        } else {
+                            worker = Some(spawn_realtime_worker(&args, activation)?);
+                            if let Some(running) = worker.as_mut() {
+                                running.toggle_ptt().await?;
+                                recording = true;
+                            }
+                        }
+                        write_ui_control_state(&control_state, activation, true, recording);
+                    }
+                    UiControlCommand::Stop if activation.requires_ptt() => {
+                        if let Some(running) = worker.as_mut()
+                            && recording
+                        {
+                            running.toggle_ptt().await?;
+                            recording = false;
+                        }
+                        write_ui_control_state(&control_state, activation, worker.is_some(), recording);
+                    }
+                    UiControlCommand::Restart | UiControlCommand::Start => {
+                        if let Some(mut running) = worker.take() {
+                            shutdown_realtime_worker(&mut running).await;
+                        }
+                        worker = Some(spawn_realtime_worker(&args, activation)?);
+                        recording = false;
+                        write_ui_control_state(&control_state, activation, true, recording);
+                    }
+                    UiControlCommand::Stop => {
+                        if let Some(mut running) = worker.take() {
+                            shutdown_realtime_worker(&mut running).await;
+                        }
+                        recording = false;
+                        write_ui_control_state(&control_state, activation, false, false);
+                    }
+                    UiControlCommand::Quit => {
+                        if let Some(mut running) = worker.take() {
+                            shutdown_realtime_worker(&mut running).await;
+                        }
+                        write_ui_control_state(&control_state, activation, false, false);
+                        return Ok(());
+                    }
+                }
+            }
+            _ = worker_poll.tick(), if worker.is_some() => {
+                if let Some(running) = worker.as_mut() {
+                    match running.child.try_wait().context("failed to query realtime worker status")? {
+                        Some(status) => {
+                            if status.success() {
+                                write_ui_control_state(&control_state, activation, false, false);
+                                return Ok(());
+                            }
+                            bail!("realtime worker exited with {status}");
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn read_supervisor_stdin(
+    lines: Option<&mut tokio::io::Lines<BufReader<tokio::io::Stdin>>>,
+) -> Result<Option<()>> {
+    let Some(lines) = lines else {
+        return Ok(None);
+    };
+    Ok(lines
+        .next_line()
+        .await
+        .context("failed to read realtime supervisor stdin")?
+        .map(|_| ()))
+}
+
+fn realtime_worker_args_for_ui(cli: &Cli, activation: RealtimeActivation) -> Vec<String> {
+    match activation {
+        RealtimeActivation::Continuous => live_args_for_ui(cli),
+        RealtimeActivation::Toggle => ptt_args_for_ui(cli),
+    }
+}
+
+struct RealtimeWorker {
+    child: tokio::process::Child,
+    ptt_stdin: Option<ChildStdin>,
+}
+
+impl RealtimeWorker {
+    async fn toggle_ptt(&mut self) -> Result<()> {
+        let Some(stdin) = self.ptt_stdin.as_mut() else {
+            return Ok(());
+        };
+        stdin
+            .write_all(b"\n")
+            .await
+            .context("failed to write PTT control to realtime worker")?;
+        stdin
+            .flush()
+            .await
+            .context("failed to flush PTT control to realtime worker")
+    }
+}
+
+fn spawn_realtime_worker(
+    args: &[String],
+    activation: RealtimeActivation,
+) -> Result<RealtimeWorker> {
+    let dicta_bin =
+        std::env::current_exe().context("failed to resolve current dicta executable")?;
+    let mut command = tokio::process::Command::new(dicta_bin);
+    command
+        .args(args)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    if activation.requires_ptt() {
+        command.stdin(Stdio::piped());
+    } else {
+        command.stdin(Stdio::inherit());
+    }
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to spawn realtime worker: {}", args.join(" ")))?;
+    let ptt_stdin = if activation.requires_ptt() {
+        Some(
+            child
+                .stdin
+                .take()
+                .context("PTT realtime worker stdin was not piped")?,
+        )
+    } else {
+        None
+    };
+    Ok(RealtimeWorker { child, ptt_stdin })
+}
+
+async fn shutdown_realtime_worker(worker: &mut RealtimeWorker) {
+    worker.ptt_stdin.take();
+    request_external_provider_shutdown(&mut worker.child).await;
+    let shutdown_timer = time::sleep(Duration::from_secs(30));
+    tokio::pin!(shutdown_timer);
+    tokio::select! {
+        _ = worker.child.wait() => {}
+        _ = &mut shutdown_timer => {
+            let _ = worker.child.start_kill();
+            let _ = worker.child.wait().await;
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 enum TrayLauncher {
@@ -1854,23 +2207,7 @@ fn resolve_ptt_backend(cli: &Cli) -> Result<AsrBackend> {
 }
 
 async fn run_realtime(cli: &Cli, activation: RealtimeActivation) -> Result<()> {
-    let realtime_cli = cli_for_realtime(cli, activation);
-    validate_realtime_cli_options(&realtime_cli, activation)?;
-
-    let provider = build_realtime_provider(&realtime_cli, activation)?;
-    let capabilities = provider.live_capabilities();
-    if activation.requires_ptt() && !capabilities.ptt {
-        bail!(
-            "provider '{}' does not support PTT; update the provider or choose one with live.ptt = true",
-            provider.config_name()
-        );
-    }
-    validate_realtime_options(
-        &realtime_cli,
-        provider.live_name(),
-        &capabilities,
-        activation,
-    )?;
+    let (realtime_cli, provider, capabilities) = prepare_realtime(cli, activation)?;
     let options = live_options_from_cli(&realtime_cli, &capabilities);
     let mut renderer = LiveRenderer::new_for_realtime(
         activation,
@@ -1903,6 +2240,35 @@ async fn run_realtime(cli: &Cli, activation: RealtimeActivation) -> Result<()> {
     renderer.finalize_session_log()?;
     renderer.print_summary();
     Ok(())
+}
+
+fn validate_realtime_start(cli: &Cli, activation: RealtimeActivation) -> Result<()> {
+    let _ = prepare_realtime(cli, activation)?;
+    Ok(())
+}
+
+fn prepare_realtime(
+    cli: &Cli,
+    activation: RealtimeActivation,
+) -> Result<(Cli, RealtimeProvider, LiveCapabilities)> {
+    let realtime_cli = cli_for_realtime(cli, activation);
+    validate_realtime_cli_options(&realtime_cli, activation)?;
+
+    let provider = build_realtime_provider(&realtime_cli, activation)?;
+    let capabilities = provider.live_capabilities();
+    if activation.requires_ptt() && !capabilities.ptt {
+        bail!(
+            "provider '{}' does not support PTT; update the provider or choose one with live.ptt = true",
+            provider.config_name()
+        );
+    }
+    validate_realtime_options(
+        &realtime_cli,
+        provider.live_name(),
+        &capabilities,
+        activation,
+    )?;
+    Ok((realtime_cli, provider, capabilities))
 }
 
 fn cli_for_realtime(cli: &Cli, activation: RealtimeActivation) -> Cli {
@@ -2033,6 +2399,7 @@ impl LiveRenderer {
         )
     }
 
+    #[cfg(test)]
     fn new(
         json_forced: bool,
         transcript: Option<PathBuf>,
@@ -2052,6 +2419,7 @@ impl LiveRenderer {
         )
     }
 
+    #[cfg(test)]
     fn new_with_rendering(
         json_mode: bool,
         append_only: bool,
@@ -6599,13 +6967,25 @@ expected_latency_ms = 5000
     }
 
     #[test]
-    fn ui_ptt_sets_ptt_activation_and_autostart() {
+    fn ui_ptt_sets_ptt_activation_and_tray_autostart() {
         let cli = Cli::try_parse_from(["dicta", "--ptt", "--ui"]).unwrap();
 
         assert!(cli.ui);
         assert_eq!(ui_activation(&cli), "ptt");
-        assert!(ui_autostart(&cli));
+        assert!(ui_autostart(&cli, true));
+        assert!(!ui_autostart(&cli, false));
         assert!(ptt_args_for_ui(&cli).contains(&"--ptt".to_owned()));
+    }
+
+    #[test]
+    fn ui_live_sets_live_activation_and_tray_autostart() {
+        let cli = Cli::try_parse_from(["dicta", "--live", "--ui"]).unwrap();
+
+        assert!(cli.ui);
+        assert_eq!(ui_activation(&cli), "live");
+        assert!(ui_autostart(&cli, true));
+        assert!(!ui_autostart(&cli, false));
+        assert!(live_args_for_ui(&cli).contains(&"--live".to_owned()));
     }
 
     #[test]
@@ -6613,7 +6993,8 @@ expected_latency_ms = 5000
         let cli = Cli::try_parse_from(["dicta", "--ui"]).unwrap();
 
         assert_eq!(ui_activation(&cli), "auto");
-        assert!(!ui_autostart(&cli));
+        assert!(!ui_autostart(&cli, true));
+        assert!(!ui_autostart(&cli, false));
     }
 
     #[test]
