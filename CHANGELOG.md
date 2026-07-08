@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.10.18](https://github.com/kingsword09/dicta/compare/v0.10.17...v0.10.18) - 2026-07-08
+
+### Other Changes
+- feat(ui): unify tray control for live and ptt sessions by @kingsword09 in https://github.com/kingsword09/dicta/pull/56
+
 ## [v0.10.17](https://github.com/kingsword09/dicta/compare/v0.10.16...v0.10.17) - 2026-07-08
 
 ### Other Changes
