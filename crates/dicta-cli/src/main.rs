@@ -2150,7 +2150,7 @@ impl RealtimeActivation {
     }
 
     fn defaults_to_active_provider(self) -> bool {
-        matches!(self, Self::Toggle)
+        matches!(self, Self::Continuous | Self::Toggle)
     }
 
     fn stdin_audio_mode(self) -> &'static str {
@@ -5581,15 +5581,17 @@ fn active_or_default_provider_name(
     if let Some(active) = read_active_provider_name(cli)? {
         return Ok(Some(active));
     }
-    Ok(default_live_provider_name(apple_support).map(ToOwned::to_owned))
+    default_live_provider_name(cli, apple_support)
 }
 
-fn default_live_provider_name(apple_support: &AppleSupport) -> Option<&'static str> {
+fn default_live_provider_name(cli: &Cli, apple_support: &AppleSupport) -> Result<Option<String>> {
     if apple_support.supported {
-        Some("apple")
-    } else {
-        None
+        return Ok(Some("apple".to_owned()));
     }
+
+    Ok(installed_providers(cli)?
+        .into_iter()
+        .find_map(|(name, provider)| provider.manifest.live.is_some().then_some(name)))
 }
 
 fn available_provider_profiles(cli: &Cli) -> Result<BTreeMap<String, ProviderProfile>> {
@@ -7461,6 +7463,14 @@ expected_latency_ms = 5000
     }
 
     #[test]
+    fn live_defaults_to_active_provider() {
+        let cli = test_cli();
+        let cli = cli_for_realtime(&cli, RealtimeActivation::Continuous);
+
+        assert_eq!(cli.provider.as_deref(), Some("active"));
+    }
+
+    #[test]
     fn explicit_ptt_provider_is_preserved() {
         let cli = Cli {
             provider: Some("qianwenime-asr".to_owned()),
@@ -7850,6 +7860,91 @@ live_enabled = false
                 .as_deref()
                 .is_some_and(|error| error.contains("no active provider is set"))
         );
+    }
+
+    #[test]
+    fn active_provider_defaults_to_only_installed_live_provider_when_apple_is_unavailable() {
+        let source_dir = temp_test_dir("dicta-provider-source");
+        let provider_dir = temp_test_dir("dicta-provider-install");
+        let state = temp_provider_state_path();
+        write_test_provider_source(&source_dir, "local-asr", "0.1.0");
+        let cli = Cli {
+            provider: Some("active".to_owned()),
+            provider_state: Some(state.clone()),
+            provider_dir: Some(provider_dir.clone()),
+            capabilities: true,
+            ..test_cli()
+        };
+        let source = ProviderInstallSource {
+            description: source_dir.display().to_string(),
+            package: ProviderInstallPackage::Directory(source_dir.clone()),
+            metadata: provider_install_metadata(
+                ProviderInstallSourceKind::Directory,
+                None,
+                None,
+                None,
+            ),
+        };
+        install_provider_from_source(&cli, source, false).unwrap();
+        let support = AppleSupport {
+            version: Some("15.6.1".to_owned()),
+            supported: false,
+            reason: "macOS 15.6.1 is below 26".to_owned(),
+        };
+
+        let report = gather_capabilities_report_with_support(&cli, &support);
+        let _ = std::fs::remove_dir_all(source_dir);
+        let _ = std::fs::remove_dir_all(provider_dir);
+        let _ = std::fs::remove_file(state);
+
+        assert_eq!(report.provider.as_deref(), Some("local-asr"));
+        assert_eq!(report.resolved.as_deref(), Some("external"));
+        assert!(report.live.is_some());
+    }
+
+    #[test]
+    fn active_provider_defaults_to_first_installed_live_provider_when_apple_is_unavailable() {
+        let first_source = temp_test_dir("dicta-provider-source-a");
+        let second_source = temp_test_dir("dicta-provider-source-z");
+        let provider_dir = temp_test_dir("dicta-provider-install");
+        let state = temp_provider_state_path();
+        write_test_provider_source(&first_source, "aaa-asr", "0.1.0");
+        write_test_provider_source(&second_source, "zzz-asr", "0.1.0");
+        let cli = Cli {
+            provider: Some("active".to_owned()),
+            provider_state: Some(state.clone()),
+            provider_dir: Some(provider_dir.clone()),
+            capabilities: true,
+            ..test_cli()
+        };
+        for source_dir in [&second_source, &first_source] {
+            let source = ProviderInstallSource {
+                description: source_dir.display().to_string(),
+                package: ProviderInstallPackage::Directory(source_dir.clone()),
+                metadata: provider_install_metadata(
+                    ProviderInstallSourceKind::Directory,
+                    None,
+                    None,
+                    None,
+                ),
+            };
+            install_provider_from_source(&cli, source, false).unwrap();
+        }
+        let support = AppleSupport {
+            version: Some("15.6.1".to_owned()),
+            supported: false,
+            reason: "macOS 15.6.1 is below 26".to_owned(),
+        };
+
+        let report = gather_capabilities_report_with_support(&cli, &support);
+        let _ = std::fs::remove_dir_all(first_source);
+        let _ = std::fs::remove_dir_all(second_source);
+        let _ = std::fs::remove_dir_all(provider_dir);
+        let _ = std::fs::remove_file(state);
+
+        assert_eq!(report.provider.as_deref(), Some("aaa-asr"));
+        assert_eq!(report.resolved.as_deref(), Some("external"));
+        assert!(report.live.is_some());
     }
 
     #[test]
