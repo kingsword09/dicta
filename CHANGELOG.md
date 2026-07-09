@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.10.20](https://github.com/kingsword09/dicta/compare/v0.10.19...v0.10.20) - 2026-07-09
+
+### Other Changes
+- feat(cli): add dicta-owned audio provider protocol by @kingsword09 in https://github.com/kingsword09/dicta/pull/60
+
 ## [v0.10.19](https://github.com/kingsword09/dicta/compare/v0.10.18...v0.10.19) - 2026-07-09
 
 ### Other Changes
