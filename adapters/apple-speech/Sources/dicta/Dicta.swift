@@ -6,7 +6,7 @@ struct Dicta: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "dicta",
         abstract: "On-device live transcription and translation for macOS 26+",
-        version: "0.10.20"
+        version: "0.10.21"
     )
 
     // MARK: - Capture options
