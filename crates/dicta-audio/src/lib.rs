@@ -1,7 +1,10 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, SampleRate, StreamConfig, SupportedStreamConfig};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -152,6 +155,181 @@ pub fn record_default_input_to_wav(
     })
 }
 
+/// Format of the frames emitted by [`stream_default_input_i16`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputStreamInfo {
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
+/// Handle to a live microphone capture stream. Dropping it stops capture and
+/// joins the audio thread.
+///
+/// `cpal::Stream` is `!Send`, so it cannot be moved across threads or held in an
+/// async task. This handle owns a dedicated thread that builds the stream, keeps
+/// it alive, and tears it down on drop; PCM frames are delivered to the caller's
+/// `on_frame` callback (invoked on cpal's audio thread).
+pub struct InputStreamHandle {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl InputStreamHandle {
+    /// Signal the capture thread to stop and wait for it to finish.
+    pub fn stop(mut self) {
+        self.shutdown();
+    }
+
+    fn shutdown(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            thread.thread().unpark();
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for InputStreamHandle {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Open the default input device and stream mono 16-bit PCM frames to
+/// `on_frame` until the returned [`InputStreamHandle`] is dropped.
+///
+/// Frames are delivered as mono PCM at the device's native sample rate
+/// (reported in [`InputStreamInfo`]); the caller is responsible for any
+/// resampling. Multi-channel input is downmixed to mono. The callback runs on
+/// cpal's realtime audio thread, so it must not block.
+pub fn stream_default_input_i16(
+    on_frame: impl FnMut(&[i16]) + Send + 'static,
+) -> AudioResult<(InputStreamHandle, InputStreamInfo)> {
+    request_microphone_permission()?;
+
+    let selection = input_device_config()?;
+    let device = selection.device;
+    let supported = selection.config;
+    let sample_format = supported.sample_format();
+    let config: StreamConfig = supported.config();
+    let sample_rate = config.sample_rate.0;
+    let channels = config.channels;
+    let channel_count = channels.max(1) as usize;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
+    let (ready_tx, ready_rx) = mpsc::channel::<AudioResult<()>>();
+
+    let thread = thread::spawn(move || {
+        let mut on_frame = on_frame;
+        let stop_on_error = Arc::clone(&stop_thread);
+        let err_fn = move |_err: cpal::StreamError| {
+            stop_on_error.store(true, Ordering::SeqCst);
+        };
+
+        // Build + start the stream. Each arm moves `on_frame`/`err_fn`; arms are
+        // mutually exclusive so the multiple moves are sound.
+        let built = (|| -> AudioResult<cpal::Stream> {
+            let stream = match sample_format {
+                SampleFormat::F32 => device.build_input_stream(
+                    &config,
+                    move |data: &[f32], _| {
+                        let mono = downmix_to_i16(data, channel_count);
+                        if !mono.is_empty() {
+                            on_frame(&mono);
+                        }
+                    },
+                    err_fn,
+                    None,
+                )?,
+                SampleFormat::I16 => device.build_input_stream(
+                    &config,
+                    move |data: &[i16], _| {
+                        let mono = downmix_to_i16(data, channel_count);
+                        if !mono.is_empty() {
+                            on_frame(&mono);
+                        }
+                    },
+                    err_fn,
+                    None,
+                )?,
+                SampleFormat::U16 => device.build_input_stream(
+                    &config,
+                    move |data: &[u16], _| {
+                        let mono = downmix_to_i16(data, channel_count);
+                        if !mono.is_empty() {
+                            on_frame(&mono);
+                        }
+                    },
+                    err_fn,
+                    None,
+                )?,
+                other => {
+                    return Err(AudioError::Stream(format!(
+                        "unsupported input sample format: {other:?}"
+                    )));
+                }
+            };
+            stream.play()?;
+            Ok(stream)
+        })();
+
+        match built {
+            Ok(stream) => {
+                if ready_tx.send(Ok(())).is_err() {
+                    return;
+                }
+                while !stop_thread.load(Ordering::SeqCst) {
+                    thread::park_timeout(Duration::from_millis(100));
+                }
+                drop(stream);
+            }
+            Err(err) => {
+                let _ = ready_tx.send(Err(err));
+            }
+        }
+    });
+
+    match ready_rx.recv() {
+        Ok(Ok(())) => Ok((
+            InputStreamHandle {
+                stop,
+                thread: Some(thread),
+            },
+            InputStreamInfo {
+                sample_rate,
+                channels: 1,
+            },
+        )),
+        Ok(Err(err)) => {
+            let _ = thread.join();
+            Err(err)
+        }
+        Err(_) => {
+            let _ = thread.join();
+            Err(AudioError::Stream(
+                "input stream thread exited during setup".to_owned(),
+            ))
+        }
+    }
+}
+
+/// Downmix an interleaved multi-channel buffer to mono `i16`.
+fn downmix_to_i16<S>(data: &[S], channels: usize) -> Vec<i16>
+where
+    S: IntoSampleI16 + Copy,
+{
+    if channels <= 1 {
+        return data.iter().map(|s| s.into_i16()).collect();
+    }
+    data.chunks(channels)
+        .map(|frame| {
+            let sum: i32 = frame.iter().map(|s| s.into_i16() as i32).sum();
+            (sum / frame.len() as i32) as i16
+        })
+        .collect()
+}
+
 fn input_device_config() -> AudioResult<InputSelection> {
     let host = cpal::default_host();
     let mut errors = Vec::new();
@@ -281,5 +459,13 @@ mod tests {
         assert_eq!(0_u16.into_i16(), i16::MIN);
         assert_eq!(32768_u16.into_i16(), 0);
         assert_eq!(u16::MAX.into_i16(), i16::MAX);
+    }
+
+    #[test]
+    fn downmixes_multichannel_audio_to_mono() {
+        assert_eq!(
+            downmix_to_i16(&[100_i16, 300, -100, -300], 2),
+            vec![200, -200]
+        );
     }
 }
