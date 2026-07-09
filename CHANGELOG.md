@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.10.21](https://github.com/kingsword09/dicta/compare/v0.10.20...v0.10.21) - 2026-07-09
+
+### Other Changes
+- fix(cli): remember active provider for live and ptt modes by @kingsword09 in https://github.com/kingsword09/dicta/pull/63
+
 ## [v0.10.20](https://github.com/kingsword09/dicta/compare/v0.10.19...v0.10.20) - 2026-07-09
 
 ### Other Changes
