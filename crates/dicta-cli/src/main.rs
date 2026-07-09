@@ -54,6 +54,7 @@ const DEFAULT_PROVIDER_SCOPE: &str = "dicta-asr";
 const DEFAULT_PROVIDER_KEYWORD: &str = "dicta-provider";
 const PROVIDER_INSTALL_METADATA_FILE: &str = ".dicta-provider-install.json";
 const PROVIDER_STDERR_TAIL_LINES: usize = 20;
+const STDIN_AUDIO_SAMPLE_RATE: u32 = 16_000;
 const ENV_LIVE_APPEND_ONLY: &str = "DICTA_LIVE_APPEND_ONLY";
 const UI_LAUNCH_GRACE: Duration = Duration::from_millis(700);
 
@@ -514,6 +515,14 @@ impl InstalledProvider {
         self.root.join(&self.manifest.command)
     }
 
+    fn live_audio_source(&self) -> ProviderLiveAudioSource {
+        self.manifest
+            .live
+            .as_ref()
+            .map(|live| live.audio_source)
+            .unwrap_or_default()
+    }
+
     fn profile(&self) -> ProviderProfile {
         ProviderProfile {
             kind: ProfileProviderKind::External,
@@ -649,9 +658,24 @@ struct ProviderLiveManifest {
     #[serde(default)]
     ptt: bool,
     #[serde(default)]
+    audio_source: ProviderLiveAudioSource,
+    #[serde(default)]
     requires_network: bool,
     #[serde(default)]
     expected_latency_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ProviderLiveAudioSource {
+    Provider,
+    Dicta,
+}
+
+impl Default for ProviderLiveAudioSource {
+    fn default() -> Self {
+        Self::Provider
+    }
 }
 
 impl ProviderLiveManifest {
@@ -2127,6 +2151,13 @@ impl RealtimeActivation {
 
     fn defaults_to_active_provider(self) -> bool {
         matches!(self, Self::Toggle)
+    }
+
+    fn stdin_audio_mode(self) -> &'static str {
+        match self {
+            Self::Continuous => "continuous",
+            Self::Toggle => "ptt",
+        }
     }
 }
 
@@ -5850,6 +5881,7 @@ struct ExternalProvider {
     root: PathBuf,
     command: PathBuf,
     capabilities: ProviderCapabilities,
+    live_audio_source: ProviderLiveAudioSource,
 }
 
 fn build_external_provider(cli: &Cli) -> Result<ExternalProvider> {
@@ -5864,6 +5896,7 @@ fn build_external_provider(cli: &Cli) -> Result<ExternalProvider> {
         root: installed.root.clone(),
         command: installed.command_path(),
         capabilities: installed.capabilities(),
+        live_audio_source: installed.live_audio_source(),
     })
 }
 
@@ -5882,6 +5915,12 @@ impl ExternalProvider {
         options: LiveAsrOptions,
         on_event: LiveEventCallback<'_>,
     ) -> dicta_asr::AsrResult<()> {
+        if self.live_audio_source == ProviderLiveAudioSource::Dicta {
+            return self
+                .run_stdin_audio(options, RealtimeActivation::Toggle, on_event)
+                .await;
+        }
+
         let mut command = self.command();
         append_external_live_args(&mut command, &options);
         command.arg("--json").arg("--ptt-json");
@@ -6016,6 +6055,170 @@ impl ExternalProvider {
         let _ = external_provider_stderr_tail(stderr_task).await;
         Ok(())
     }
+
+    async fn run_stdin_audio(
+        &self,
+        options: LiveAsrOptions,
+        activation: RealtimeActivation,
+        on_event: LiveEventCallback<'_>,
+    ) -> dicta_asr::AsrResult<()> {
+        if !options.mic {
+            return Err(dicta_asr::AsrError::Config(format!(
+                "provider {} {} mode requires microphone input for dicta-owned audio",
+                self.id,
+                activation.label()
+            )));
+        }
+
+        let mut command = self.command();
+        append_external_live_args(&mut command, &options);
+        command.arg("--json").arg("--stdin-audio-json");
+
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|err| {
+                dicta_asr::AsrError::Request(format!(
+                    "failed to run provider {} at {}: {err}",
+                    self.id,
+                    self.command.display()
+                ))
+            })?;
+        let child_stdin = child.stdin.take().ok_or_else(|| {
+            dicta_asr::AsrError::Request(format!("provider {} stdin was not piped", self.id))
+        })?;
+        let mut child_stdin = Some(child_stdin);
+        let stdout = child.stdout.take().ok_or_else(|| {
+            dicta_asr::AsrError::Request(format!("provider {} stdout was not piped", self.id))
+        })?;
+        let stderr_task = child.stderr.take().map(drain_external_provider_stderr);
+        let mut provider_lines = BufReader::new(stdout).lines();
+        let mut input_lines = if activation.requires_ptt() {
+            Some(BufReader::new(tokio::io::stdin()).lines())
+        } else {
+            None
+        };
+
+        let mut capture = None::<DictaAudioCapture>;
+        let mut interrupted = false;
+        let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
+        let shutdown_timer = time::sleep(Duration::from_secs(0));
+        tokio::pin!(shutdown_timer);
+        let mut shutdown_requested = false;
+
+        if activation.requires_ptt() {
+            ptt_prompt("press Enter to start/stop recording; Ctrl-C to quit");
+        } else if let Some(stdin) = child_stdin.as_mut() {
+            capture = Some(start_dicta_audio_capture(self, &options, activation, stdin).await?);
+        }
+
+        loop {
+            tokio::select! {
+                biased;
+                signal = &mut ctrl_c, if !shutdown_requested => {
+                    signal.map_err(|err| {
+                        dicta_asr::AsrError::Request(format!("failed to listen for Ctrl-C: {err}"))
+                    })?;
+                    interrupted = true;
+                    shutdown_requested = true;
+                    if let Some(stdin) = child_stdin.as_mut() {
+                        if capture.is_some() {
+                            stop_dicta_audio_capture(self, stdin, &mut capture).await.ok();
+                        } else {
+                            send_stdin_audio_control(self, stdin, ProviderStdinAudioEvent::Cancel).await.ok();
+                        }
+                    }
+                    child_stdin.take();
+                    shutdown_timer
+                        .as_mut()
+                        .reset(TokioInstant::now() + Duration::from_secs(30));
+                }
+                _ = &mut shutdown_timer, if shutdown_requested => {
+                    let _ = child.start_kill();
+                    on_event(LiveEvent::Eof)?;
+                    break;
+                }
+                input = read_optional_stdin_line(&mut input_lines), if !shutdown_requested && activation.requires_ptt() => {
+                    let Some(_) = input? else {
+                        shutdown_requested = true;
+                        if let Some(stdin) = child_stdin.as_mut() {
+                            if capture.is_some() {
+                                stop_dicta_audio_capture(self, stdin, &mut capture).await.ok();
+                            }
+                            send_stdin_audio_control(self, stdin, ProviderStdinAudioEvent::Cancel).await.ok();
+                        }
+                        child_stdin.take();
+                        shutdown_timer
+                            .as_mut()
+                            .reset(TokioInstant::now() + Duration::from_secs(30));
+                        continue;
+                    };
+                    let stdin = child_stdin.as_mut().ok_or_else(|| {
+                        dicta_asr::AsrError::Request(format!("provider {} stdin is closed", self.id))
+                    })?;
+                    if capture.is_some() {
+                        stop_dicta_audio_capture(self, stdin, &mut capture).await?;
+                        ptt_prompt("finalizing; press Enter to start next utterance");
+                    } else {
+                        capture = Some(start_dicta_audio_capture(self, &options, activation, stdin).await?);
+                        ptt_prompt("recording; press Enter to stop");
+                    }
+                }
+                frame = read_dicta_audio_frame(&mut capture), if capture.is_some() && !shutdown_requested => {
+                    let Some(frame) = frame else {
+                        if let Some(stdin) = child_stdin.as_mut() {
+                            stop_dicta_audio_capture(self, stdin, &mut capture).await.ok();
+                        }
+                        continue;
+                    };
+                    if let Some(stdin) = child_stdin.as_mut() {
+                        send_dicta_audio_frame(self, stdin, &mut capture, frame).await?;
+                    }
+                }
+                line = provider_lines.next_line() => {
+                    let Some(line) = line.map_err(|err| {
+                        dicta_asr::AsrError::Request(format!("failed to read provider {} stdout: {err}", self.id))
+                    })? else {
+                        break;
+                    };
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let event = parse_external_live_event(line)?;
+                    let eof = matches!(event, LiveEvent::Eof);
+                    on_event(event)?;
+                    if eof {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let status = child.wait().await.map_err(|err| {
+            dicta_asr::AsrError::Request(format!(
+                "failed to wait for provider {} at {}: {err}",
+                self.id,
+                self.command.display()
+            ))
+        })?;
+        if !interrupted && !status.success() {
+            let stderr_tail = external_provider_stderr_tail(stderr_task).await;
+            let detail = if stderr_tail.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", stderr_tail.join("\n"))
+            };
+            return Err(dicta_asr::AsrError::Request(format!(
+                "provider {} exited with {status}{detail}",
+                self.id,
+            )));
+        }
+        let _ = external_provider_stderr_tail(stderr_task).await;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -6024,6 +6227,252 @@ enum PttControlEvent {
     StartUtterance,
     StopUtterance,
     CancelUtterance,
+}
+
+struct DictaAudioCapture {
+    handle: Option<dicta_audio::InputStreamHandle>,
+    frames: mpsc::Receiver<Vec<i16>>,
+    resampler: IncrementalPcmResampler,
+    seq: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ProviderStdinAudioEvent {
+    Start {
+        mode: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        src: Option<String>,
+        sample_rate: u32,
+        channels: u16,
+        format: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        chunk_ms: Option<u64>,
+    },
+    Audio {
+        seq: u64,
+        pcm: String,
+    },
+    Stop,
+    Cancel,
+}
+
+async fn start_dicta_audio_capture(
+    provider: &ExternalProvider,
+    options: &LiveAsrOptions,
+    activation: RealtimeActivation,
+    stdin: &mut ChildStdin,
+) -> dicta_asr::AsrResult<DictaAudioCapture> {
+    let (frame_tx, frames) = mpsc::channel::<Vec<i16>>(64);
+    let (handle, info) = dicta_audio::stream_default_input_i16(move |frame| {
+        let _ = frame_tx.try_send(frame.to_vec());
+    })
+    .map_err(|err| {
+        dicta_asr::AsrError::Input(format!("failed to open default microphone stream: {err}"))
+    })?;
+    let mut capture = DictaAudioCapture {
+        handle: Some(handle),
+        frames,
+        resampler: IncrementalPcmResampler::new(info.sample_rate),
+        seq: 0,
+    };
+    send_stdin_audio_control(
+        provider,
+        stdin,
+        ProviderStdinAudioEvent::Start {
+            mode: activation.stdin_audio_mode(),
+            src: options.src.clone(),
+            sample_rate: STDIN_AUDIO_SAMPLE_RATE,
+            channels: 1,
+            format: "pcm_s16le",
+            chunk_ms: stdin_audio_chunk_ms(provider, options),
+        },
+    )
+    .await?;
+    drain_pending_dicta_audio_frames(provider, stdin, &mut capture).await?;
+    Ok(capture)
+}
+
+async fn stop_dicta_audio_capture(
+    provider: &ExternalProvider,
+    stdin: &mut ChildStdin,
+    capture: &mut Option<DictaAudioCapture>,
+) -> dicta_asr::AsrResult<()> {
+    let Some(mut active) = capture.take() else {
+        return Ok(());
+    };
+    if let Some(handle) = active.handle.take() {
+        handle.stop();
+    }
+    drain_pending_dicta_audio_frames(provider, stdin, &mut active).await?;
+    let tail = active.resampler.flush();
+    if !tail.is_empty() {
+        send_pcm16_frame(provider, stdin, &mut active.seq, &tail).await?;
+    }
+    send_stdin_audio_control(provider, stdin, ProviderStdinAudioEvent::Stop).await
+}
+
+async fn send_dicta_audio_frame(
+    provider: &ExternalProvider,
+    stdin: &mut ChildStdin,
+    capture: &mut Option<DictaAudioCapture>,
+    frame: Vec<i16>,
+) -> dicta_asr::AsrResult<()> {
+    let Some(active) = capture.as_mut() else {
+        return Ok(());
+    };
+    let pcm = active.resampler.push(&frame);
+    if !pcm.is_empty() {
+        send_pcm16_frame(provider, stdin, &mut active.seq, &pcm).await?;
+    }
+    Ok(())
+}
+
+async fn drain_pending_dicta_audio_frames(
+    provider: &ExternalProvider,
+    stdin: &mut ChildStdin,
+    active: &mut DictaAudioCapture,
+) -> dicta_asr::AsrResult<()> {
+    while let Ok(frame) = active.frames.try_recv() {
+        let pcm = active.resampler.push(&frame);
+        if !pcm.is_empty() {
+            send_pcm16_frame(provider, stdin, &mut active.seq, &pcm).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn read_dicta_audio_frame(capture: &mut Option<DictaAudioCapture>) -> Option<Vec<i16>> {
+    match capture {
+        Some(active) => active.frames.recv().await,
+        None => None,
+    }
+}
+
+async fn read_optional_stdin_line(
+    lines: &mut Option<tokio::io::Lines<BufReader<tokio::io::Stdin>>>,
+) -> dicta_asr::AsrResult<Option<String>> {
+    match lines {
+        Some(lines) => lines.next_line().await.map_err(|err| {
+            dicta_asr::AsrError::Request(format!("failed to read PTT stdin: {err}"))
+        }),
+        None => Ok(None),
+    }
+}
+
+async fn send_pcm16_frame(
+    provider: &ExternalProvider,
+    stdin: &mut ChildStdin,
+    seq: &mut u64,
+    samples: &[i16],
+) -> dicta_asr::AsrResult<()> {
+    let pcm = encode_pcm16_base64(samples);
+    let event = ProviderStdinAudioEvent::Audio { seq: *seq, pcm };
+    *seq += 1;
+    send_stdin_audio_control(provider, stdin, event).await
+}
+
+async fn send_stdin_audio_control(
+    provider: &ExternalProvider,
+    stdin: &mut ChildStdin,
+    event: ProviderStdinAudioEvent,
+) -> dicta_asr::AsrResult<()> {
+    let mut line = serde_json::to_string(&event).map_err(|err| {
+        dicta_asr::AsrError::InvalidResponse(format!(
+            "failed to serialize provider stdin audio event: {err}"
+        ))
+    })?;
+    line.push('\n');
+    stdin.write_all(line.as_bytes()).await.map_err(|err| {
+        dicta_asr::AsrError::Request(format!(
+            "failed to write provider {} stdin: {err}",
+            provider.id
+        ))
+    })?;
+    stdin.flush().await.map_err(|err| {
+        dicta_asr::AsrError::Request(format!(
+            "failed to flush provider {} stdin: {err}",
+            provider.id
+        ))
+    })
+}
+
+fn encode_pcm16_base64(samples: &[i16]) -> String {
+    let mut bytes = Vec::with_capacity(samples.len() * 2);
+    for sample in samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    BASE64_STANDARD.encode(bytes)
+}
+
+fn stdin_audio_chunk_ms(provider: &ExternalProvider, options: &LiveAsrOptions) -> Option<u64> {
+    provider
+        .capabilities
+        .live
+        .as_ref()
+        .filter(|live| live.mode == LiveModeKind::Chunked)
+        .map(|_| duration_to_millis(options.chunk_duration).max(1))
+}
+
+fn duration_to_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+struct IncrementalPcmResampler {
+    input_rate: u32,
+    pos: f64,
+    last: Option<i16>,
+}
+
+impl IncrementalPcmResampler {
+    fn new(input_rate: u32) -> Self {
+        Self {
+            input_rate: input_rate.max(1),
+            pos: 0.0,
+            last: None,
+        }
+    }
+
+    fn push(&mut self, mono: &[i16]) -> Vec<i16> {
+        if mono.is_empty() {
+            return Vec::new();
+        }
+        if self.input_rate == STDIN_AUDIO_SAMPLE_RATE {
+            return mono.to_vec();
+        }
+
+        let mut buf = Vec::with_capacity(mono.len() + 1);
+        let offset = if let Some(last) = self.last {
+            buf.push(last);
+            1.0
+        } else {
+            0.0
+        };
+        buf.extend_from_slice(mono);
+
+        let ratio = self.input_rate as f64 / STDIN_AUDIO_SAMPLE_RATE as f64;
+        let mut out = Vec::new();
+        let mut src = self.pos + offset;
+        let max = (buf.len() - 1) as f64;
+        while src <= max {
+            let lower = src.floor() as usize;
+            let upper = (lower + 1).min(buf.len() - 1);
+            let frac = src - lower as f64;
+            let sample = buf[lower] as f64 * (1.0 - frac) + buf[upper] as f64 * frac;
+            out.push(sample.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16);
+            src += ratio;
+        }
+
+        self.pos = src - offset - mono.len() as f64;
+        self.last = mono.last().copied();
+        out
+    }
+
+    fn flush(&mut self) -> Vec<i16> {
+        self.pos = 0.0;
+        self.last = None;
+        Vec::new()
+    }
 }
 
 fn append_external_live_args(command: &mut tokio::process::Command, options: &LiveAsrOptions) {
@@ -6137,6 +6586,12 @@ impl LiveAsrProvider for ExternalProvider {
         options: LiveAsrOptions,
         on_event: LiveEventCallback<'_>,
     ) -> dicta_asr::AsrResult<()> {
+        if self.live_audio_source == ProviderLiveAudioSource::Dicta {
+            return self
+                .run_stdin_audio(options, RealtimeActivation::Continuous, on_event)
+                .await;
+        }
+
         let mut command = self.command();
         append_external_live_args(&mut command, &options);
         command.arg("--json").arg("--event-json");
@@ -7054,6 +7509,42 @@ expected_latency_ms = 5000
     }
 
     #[test]
+    fn stdin_audio_event_uses_provider_protocol_names() {
+        let encoded = serde_json::to_string(&ProviderStdinAudioEvent::Start {
+            mode: "ptt",
+            src: Some("zh-CN".to_owned()),
+            sample_rate: 16_000,
+            channels: 1,
+            format: "pcm_s16le",
+            chunk_ms: Some(1_500),
+        })
+        .unwrap();
+
+        assert_eq!(
+            encoded,
+            r#"{"type":"start","mode":"ptt","src":"zh-CN","sample_rate":16000,"channels":1,"format":"pcm_s16le","chunk_ms":1500}"#
+        );
+    }
+
+    #[test]
+    fn stdin_audio_start_omits_chunk_for_streaming_provider() {
+        let encoded = serde_json::to_string(&ProviderStdinAudioEvent::Start {
+            mode: "continuous",
+            src: None,
+            sample_rate: 16_000,
+            channels: 1,
+            format: "pcm_s16le",
+            chunk_ms: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            encoded,
+            r#"{"type":"start","mode":"continuous","sample_rate":16000,"channels":1,"format":"pcm_s16le"}"#
+        );
+    }
+
+    #[test]
     fn provider_manifest_reads_ptt_capability() {
         let manifest: ProviderPackageManifest = toml::from_str(
             r#"
@@ -7072,6 +7563,26 @@ ptt = true
                 .live
                 .as_ref()
                 .is_some_and(|live| live.capabilities().ptt)
+        );
+    }
+
+    #[test]
+    fn provider_manifest_reads_dicta_audio_source() {
+        let manifest: ProviderPackageManifest = toml::from_str(
+            r#"
+id = "stdin-audio-asr"
+protocol = "dicta-provider-jsonl-v1"
+command = "bin/stdin-audio-asr"
+
+[live]
+audio_source = "dicta"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            manifest.live.as_ref().map(|live| live.audio_source),
+            Some(ProviderLiveAudioSource::Dicta)
         );
     }
 
