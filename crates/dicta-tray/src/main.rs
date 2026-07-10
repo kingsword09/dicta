@@ -1541,9 +1541,39 @@ fn process_is_running(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
-#[cfg(not(unix))]
-fn process_is_running(_pid: u32) -> bool {
-    true
+#[cfg(windows)]
+fn process_is_running(pid: u32) -> bool {
+    use std::ffi::c_void;
+
+    if pid == 0 {
+        return false;
+    }
+
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const WAIT_TIMEOUT: u32 = 0x0000_0102;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        #[link_name = "OpenProcess"]
+        fn open_process(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
+        #[link_name = "WaitForSingleObject"]
+        fn wait_for_single_object(handle: *mut c_void, milliseconds: u32) -> u32;
+        #[link_name = "CloseHandle"]
+        fn close_handle(handle: *mut c_void) -> i32;
+    }
+
+    let handle = unsafe { open_process(SYNCHRONIZE, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    let wait = unsafe { wait_for_single_object(handle, 0) };
+    let _ = unsafe { close_handle(handle) };
+    wait == WAIT_TIMEOUT
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_is_running(pid: u32) -> bool {
+    pid != 0
 }
 
 fn update_tray_icon(icon: &TrayIcon, app: &mut TrayApp) -> Result<()> {
