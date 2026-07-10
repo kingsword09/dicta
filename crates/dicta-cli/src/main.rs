@@ -55,6 +55,13 @@ const DEFAULT_PROVIDER_KEYWORD: &str = "dicta-provider";
 const PROVIDER_INSTALL_METADATA_FILE: &str = ".dicta-provider-install.json";
 const PROVIDER_STDERR_TAIL_LINES: usize = 20;
 const STDIN_AUDIO_SAMPLE_RATE: u32 = 16_000;
+const LOCAL_ENDPOINT_FRAME_MS: u64 = 20;
+const LOCAL_ENDPOINT_FRAME_SAMPLES: usize =
+    (STDIN_AUDIO_SAMPLE_RATE as usize * LOCAL_ENDPOINT_FRAME_MS as usize) / 1000;
+const LOCAL_ENDPOINT_PREROLL_MS: u64 = 300;
+const LOCAL_ENDPOINT_START_MS: u64 = 160;
+const LOCAL_ENDPOINT_END_SILENCE_MS: u64 = 900;
+const LOCAL_ENDPOINT_MAX_MS: u64 = 30_000;
 const ENV_LIVE_APPEND_ONLY: &str = "DICTA_LIVE_APPEND_ONLY";
 const UI_LAUNCH_GRACE: Duration = Duration::from_millis(700);
 
@@ -1815,6 +1822,7 @@ fn spawn_realtime_worker(
     let dicta_bin =
         std::env::current_exe().context("failed to resolve current dicta executable")?;
     let mut command = tokio::process::Command::new(dicta_bin);
+    configure_child_process_group(&mut command);
     command
         .args(args)
         .stdout(Stdio::inherit())
@@ -1842,13 +1850,13 @@ fn spawn_realtime_worker(
 
 async fn shutdown_realtime_worker(worker: &mut RealtimeWorker) {
     worker.ptt_stdin.take();
-    request_external_provider_shutdown(&mut worker.child).await;
+    request_child_process_shutdown(&mut worker.child).await;
     let shutdown_timer = time::sleep(Duration::from_secs(30));
     tokio::pin!(shutdown_timer);
     tokio::select! {
         _ = worker.child.wait() => {}
         _ = &mut shutdown_timer => {
-            let _ = worker.child.start_kill();
+            force_child_process_shutdown(&mut worker.child).await;
             let _ = worker.child.wait().await;
         }
     }
@@ -5905,6 +5913,7 @@ fn build_external_provider(cli: &Cli) -> Result<ExternalProvider> {
 impl ExternalProvider {
     fn command(&self) -> tokio::process::Command {
         let mut command = tokio::process::Command::new(&self.command);
+        configure_child_process_group(&mut command);
         command
             .current_dir(&self.root)
             .env("DICTA_PROVIDER_ID", &self.id)
@@ -5981,7 +5990,7 @@ impl ExternalProvider {
                         .reset(TokioInstant::now() + Duration::from_secs(30));
                 }
                 _ = &mut shutdown_timer, if shutdown_requested => {
-                    let _ = child.start_kill();
+                    force_child_process_shutdown(&mut child).await;
                     on_event(LiveEvent::Eof)?;
                     break;
                 }
@@ -6138,7 +6147,7 @@ impl ExternalProvider {
                         .reset(TokioInstant::now() + Duration::from_secs(30));
                 }
                 _ = &mut shutdown_timer, if shutdown_requested => {
-                    let _ = child.start_kill();
+                    force_child_process_shutdown(&mut child).await;
                     on_event(LiveEvent::Eof)?;
                     break;
                 }
@@ -6235,6 +6244,8 @@ struct DictaAudioCapture {
     handle: Option<dicta_audio::InputStreamHandle>,
     frames: mpsc::Receiver<Vec<i16>>,
     resampler: IncrementalPcmResampler,
+    endpoint: Option<LocalVoiceEndpoint>,
+    src: Option<String>,
     seq: u64,
 }
 
@@ -6276,21 +6287,20 @@ async fn start_dicta_audio_capture(
         handle: Some(handle),
         frames,
         resampler: IncrementalPcmResampler::new(info.sample_rate),
+        endpoint: (!activation.requires_ptt()).then(LocalVoiceEndpoint::new),
+        src: options.src.clone(),
         seq: 0,
     };
-    send_stdin_audio_control(
-        provider,
-        stdin,
-        ProviderStdinAudioEvent::Start {
-            mode: activation.stdin_audio_mode(),
-            src: options.src.clone(),
-            sample_rate: STDIN_AUDIO_SAMPLE_RATE,
-            channels: 1,
-            format: "pcm_s16le",
-            chunk_ms: stdin_audio_chunk_ms(provider, options),
-        },
-    )
-    .await?;
+    if capture.endpoint.is_none() {
+        send_stdin_audio_start(
+            provider,
+            stdin,
+            options.src.clone(),
+            activation,
+            stdin_audio_chunk_ms(provider, options),
+        )
+        .await?;
+    }
     drain_pending_dicta_audio_frames(provider, stdin, &mut capture).await?;
     Ok(capture)
 }
@@ -6309,9 +6319,17 @@ async fn stop_dicta_audio_capture(
     drain_pending_dicta_audio_frames(provider, stdin, &mut active).await?;
     let tail = active.resampler.flush();
     if !tail.is_empty() {
-        send_pcm16_frame(provider, stdin, &mut active.seq, &tail).await?;
+        send_dicta_audio_pcm(provider, stdin, &mut active, &tail).await?;
     }
-    send_stdin_audio_control(provider, stdin, ProviderStdinAudioEvent::Stop).await
+    if let Some(endpoint) = active.endpoint.as_mut() {
+        for action in endpoint.finish() {
+            send_endpoint_action(provider, stdin, active.src.clone(), &mut active.seq, action)
+                .await?;
+        }
+    } else {
+        send_stdin_audio_control(provider, stdin, ProviderStdinAudioEvent::Stop).await?;
+    }
+    Ok(())
 }
 
 async fn send_dicta_audio_frame(
@@ -6325,7 +6343,7 @@ async fn send_dicta_audio_frame(
     };
     let pcm = active.resampler.push(&frame);
     if !pcm.is_empty() {
-        send_pcm16_frame(provider, stdin, &mut active.seq, &pcm).await?;
+        send_dicta_audio_pcm(provider, stdin, active, &pcm).await?;
     }
     Ok(())
 }
@@ -6338,10 +6356,208 @@ async fn drain_pending_dicta_audio_frames(
     while let Ok(frame) = active.frames.try_recv() {
         let pcm = active.resampler.push(&frame);
         if !pcm.is_empty() {
-            send_pcm16_frame(provider, stdin, &mut active.seq, &pcm).await?;
+            send_dicta_audio_pcm(provider, stdin, active, &pcm).await?;
         }
     }
     Ok(())
+}
+
+async fn send_dicta_audio_pcm(
+    provider: &ExternalProvider,
+    stdin: &mut ChildStdin,
+    active: &mut DictaAudioCapture,
+    pcm: &[i16],
+) -> dicta_asr::AsrResult<()> {
+    if active.endpoint.is_some() {
+        let actions = {
+            let endpoint = active.endpoint.as_mut().expect("endpoint checked");
+            endpoint.push(pcm)
+        };
+        for action in actions {
+            send_endpoint_action(provider, stdin, active.src.clone(), &mut active.seq, action)
+                .await?;
+        }
+    } else {
+        send_pcm16_frame(provider, stdin, &mut active.seq, pcm).await?;
+    }
+    Ok(())
+}
+
+async fn send_endpoint_action(
+    provider: &ExternalProvider,
+    stdin: &mut ChildStdin,
+    src: Option<String>,
+    seq: &mut u64,
+    action: LocalEndpointAction,
+) -> dicta_asr::AsrResult<()> {
+    match action {
+        LocalEndpointAction::Start => {
+            send_stdin_audio_start(
+                provider,
+                stdin,
+                src,
+                RealtimeActivation::Continuous,
+                Some(LOCAL_ENDPOINT_MAX_MS),
+            )
+            .await
+        }
+        LocalEndpointAction::Audio(pcm) => send_pcm16_frame(provider, stdin, seq, &pcm).await,
+        LocalEndpointAction::Stop => {
+            send_stdin_audio_control(provider, stdin, ProviderStdinAudioEvent::Stop).await
+        }
+    }
+}
+
+async fn send_stdin_audio_start(
+    provider: &ExternalProvider,
+    stdin: &mut ChildStdin,
+    src: Option<String>,
+    activation: RealtimeActivation,
+    chunk_ms: Option<u64>,
+) -> dicta_asr::AsrResult<()> {
+    send_stdin_audio_control(
+        provider,
+        stdin,
+        ProviderStdinAudioEvent::Start {
+            mode: activation.stdin_audio_mode(),
+            src,
+            sample_rate: STDIN_AUDIO_SAMPLE_RATE,
+            channels: 1,
+            format: "pcm_s16le",
+            chunk_ms,
+        },
+    )
+    .await
+}
+
+#[derive(Debug)]
+struct LocalVoiceEndpoint {
+    frame_buffer: Vec<i16>,
+    pre_roll: VecDeque<i16>,
+    in_speech: bool,
+    speech_streak_ms: u64,
+    silence_ms: u64,
+    utterance_ms: u64,
+    gate: dicta_audio::RmsEnergyGate,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LocalEndpointAction {
+    Start,
+    Audio(Vec<i16>),
+    Stop,
+}
+
+impl LocalVoiceEndpoint {
+    fn new() -> Self {
+        Self {
+            frame_buffer: Vec::new(),
+            pre_roll: VecDeque::with_capacity(local_endpoint_preroll_samples()),
+            in_speech: false,
+            speech_streak_ms: 0,
+            silence_ms: 0,
+            utterance_ms: 0,
+            gate: dicta_audio::RmsEnergyGate::default(),
+        }
+    }
+
+    fn push(&mut self, samples: &[i16]) -> Vec<LocalEndpointAction> {
+        self.frame_buffer.extend_from_slice(samples);
+        let mut actions = Vec::new();
+        while self.frame_buffer.len() >= LOCAL_ENDPOINT_FRAME_SAMPLES {
+            let frame = self
+                .frame_buffer
+                .drain(..LOCAL_ENDPOINT_FRAME_SAMPLES)
+                .collect::<Vec<_>>();
+            actions.extend(self.push_frame(frame));
+        }
+        actions
+    }
+
+    fn finish(&mut self) -> Vec<LocalEndpointAction> {
+        let mut actions = Vec::new();
+        if !self.frame_buffer.is_empty() {
+            let frame = std::mem::take(&mut self.frame_buffer);
+            actions.extend(self.push_frame(frame));
+        }
+        if self.in_speech {
+            self.reset_utterance();
+            actions.push(LocalEndpointAction::Stop);
+        }
+        actions
+    }
+
+    fn push_frame(&mut self, frame: Vec<i16>) -> Vec<LocalEndpointAction> {
+        let voiced = self.is_voiced(&frame);
+        if self.in_speech {
+            return self.push_speech_frame(frame, voiced);
+        }
+        self.push_idle_frame(frame, voiced)
+    }
+
+    fn push_idle_frame(&mut self, frame: Vec<i16>, voiced: bool) -> Vec<LocalEndpointAction> {
+        self.push_pre_roll(&frame);
+        if voiced {
+            self.speech_streak_ms += LOCAL_ENDPOINT_FRAME_MS;
+        } else {
+            self.speech_streak_ms = 0;
+        }
+        if self.speech_streak_ms < LOCAL_ENDPOINT_START_MS {
+            return Vec::new();
+        }
+
+        self.in_speech = true;
+        self.silence_ms = 0;
+        self.utterance_ms = self.speech_streak_ms.min(LOCAL_ENDPOINT_PREROLL_MS);
+        let audio = self.pre_roll.iter().copied().collect::<Vec<_>>();
+        self.pre_roll.clear();
+        vec![
+            LocalEndpointAction::Start,
+            LocalEndpointAction::Audio(audio),
+        ]
+    }
+
+    fn push_speech_frame(&mut self, frame: Vec<i16>, voiced: bool) -> Vec<LocalEndpointAction> {
+        self.utterance_ms += LOCAL_ENDPOINT_FRAME_MS;
+        if voiced {
+            self.silence_ms = 0;
+        } else {
+            self.silence_ms += LOCAL_ENDPOINT_FRAME_MS;
+        }
+
+        let mut actions = vec![LocalEndpointAction::Audio(frame)];
+        if self.silence_ms >= LOCAL_ENDPOINT_END_SILENCE_MS
+            || self.utterance_ms >= LOCAL_ENDPOINT_MAX_MS
+        {
+            self.reset_utterance();
+            actions.push(LocalEndpointAction::Stop);
+        }
+        actions
+    }
+
+    fn push_pre_roll(&mut self, frame: &[i16]) {
+        self.pre_roll.extend(frame.iter().copied());
+        let max = local_endpoint_preroll_samples();
+        while self.pre_roll.len() > max {
+            self.pre_roll.pop_front();
+        }
+    }
+
+    fn reset_utterance(&mut self) {
+        self.in_speech = false;
+        self.speech_streak_ms = 0;
+        self.silence_ms = 0;
+        self.utterance_ms = 0;
+        self.pre_roll.clear();
+    }
+
+    fn is_voiced(&mut self, frame: &[i16]) -> bool {
+        self.gate.is_voiced(frame, !self.in_speech)
+    }
+}
+
+fn local_endpoint_preroll_samples() -> usize {
+    (STDIN_AUDIO_SAMPLE_RATE as usize * LOCAL_ENDPOINT_PREROLL_MS as usize) / 1000
 }
 
 async fn read_dicta_audio_frame(capture: &mut Option<DictaAudioCapture>) -> Option<Vec<i16>> {
@@ -6633,10 +6849,10 @@ impl LiveAsrProvider for ExternalProvider {
                     shutdown_timer
                         .as_mut()
                         .reset(TokioInstant::now() + Duration::from_secs(30));
-                    request_external_provider_shutdown(&mut child).await;
+                    request_child_process_shutdown(&mut child).await;
                 }
                 _ = &mut shutdown_timer, if shutdown_requested => {
-                    let _ = child.start_kill();
+                    force_child_process_shutdown(&mut child).await;
                     on_event(LiveEvent::Eof)?;
                     break;
                 }
@@ -6727,21 +6943,67 @@ async fn external_provider_stderr_tail(
 }
 
 #[cfg(unix)]
-async fn request_external_provider_shutdown(child: &mut tokio::process::Child) {
-    if let Some(pid) = child.id() {
-        let _ = tokio::process::Command::new("/bin/kill")
-            .arg("-INT")
-            .arg(pid.to_string())
-            .status()
-            .await;
-    } else {
+fn configure_child_process_group(command: &mut tokio::process::Command) {
+    unsafe {
+        command.as_std_mut().pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_child_process_group(_command: &mut tokio::process::Command) {}
+
+#[cfg(unix)]
+async fn request_child_process_shutdown(child: &mut tokio::process::Child) {
+    if signal_child_process_group(child, libc::SIGINT).is_err() {
         let _ = child.start_kill();
     }
 }
 
 #[cfg(not(unix))]
-async fn request_external_provider_shutdown(child: &mut tokio::process::Child) {
+async fn request_child_process_shutdown(child: &mut tokio::process::Child) {
     let _ = child.start_kill();
+}
+
+#[cfg(unix)]
+async fn force_child_process_shutdown(child: &mut tokio::process::Child) {
+    if signal_child_process_group(child, libc::SIGKILL).is_err() {
+        let _ = child.start_kill();
+    }
+}
+
+#[cfg(not(unix))]
+async fn force_child_process_shutdown(child: &mut tokio::process::Child) {
+    let _ = child.start_kill();
+}
+
+#[cfg(unix)]
+fn signal_child_process_group(
+    child: &mut tokio::process::Child,
+    signal: libc::c_int,
+) -> std::io::Result<()> {
+    let pid = child.id().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "child process pid is unavailable",
+        )
+    })? as libc::pid_t;
+    if pid <= 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "child process pid is unavailable",
+        ));
+    }
+    let result = unsafe { libc::kill(-pid, signal) };
+    if result == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn parse_external_provider_jsonl(stdout: &str) -> dicta_asr::AsrResult<dicta_asr::Transcript> {
@@ -6990,6 +7252,10 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    fn samples_for_ms(ms: u64) -> usize {
+        (STDIN_AUDIO_SAMPLE_RATE as usize * ms as usize) / 1000
     }
 
     fn write_test_provider_source(root: &Path, id: &str, version: &str) {
@@ -7552,6 +7818,31 @@ expected_latency_ms = 5000
             encoded,
             r#"{"type":"start","mode":"continuous","sample_rate":16000,"channels":1,"format":"pcm_s16le"}"#
         );
+    }
+
+    #[test]
+    fn local_endpoint_waits_for_voice_before_starting() {
+        let mut endpoint = LocalVoiceEndpoint::new();
+        let silence = vec![0; samples_for_ms(1_000)];
+
+        assert!(endpoint.push(&silence).is_empty());
+    }
+
+    #[test]
+    fn local_endpoint_starts_on_voice_and_stops_after_silence() {
+        let mut endpoint = LocalVoiceEndpoint::new();
+        let speech = vec![8_000; samples_for_ms(LOCAL_ENDPOINT_START_MS)];
+        let actions = endpoint.push(&speech);
+
+        assert!(matches!(
+            actions.as_slice(),
+            [LocalEndpointAction::Start, LocalEndpointAction::Audio(_)]
+        ));
+
+        let silence = vec![0; samples_for_ms(LOCAL_ENDPOINT_END_SILENCE_MS)];
+        let actions = endpoint.push(&silence);
+
+        assert!(matches!(actions.last(), Some(LocalEndpointAction::Stop)));
     }
 
     #[test]

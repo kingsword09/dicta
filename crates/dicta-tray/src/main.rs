@@ -1143,6 +1143,7 @@ impl TrayApp {
 
 fn main() -> Result<()> {
     let config = AppConfig::from_env();
+    let _instance_lock = acquire_tray_instance_lock()?;
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
 
     let proxy = event_loop.create_proxy();
@@ -1471,6 +1472,108 @@ fn sanitize_log_name(value: &str) -> String {
     } else {
         sanitized
     }
+}
+
+#[derive(Debug)]
+struct TrayInstanceLock {
+    path: PathBuf,
+    _file: File,
+}
+
+impl Drop for TrayInstanceLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_tray_instance_lock() -> Result<TrayInstanceLock> {
+    acquire_tray_instance_lock_at(tray_instance_lock_path())
+}
+
+fn acquire_tray_instance_lock_at(path: PathBuf) -> Result<TrayInstanceLock> {
+    loop {
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                writeln!(file, "{}", std::process::id())
+                    .with_context(|| format!("failed to write {}", path.display()))?;
+                return Ok(TrayInstanceLock { path, _file: file });
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                if tray_lock_is_stale(&path) {
+                    let _ = fs::remove_file(&path);
+                    continue;
+                }
+                bail!(
+                    "another dicta-tray instance is already running; quit it before starting a new one"
+                );
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to create tray lock {}", path.display()));
+            }
+        }
+    }
+}
+
+fn tray_instance_lock_path() -> PathBuf {
+    std::env::temp_dir().join("dicta-tray.lock")
+}
+
+fn tray_lock_is_stale(path: &PathBuf) -> bool {
+    let Some(pid) = fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| contents.trim().parse::<u32>().ok())
+    else {
+        return true;
+    };
+    !process_is_running(pid)
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(windows)]
+fn process_is_running(pid: u32) -> bool {
+    use std::ffi::c_void;
+
+    if pid == 0 {
+        return false;
+    }
+
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const WAIT_TIMEOUT: u32 = 0x0000_0102;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        #[link_name = "OpenProcess"]
+        fn open_process(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
+        #[link_name = "WaitForSingleObject"]
+        fn wait_for_single_object(handle: *mut c_void, milliseconds: u32) -> u32;
+        #[link_name = "CloseHandle"]
+        fn close_handle(handle: *mut c_void) -> i32;
+    }
+
+    let handle = unsafe { open_process(SYNCHRONIZE, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    let wait = unsafe { wait_for_single_object(handle, 0) };
+    let _ = unsafe { close_handle(handle) };
+    wait == WAIT_TIMEOUT
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_is_running(pid: u32) -> bool {
+    pid != 0
 }
 
 fn update_tray_icon(icon: &TrayIcon, app: &mut TrayApp) -> Result<()> {
@@ -1979,6 +2082,33 @@ mod tests {
         assert!(parse_hotkey_config("off").unwrap().is_none());
         assert!(parse_hotkey_config("").unwrap().is_none());
         assert!(parse_hotkey_config("ctrl+space+alt").is_err());
+    }
+
+    #[test]
+    fn tray_instance_lock_rejects_second_live_instance() {
+        let path = temp_test_path("dicta-tray-lock");
+        let first = acquire_tray_instance_lock_at(path.clone()).unwrap();
+
+        let second = acquire_tray_instance_lock_at(path.clone()).unwrap_err();
+
+        assert!(
+            second
+                .to_string()
+                .contains("another dicta-tray instance is already running")
+        );
+        drop(first);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn tray_instance_lock_removes_stale_lock() {
+        let path = temp_test_path("dicta-tray-lock-stale");
+        std::fs::write(&path, "0\n").unwrap();
+
+        let lock = acquire_tray_instance_lock_at(path.clone()).unwrap();
+
+        drop(lock);
+        assert!(!path.exists());
     }
 
     #[test]
