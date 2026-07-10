@@ -162,6 +162,106 @@ pub struct InputStreamInfo {
     pub channels: u16,
 }
 
+const RMS_GATE_INITIAL_NOISE_FLOOR_DB: f64 = -60.0;
+const RMS_GATE_NOISE_FLOOR_ALPHA: f64 = 0.05;
+const RMS_GATE_MIN_NOISE_FLOOR_DB: f64 = -90.0;
+const RMS_GATE_MAX_NOISE_FLOOR_DB: f64 = -25.0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RmsEnergyGateConfig {
+    pub reference_rms: f64,
+    pub noise_margin_db: f64,
+    pub min_threshold_db: f64,
+    pub max_threshold_db: f64,
+    pub reference_relax_db: f64,
+}
+
+impl Default for RmsEnergyGateConfig {
+    fn default() -> Self {
+        Self {
+            reference_rms: 300.0,
+            noise_margin_db: 12.0,
+            min_threshold_db: -50.0,
+            max_threshold_db: -30.0,
+            reference_relax_db: 6.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RmsEnergyGate {
+    config: RmsEnergyGateConfig,
+    noise_floor_db: f64,
+    peak_rms: f64,
+}
+
+impl RmsEnergyGate {
+    pub fn new(config: RmsEnergyGateConfig) -> Self {
+        Self {
+            config,
+            noise_floor_db: RMS_GATE_INITIAL_NOISE_FLOOR_DB,
+            peak_rms: 0.0,
+        }
+    }
+
+    pub fn is_voiced(&mut self, frame: &[i16], update_noise_floor: bool) -> bool {
+        let rms = frame_rms(frame);
+        self.peak_rms = self.peak_rms.max(rms);
+        let db = rms_to_dbfs(rms);
+        let voiced = db >= self.threshold_db();
+        if update_noise_floor && !voiced {
+            self.noise_floor_db = (self.noise_floor_db * (1.0 - RMS_GATE_NOISE_FLOOR_ALPHA)
+                + db * RMS_GATE_NOISE_FLOOR_ALPHA)
+                .clamp(RMS_GATE_MIN_NOISE_FLOOR_DB, RMS_GATE_MAX_NOISE_FLOOR_DB);
+        }
+        voiced
+    }
+
+    pub fn threshold_db(&self) -> f64 {
+        let adaptive = (self.noise_floor_db + self.config.noise_margin_db)
+            .clamp(self.config.min_threshold_db, self.config.max_threshold_db);
+        let reference_floor =
+            rms_to_dbfs(self.config.reference_rms) - self.config.reference_relax_db;
+        adaptive.max(reference_floor)
+    }
+
+    pub fn observed_peak_rms(&self) -> f64 {
+        self.peak_rms
+    }
+}
+
+impl Default for RmsEnergyGate {
+    fn default() -> Self {
+        Self::new(RmsEnergyGateConfig::default())
+    }
+}
+
+pub fn frame_rms(frame: &[i16]) -> f64 {
+    if frame.is_empty() {
+        return 0.0;
+    }
+    let sum = frame
+        .iter()
+        .map(|sample| {
+            let value = f64::from(*sample);
+            value * value
+        })
+        .sum::<f64>();
+    (sum / frame.len() as f64).sqrt()
+}
+
+pub fn rms_to_dbfs(rms: f64) -> f64 {
+    if rms <= f64::EPSILON {
+        return RMS_GATE_MIN_NOISE_FLOOR_DB;
+    }
+    let normalized = rms / f64::from(i16::MAX);
+    if normalized <= f64::EPSILON {
+        RMS_GATE_MIN_NOISE_FLOOR_DB
+    } else {
+        (20.0 * normalized.log10()).clamp(RMS_GATE_MIN_NOISE_FLOOR_DB, 0.0)
+    }
+}
+
 /// Handle to a live microphone capture stream. Dropping it stops capture and
 /// joins the audio thread.
 ///
@@ -467,5 +567,29 @@ mod tests {
             downmix_to_i16(&[100_i16, 300, -100, -300], 2),
             vec![200, -200]
         );
+    }
+
+    #[test]
+    fn frame_rms_returns_zero_for_silence() {
+        assert_eq!(frame_rms(&[0, 0, 0]), 0.0);
+    }
+
+    #[test]
+    fn frame_rms_returns_constant_sample_level() {
+        assert!((frame_rms(&[300, 300, 300]) - 300.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rms_to_dbfs_converts_relative_to_full_scale() {
+        assert!((rms_to_dbfs(300.0) - -40.77).abs() < 0.02);
+    }
+
+    #[test]
+    fn rms_energy_gate_tracks_peak_rms() {
+        let mut gate = RmsEnergyGate::default();
+
+        assert!(!gate.is_voiced(&[0; 320], true));
+        assert!(gate.is_voiced(&[8_000; 320], true));
+        assert!((gate.observed_peak_rms() - 8_000.0).abs() < 1.0);
     }
 }
