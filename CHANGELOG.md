@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.10.23](https://github.com/kingsword09/dicta/compare/v0.10.22...v0.10.23) - 2026-07-10
+
+### Other Changes
+- fix(live): pass provider chunk duration to endpointed audio by @kingsword09 in https://github.com/kingsword09/dicta/pull/67
+
 ## [v0.10.22](https://github.com/kingsword09/dicta/compare/v0.10.21...v0.10.22) - 2026-07-10
 
 ### Other Changes
