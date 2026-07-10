@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.10.24](https://github.com/kingsword09/dicta/compare/v0.10.23...v0.10.24) - 2026-07-10
+
+### Other Changes
+- fix(live): cancel stdin audio providers on shutdown by @kingsword09 in https://github.com/kingsword09/dicta/pull/69
+
 ## [v0.10.23](https://github.com/kingsword09/dicta/compare/v0.10.22...v0.10.23) - 2026-07-10
 
 ### Other Changes
