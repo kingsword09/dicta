@@ -6246,6 +6246,7 @@ struct DictaAudioCapture {
     resampler: IncrementalPcmResampler,
     endpoint: Option<LocalVoiceEndpoint>,
     src: Option<String>,
+    chunk_ms: Option<u64>,
     seq: u64,
 }
 
@@ -6289,6 +6290,7 @@ async fn start_dicta_audio_capture(
         resampler: IncrementalPcmResampler::new(info.sample_rate),
         endpoint: (!activation.requires_ptt()).then(LocalVoiceEndpoint::new),
         src: options.src.clone(),
+        chunk_ms: stdin_audio_chunk_ms(provider, options),
         seq: 0,
     };
     if capture.endpoint.is_none() {
@@ -6297,7 +6299,7 @@ async fn start_dicta_audio_capture(
             stdin,
             options.src.clone(),
             activation,
-            stdin_audio_chunk_ms(provider, options),
+            capture.chunk_ms,
         )
         .await?;
     }
@@ -6323,8 +6325,15 @@ async fn stop_dicta_audio_capture(
     }
     if let Some(endpoint) = active.endpoint.as_mut() {
         for action in endpoint.finish() {
-            send_endpoint_action(provider, stdin, active.src.clone(), &mut active.seq, action)
-                .await?;
+            send_endpoint_action(
+                provider,
+                stdin,
+                active.src.clone(),
+                active.chunk_ms,
+                &mut active.seq,
+                action,
+            )
+            .await?;
         }
     } else {
         send_stdin_audio_control(provider, stdin, ProviderStdinAudioEvent::Stop).await?;
@@ -6374,8 +6383,15 @@ async fn send_dicta_audio_pcm(
             endpoint.push(pcm)
         };
         for action in actions {
-            send_endpoint_action(provider, stdin, active.src.clone(), &mut active.seq, action)
-                .await?;
+            send_endpoint_action(
+                provider,
+                stdin,
+                active.src.clone(),
+                active.chunk_ms,
+                &mut active.seq,
+                action,
+            )
+            .await?;
         }
     } else {
         send_pcm16_frame(provider, stdin, &mut active.seq, pcm).await?;
@@ -6387,6 +6403,7 @@ async fn send_endpoint_action(
     provider: &ExternalProvider,
     stdin: &mut ChildStdin,
     src: Option<String>,
+    chunk_ms: Option<u64>,
     seq: &mut u64,
     action: LocalEndpointAction,
 ) -> dicta_asr::AsrResult<()> {
@@ -6397,7 +6414,7 @@ async fn send_endpoint_action(
                 stdin,
                 src,
                 RealtimeActivation::Continuous,
-                Some(LOCAL_ENDPOINT_MAX_MS),
+                chunk_ms,
             )
             .await
         }
