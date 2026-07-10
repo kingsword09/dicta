@@ -6135,16 +6135,14 @@ impl ExternalProvider {
                     interrupted = true;
                     shutdown_requested = true;
                     if let Some(stdin) = child_stdin.as_mut() {
-                        if capture.is_some() {
-                            stop_dicta_audio_capture(self, stdin, &mut capture).await.ok();
-                        } else {
-                            send_stdin_audio_control(self, stdin, ProviderStdinAudioEvent::Cancel).await.ok();
-                        }
+                        send_stdin_audio_control(self, stdin, ProviderStdinAudioEvent::Cancel).await.ok();
                     }
+                    drop(capture.take());
                     child_stdin.take();
+                    request_child_process_shutdown(&mut child).await;
                     shutdown_timer
                         .as_mut()
-                        .reset(TokioInstant::now() + Duration::from_secs(30));
+                        .reset(TokioInstant::now() + Duration::from_secs(5));
                 }
                 _ = &mut shutdown_timer, if shutdown_requested => {
                     force_child_process_shutdown(&mut child).await;
@@ -6155,15 +6153,14 @@ impl ExternalProvider {
                     let Some(_) = input? else {
                         shutdown_requested = true;
                         if let Some(stdin) = child_stdin.as_mut() {
-                            if capture.is_some() {
-                                stop_dicta_audio_capture(self, stdin, &mut capture).await.ok();
-                            }
                             send_stdin_audio_control(self, stdin, ProviderStdinAudioEvent::Cancel).await.ok();
                         }
+                        drop(capture.take());
                         child_stdin.take();
+                        request_child_process_shutdown(&mut child).await;
                         shutdown_timer
                             .as_mut()
-                            .reset(TokioInstant::now() + Duration::from_secs(30));
+                            .reset(TokioInstant::now() + Duration::from_secs(5));
                         continue;
                     };
                     let stdin = child_stdin.as_mut().ok_or_else(|| {
