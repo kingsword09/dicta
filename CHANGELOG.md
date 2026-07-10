@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.10.22](https://github.com/kingsword09/dicta/compare/v0.10.21...v0.10.22) - 2026-07-10
+
+### Other Changes
+- feat(live): add local endpointing for dicta-owned audio by @kingsword09 in https://github.com/kingsword09/dicta/pull/65
+
 ## [v0.10.21](https://github.com/kingsword09/dicta/compare/v0.10.20...v0.10.21) - 2026-07-09
 
 ### Other Changes
