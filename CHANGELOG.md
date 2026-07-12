@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.10.28](https://github.com/kingsword09/dicta/compare/v0.10.27...v0.10.28) - 2026-07-12
+
+### Other Changes
+- build(release): add size-optimized distribution profile by @kingsword09 in https://github.com/kingsword09/dicta/pull/77
+
 ## [v0.10.27](https://github.com/kingsword09/dicta/compare/v0.10.26...v0.10.27) - 2026-07-12
 
 ### Other Changes
