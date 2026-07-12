@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.10.26](https://github.com/kingsword09/dicta/compare/v0.10.25...v0.10.26) - 2026-07-12
+
+### Other Changes
+- ci: upload a single release archive per platform by @kingsword09 in https://github.com/kingsword09/dicta/pull/73
+
 ## [v0.10.25](https://github.com/kingsword09/dicta/compare/v0.10.24...v0.10.25) - 2026-07-12
 
 ### Other Changes
