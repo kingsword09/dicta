@@ -655,6 +655,7 @@ version = "0.10.24"
 dependencies = [
  "cc",
  "cpal",
+ "earshot",
  "hound",
  "thiserror 2.0.18",
 ]
@@ -846,6 +847,12 @@ name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
+name = "earshot"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7984231f8b4c72eb3b88c70040dc1e4ff6803fa9169e93c0ac465942d74fa36a"
 
 [[package]]
 name = "encoding_rs"
