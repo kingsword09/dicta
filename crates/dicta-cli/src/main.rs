@@ -39,6 +39,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{cmp, env};
+use terminal_size::{Width, terminal_size_of};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::process::ChildStdin;
@@ -57,6 +58,7 @@ const PROVIDER_STDERR_TAIL_LINES: usize = 20;
 const STDIN_AUDIO_SAMPLE_RATE: u32 = dicta_audio::VOICE_ENDPOINT_SAMPLE_RATE;
 const ENV_LIVE_APPEND_ONLY: &str = "DICTA_LIVE_APPEND_ONLY";
 const UI_LAUNCH_GRACE: Duration = Duration::from_millis(700);
+const MAX_VOLATILE_ROWS: usize = 4;
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "dicta")]
@@ -2405,7 +2407,7 @@ struct LiveRenderer {
     pending: Vec<TranscriptEvent>,
     status: Option<LiveStatusEvent>,
     volatile: Vec<LiveVolatileEvent>,
-    live_region_lines: usize,
+    rendered_live_lines: Vec<String>,
     append_only: bool,
 }
 
@@ -2494,7 +2496,7 @@ impl LiveRenderer {
             pending: Vec::new(),
             status: None,
             volatile: Vec::new(),
-            live_region_lines: 0,
+            rendered_live_lines: Vec::new(),
             append_only,
         })
     }
@@ -2706,7 +2708,7 @@ impl LiveRenderer {
         }
     }
 
-    fn live_region_lines(&self) -> Vec<String> {
+    fn live_region_lines(&self, terminal_width: usize) -> Vec<String> {
         if self.json_mode || self.append_only {
             return Vec::new();
         }
@@ -2750,12 +2752,22 @@ impl LiveRenderer {
             } else {
                 String::new()
             };
+            let prefix_width =
+                pad + if self.show_channel_label {
+                    display_width(channel_label(volatile.channel)) + 2
+                } else {
+                    0
+                } + display_width("... ");
+            let preview_width = terminal_width
+                .saturating_mul(MAX_VOLATILE_ROWS)
+                .saturating_sub(prefix_width);
+            let text = live_text_preview(&volatile.text, preview_width);
             lines.push(format!(
                 "{:pad$}{}{}{}",
                 "",
                 label,
                 ansi256(240, "... "),
-                ansi256(244, &volatile.text),
+                ansi256(244, &text),
                 pad = pad
             ));
         }
@@ -2767,23 +2779,24 @@ impl LiveRenderer {
             return;
         }
         self.clear_live_region();
-        let lines = self.live_region_lines();
         let width = terminal_width();
+        let lines = self.live_region_lines(width);
         for line in &lines {
             println!("{line}");
         }
-        self.live_region_lines = lines.iter().map(|line| physical_rows(line, width)).sum();
+        self.rendered_live_lines = lines;
     }
 
     fn clear_live_region(&mut self) {
-        if self.json_mode || self.append_only || self.live_region_lines == 0 {
+        if self.json_mode || self.append_only || self.rendered_live_lines.is_empty() {
             return;
         }
-        for _ in 0..self.live_region_lines {
+        let rows = rendered_region_rows(&self.rendered_live_lines, terminal_width());
+        for _ in 0..rows {
             print!("\r\x1b[A\x1b[2K");
         }
         let _ = io::stdout().flush();
-        self.live_region_lines = 0;
+        self.rendered_live_lines.clear();
     }
 
     fn source_column_pad(&self) -> usize {
@@ -3119,17 +3132,57 @@ fn set_terminal_mode(fd: libc::c_int, mode: &libc::termios) -> io::Result<()> {
 }
 
 fn terminal_width() -> usize {
-    env::var("COLUMNS")
-        .ok()
-        .and_then(|value| value.parse().ok())
+    // Redraw must use stdout's actual geometry; stale COLUMNS values can make
+    // clear_live_region move above the live area and erase committed output.
+    let detected = terminal_size_of(io::stdout()).map(|(Width(width), _)| usize::from(width));
+    let columns = env::var("COLUMNS").ok();
+    resolve_terminal_width(detected, columns.as_deref())
+}
+
+fn resolve_terminal_width(detected: Option<usize>, columns: Option<&str>) -> usize {
+    detected
         .filter(|width| *width > 0)
+        .or_else(|| {
+            columns
+                .and_then(|value| value.parse().ok())
+                .filter(|width| *width > 0)
+        })
         .unwrap_or(80)
 }
 
 fn physical_rows(line: &str, terminal_width: usize) -> usize {
     let terminal_width = cmp::max(1, terminal_width);
-    let width = display_width(&strip_ansi(line));
-    cmp::max(1, width.div_ceil(terminal_width))
+    strip_ansi(line)
+        .split('\n')
+        .map(|segment| cmp::max(1, display_width(segment).div_ceil(terminal_width)))
+        .sum()
+}
+
+fn rendered_region_rows(lines: &[String], terminal_width: usize) -> usize {
+    lines
+        .iter()
+        .map(|line| physical_rows(line, terminal_width))
+        .sum()
+}
+
+fn live_text_preview(text: &str, max_width: usize) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if display_width(&text) <= max_width {
+        return text;
+    }
+
+    let mut width = 0;
+    let mut suffix = Vec::new();
+    for ch in text.chars().rev() {
+        let char_width = if is_wide_char(ch) { 2 } else { 1 };
+        if width + char_width > max_width {
+            break;
+        }
+        width += char_width;
+        suffix.push(ch);
+    }
+    suffix.reverse();
+    suffix.into_iter().collect()
 }
 
 fn strip_ansi(line: &str) -> String {
@@ -7053,6 +7106,46 @@ fn default_model_for_name(backend: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_width_prefers_detected_terminal_over_columns() {
+        assert_eq!(resolve_terminal_width(Some(160), Some("80")), 160);
+        assert_eq!(resolve_terminal_width(None, Some("120")), 120);
+        assert_eq!(resolve_terminal_width(Some(0), Some("100")), 100);
+        assert_eq!(resolve_terminal_width(None, Some("invalid")), 80);
+        assert_eq!(resolve_terminal_width(None, Some("0")), 80);
+    }
+
+    #[test]
+    fn physical_rows_use_detected_wide_terminal_width() {
+        let line = "x".repeat(100);
+        assert_eq!(physical_rows(&line, 160), 1);
+        assert_eq!(physical_rows(&line, 80), 2);
+    }
+
+    #[test]
+    fn physical_rows_handle_long_wide_and_explicitly_multiline_text() {
+        let long_chinese = ansi256(244, &"中".repeat(481));
+        assert_eq!(physical_rows(&long_chinese, 80), 13);
+        assert_eq!(physical_rows("first\nsecond\n", 80), 3);
+    }
+
+    #[test]
+    fn rendered_region_rows_reflow_when_terminal_width_changes() {
+        let lines = vec!["x".repeat(200), "status".to_owned()];
+        assert_eq!(rendered_region_rows(&lines, 80), 4);
+        assert_eq!(rendered_region_rows(&lines, 160), 3);
+    }
+
+    #[test]
+    fn live_text_preview_keeps_recent_text_within_row_budget() {
+        let text = "这是很长的实时转写内容".repeat(30);
+        let preview = live_text_preview(&text, 160);
+
+        assert!(display_width(&preview) <= 160);
+        assert!(text.ends_with(&preview));
+    }
+
     fn test_cli() -> Cli {
         Cli {
             asr: AsrBackend::Auto,
@@ -8659,8 +8752,31 @@ live_enabled = false
             }))
             .unwrap();
 
-        assert!(renderer.live_region_lines().is_empty());
-        assert_eq!(renderer.live_region_lines, 0);
+        assert!(renderer.live_region_lines(80).is_empty());
+        assert!(renderer.rendered_live_lines.is_empty());
+    }
+
+    #[test]
+    fn live_renderer_bounds_long_volatile_region_without_losing_full_text() {
+        let text = "这是一段持续很久的实时语音转写内容".repeat(100);
+        let mut renderer = LiveRenderer::new_with_rendering(
+            false,
+            false,
+            None,
+            false,
+            Some("zh-CN".to_owned()),
+            None,
+        )
+        .unwrap();
+        renderer.set_volatile(LiveVolatileEvent {
+            channel: AudioChannel::Mic,
+            text: text.clone(),
+        });
+
+        let lines = renderer.live_region_lines(80);
+        assert_eq!(lines.len(), 1);
+        assert!(physical_rows(&lines[0], 80) <= MAX_VOLATILE_ROWS);
+        assert_eq!(renderer.volatile[0].text, text);
     }
 
     #[test]
