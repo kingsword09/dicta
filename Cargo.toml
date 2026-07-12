@@ -51,3 +51,10 @@ dicta-asr-openai-compatible = { path = "crates/dicta-asr-openai-compatible" }
 dicta-audio = { path = "crates/dicta-audio" }
 dicta-core = { path = "crates/dicta-core" }
 wry = { version = "0.55.1", features = ["transparent"] }
+
+[profile.dist]
+inherits = "release"
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
