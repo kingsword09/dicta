@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.10.25](https://github.com/kingsword09/dicta/compare/v0.10.24...v0.10.25) - 2026-07-12
+
+### Other Changes
+- feat(audio): replace RMS endpointing with earshot VAD by @kingsword09 in https://github.com/kingsword09/dicta/pull/71
+
 ## [v0.10.24](https://github.com/kingsword09/dicta/compare/v0.10.23...v0.10.24) - 2026-07-10
 
 ### Other Changes
