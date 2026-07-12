@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.10.27](https://github.com/kingsword09/dicta/compare/v0.10.26...v0.10.27) - 2026-07-12
+
+### Other Changes
+- fix(cli): bound live redraws and preserve terminal history by @kingsword09 in https://github.com/kingsword09/dicta/pull/75
+
 ## [v0.10.26](https://github.com/kingsword09/dicta/compare/v0.10.25...v0.10.26) - 2026-07-12
 
 ### Other Changes
