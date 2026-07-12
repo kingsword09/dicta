@@ -143,8 +143,6 @@ jobs:
       - name: Package archive
         id: pkg
         run: |
-          TAG="${{ needs.tagpr.outputs.tagpr-tag }}"
-          VERSION="${TAG#v}"
           BIN="${{ matrix.bin }}"
           TRAY_BIN="${{ matrix.tray_bin }}"
           STAGE="$(mktemp -d)"
@@ -155,17 +153,13 @@ jobs:
             cp "$ADAPTER_BIN" "$STAGE/dicta-adapter-apple-speech"
           fi
           cp LICENSE README.md "$STAGE/"
-          ARCHIVE="dicta_v${VERSION}_${{ matrix.archive_suffix }}.${{ matrix.archive_ext }}"
-          LATEST_ARCHIVE="dicta_${{ matrix.archive_suffix }}.${{ matrix.archive_ext }}"
+          ARCHIVE="dicta_${{ matrix.archive_suffix }}.${{ matrix.archive_ext }}"
           if [ "${{ matrix.archive_ext }}" = "zip" ]; then
             7z a "$ARCHIVE" "$STAGE"/*
-            cp "$ARCHIVE" "$LATEST_ARCHIVE"
           else
             tar -C "$STAGE" -czf "$ARCHIVE" .
-            cp "$ARCHIVE" "$LATEST_ARCHIVE"
           fi
           echo "archive=${ARCHIVE}" >> "$GITHUB_OUTPUT"
-          echo "latest_archive=${LATEST_ARCHIVE}" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Upload assets to release
@@ -174,7 +168,6 @@ jobs:
         run: |
           gh release upload "${{ needs.tagpr.outputs.tagpr-tag }}" \
             "${{ steps.pkg.outputs.archive }}" \
-            "${{ steps.pkg.outputs.latest_archive }}" \
             --clobber
         shell: bash
 
