@@ -54,14 +54,7 @@ const DEFAULT_PROVIDER_SCOPE: &str = "dicta-asr";
 const DEFAULT_PROVIDER_KEYWORD: &str = "dicta-provider";
 const PROVIDER_INSTALL_METADATA_FILE: &str = ".dicta-provider-install.json";
 const PROVIDER_STDERR_TAIL_LINES: usize = 20;
-const STDIN_AUDIO_SAMPLE_RATE: u32 = 16_000;
-const LOCAL_ENDPOINT_FRAME_MS: u64 = 20;
-const LOCAL_ENDPOINT_FRAME_SAMPLES: usize =
-    (STDIN_AUDIO_SAMPLE_RATE as usize * LOCAL_ENDPOINT_FRAME_MS as usize) / 1000;
-const LOCAL_ENDPOINT_PREROLL_MS: u64 = 300;
-const LOCAL_ENDPOINT_START_MS: u64 = 160;
-const LOCAL_ENDPOINT_END_SILENCE_MS: u64 = 900;
-const LOCAL_ENDPOINT_MAX_MS: u64 = 30_000;
+const STDIN_AUDIO_SAMPLE_RATE: u32 = dicta_audio::VOICE_ENDPOINT_SAMPLE_RATE;
 const ENV_LIVE_APPEND_ONLY: &str = "DICTA_LIVE_APPEND_ONLY";
 const UI_LAUNCH_GRACE: Duration = Duration::from_millis(700);
 
@@ -6241,7 +6234,7 @@ struct DictaAudioCapture {
     handle: Option<dicta_audio::InputStreamHandle>,
     frames: mpsc::Receiver<Vec<i16>>,
     resampler: IncrementalPcmResampler,
-    endpoint: Option<LocalVoiceEndpoint>,
+    endpoint: Option<dicta_audio::VoiceEndpoint>,
     src: Option<String>,
     chunk_ms: Option<u64>,
     seq: u64,
@@ -6285,7 +6278,7 @@ async fn start_dicta_audio_capture(
         handle: Some(handle),
         frames,
         resampler: IncrementalPcmResampler::new(info.sample_rate),
-        endpoint: (!activation.requires_ptt()).then(LocalVoiceEndpoint::new),
+        endpoint: (!activation.requires_ptt()).then(dicta_audio::VoiceEndpoint::new),
         src: options.src.clone(),
         chunk_ms: stdin_audio_chunk_ms(provider, options),
         seq: 0,
@@ -6402,10 +6395,10 @@ async fn send_endpoint_action(
     src: Option<String>,
     chunk_ms: Option<u64>,
     seq: &mut u64,
-    action: LocalEndpointAction,
+    action: dicta_audio::VoiceEndpointAction,
 ) -> dicta_asr::AsrResult<()> {
     match action {
-        LocalEndpointAction::Start => {
+        dicta_audio::VoiceEndpointAction::Start => {
             send_stdin_audio_start(
                 provider,
                 stdin,
@@ -6415,8 +6408,10 @@ async fn send_endpoint_action(
             )
             .await
         }
-        LocalEndpointAction::Audio(pcm) => send_pcm16_frame(provider, stdin, seq, &pcm).await,
-        LocalEndpointAction::Stop => {
+        dicta_audio::VoiceEndpointAction::Audio(pcm) => {
+            send_pcm16_frame(provider, stdin, seq, &pcm).await
+        }
+        dicta_audio::VoiceEndpointAction::Stop => {
             send_stdin_audio_control(provider, stdin, ProviderStdinAudioEvent::Stop).await
         }
     }
@@ -6442,136 +6437,6 @@ async fn send_stdin_audio_start(
         },
     )
     .await
-}
-
-#[derive(Debug)]
-struct LocalVoiceEndpoint {
-    frame_buffer: Vec<i16>,
-    pre_roll: VecDeque<i16>,
-    in_speech: bool,
-    speech_streak_ms: u64,
-    silence_ms: u64,
-    utterance_ms: u64,
-    gate: dicta_audio::RmsEnergyGate,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum LocalEndpointAction {
-    Start,
-    Audio(Vec<i16>),
-    Stop,
-}
-
-impl LocalVoiceEndpoint {
-    fn new() -> Self {
-        Self {
-            frame_buffer: Vec::new(),
-            pre_roll: VecDeque::with_capacity(local_endpoint_preroll_samples()),
-            in_speech: false,
-            speech_streak_ms: 0,
-            silence_ms: 0,
-            utterance_ms: 0,
-            gate: dicta_audio::RmsEnergyGate::default(),
-        }
-    }
-
-    fn push(&mut self, samples: &[i16]) -> Vec<LocalEndpointAction> {
-        self.frame_buffer.extend_from_slice(samples);
-        let mut actions = Vec::new();
-        while self.frame_buffer.len() >= LOCAL_ENDPOINT_FRAME_SAMPLES {
-            let frame = self
-                .frame_buffer
-                .drain(..LOCAL_ENDPOINT_FRAME_SAMPLES)
-                .collect::<Vec<_>>();
-            actions.extend(self.push_frame(frame));
-        }
-        actions
-    }
-
-    fn finish(&mut self) -> Vec<LocalEndpointAction> {
-        let mut actions = Vec::new();
-        if !self.frame_buffer.is_empty() {
-            let frame = std::mem::take(&mut self.frame_buffer);
-            actions.extend(self.push_frame(frame));
-        }
-        if self.in_speech {
-            self.reset_utterance();
-            actions.push(LocalEndpointAction::Stop);
-        }
-        actions
-    }
-
-    fn push_frame(&mut self, frame: Vec<i16>) -> Vec<LocalEndpointAction> {
-        let voiced = self.is_voiced(&frame);
-        if self.in_speech {
-            return self.push_speech_frame(frame, voiced);
-        }
-        self.push_idle_frame(frame, voiced)
-    }
-
-    fn push_idle_frame(&mut self, frame: Vec<i16>, voiced: bool) -> Vec<LocalEndpointAction> {
-        self.push_pre_roll(&frame);
-        if voiced {
-            self.speech_streak_ms += LOCAL_ENDPOINT_FRAME_MS;
-        } else {
-            self.speech_streak_ms = 0;
-        }
-        if self.speech_streak_ms < LOCAL_ENDPOINT_START_MS {
-            return Vec::new();
-        }
-
-        self.in_speech = true;
-        self.silence_ms = 0;
-        self.utterance_ms = self.speech_streak_ms.min(LOCAL_ENDPOINT_PREROLL_MS);
-        let audio = self.pre_roll.iter().copied().collect::<Vec<_>>();
-        self.pre_roll.clear();
-        vec![
-            LocalEndpointAction::Start,
-            LocalEndpointAction::Audio(audio),
-        ]
-    }
-
-    fn push_speech_frame(&mut self, frame: Vec<i16>, voiced: bool) -> Vec<LocalEndpointAction> {
-        self.utterance_ms += LOCAL_ENDPOINT_FRAME_MS;
-        if voiced {
-            self.silence_ms = 0;
-        } else {
-            self.silence_ms += LOCAL_ENDPOINT_FRAME_MS;
-        }
-
-        let mut actions = vec![LocalEndpointAction::Audio(frame)];
-        if self.silence_ms >= LOCAL_ENDPOINT_END_SILENCE_MS
-            || self.utterance_ms >= LOCAL_ENDPOINT_MAX_MS
-        {
-            self.reset_utterance();
-            actions.push(LocalEndpointAction::Stop);
-        }
-        actions
-    }
-
-    fn push_pre_roll(&mut self, frame: &[i16]) {
-        self.pre_roll.extend(frame.iter().copied());
-        let max = local_endpoint_preroll_samples();
-        while self.pre_roll.len() > max {
-            self.pre_roll.pop_front();
-        }
-    }
-
-    fn reset_utterance(&mut self) {
-        self.in_speech = false;
-        self.speech_streak_ms = 0;
-        self.silence_ms = 0;
-        self.utterance_ms = 0;
-        self.pre_roll.clear();
-    }
-
-    fn is_voiced(&mut self, frame: &[i16]) -> bool {
-        self.gate.is_voiced(frame, !self.in_speech)
-    }
-}
-
-fn local_endpoint_preroll_samples() -> usize {
-    (STDIN_AUDIO_SAMPLE_RATE as usize * LOCAL_ENDPOINT_PREROLL_MS as usize) / 1000
 }
 
 async fn read_dicta_audio_frame(capture: &mut Option<DictaAudioCapture>) -> Option<Vec<i16>> {
@@ -7268,10 +7133,6 @@ mod tests {
         ))
     }
 
-    fn samples_for_ms(ms: u64) -> usize {
-        (STDIN_AUDIO_SAMPLE_RATE as usize * ms as usize) / 1000
-    }
-
     fn write_test_provider_source(root: &Path, id: &str, version: &str) {
         std::fs::create_dir_all(root.join("bin")).unwrap();
         std::fs::write(
@@ -7832,31 +7693,6 @@ expected_latency_ms = 5000
             encoded,
             r#"{"type":"start","mode":"continuous","sample_rate":16000,"channels":1,"format":"pcm_s16le"}"#
         );
-    }
-
-    #[test]
-    fn local_endpoint_waits_for_voice_before_starting() {
-        let mut endpoint = LocalVoiceEndpoint::new();
-        let silence = vec![0; samples_for_ms(1_000)];
-
-        assert!(endpoint.push(&silence).is_empty());
-    }
-
-    #[test]
-    fn local_endpoint_starts_on_voice_and_stops_after_silence() {
-        let mut endpoint = LocalVoiceEndpoint::new();
-        let speech = vec![8_000; samples_for_ms(LOCAL_ENDPOINT_START_MS)];
-        let actions = endpoint.push(&speech);
-
-        assert!(matches!(
-            actions.as_slice(),
-            [LocalEndpointAction::Start, LocalEndpointAction::Audio(_)]
-        ));
-
-        let silence = vec![0; samples_for_ms(LOCAL_ENDPOINT_END_SILENCE_MS)];
-        let actions = endpoint.push(&silence);
-
-        assert!(matches!(actions.last(), Some(LocalEndpointAction::Stop)));
     }
 
     #[test]

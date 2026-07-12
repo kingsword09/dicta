@@ -1,5 +1,6 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, SampleRate, StreamConfig, SupportedStreamConfig};
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -162,104 +163,268 @@ pub struct InputStreamInfo {
     pub channels: u16,
 }
 
-const RMS_GATE_INITIAL_NOISE_FLOOR_DB: f64 = -60.0;
-const RMS_GATE_NOISE_FLOOR_ALPHA: f64 = 0.05;
-const RMS_GATE_MIN_NOISE_FLOOR_DB: f64 = -90.0;
-const RMS_GATE_MAX_NOISE_FLOOR_DB: f64 = -25.0;
+pub const VOICE_ENDPOINT_SAMPLE_RATE: u32 = 16_000;
+pub const EARSHOT_VAD_FRAME_SAMPLES: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct RmsEnergyGateConfig {
-    pub reference_rms: f64,
-    pub noise_margin_db: f64,
-    pub min_threshold_db: f64,
-    pub max_threshold_db: f64,
-    pub reference_relax_db: f64,
+pub struct VoiceEndpointConfig {
+    pub sample_rate: u32,
+    pub speech_threshold: f32,
+    pub start_confirm_ms: u64,
+    pub start_padding_ms: u64,
+    pub end_silence_ms: u64,
+    pub max_utterance_ms: u64,
 }
 
-impl Default for RmsEnergyGateConfig {
+impl Default for VoiceEndpointConfig {
     fn default() -> Self {
         Self {
-            reference_rms: 300.0,
-            noise_margin_db: 12.0,
-            min_threshold_db: -50.0,
-            max_threshold_db: -30.0,
-            reference_relax_db: 6.0,
+            sample_rate: VOICE_ENDPOINT_SAMPLE_RATE,
+            speech_threshold: 0.5,
+            start_confirm_ms: 160,
+            start_padding_ms: 300,
+            end_silence_ms: 900,
+            max_utterance_ms: 30_000,
         }
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct RmsEnergyGate {
-    config: RmsEnergyGateConfig,
-    noise_floor_db: f64,
-    peak_rms: f64,
+pub trait VoiceActivityDetector: Send {
+    fn sample_rate(&self) -> u32;
+    fn frame_samples(&self) -> usize;
+    fn predict_i16(&mut self, frame: &[i16], update_background: bool) -> f32;
+    fn reset(&mut self);
 }
 
-impl RmsEnergyGate {
-    pub fn new(config: RmsEnergyGateConfig) -> Self {
+pub struct EarshotVadDetector {
+    detector: Box<earshot::Detector>,
+}
+
+impl EarshotVadDetector {
+    pub fn new() -> Self {
+        Self {
+            detector: earshot::Detector::default_boxed(),
+        }
+    }
+}
+
+impl Default for EarshotVadDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VoiceActivityDetector for EarshotVadDetector {
+    fn sample_rate(&self) -> u32 {
+        VOICE_ENDPOINT_SAMPLE_RATE
+    }
+
+    fn frame_samples(&self) -> usize {
+        EARSHOT_VAD_FRAME_SAMPLES
+    }
+
+    fn predict_i16(&mut self, frame: &[i16], _update_background: bool) -> f32 {
+        self.detector.predict_i16(frame).clamp(0.0, 1.0)
+    }
+
+    fn reset(&mut self) {
+        self.detector.reset();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VoiceEndpointAction {
+    Start,
+    Audio(Vec<i16>),
+    Stop,
+}
+
+pub struct VoiceEndpoint {
+    config: VoiceEndpointConfig,
+    detector: Box<dyn VoiceActivityDetector>,
+    frame_buffer: Vec<i16>,
+    pre_roll: VecDeque<i16>,
+    in_speech: bool,
+    speech_streak_samples: u64,
+    silence_samples: u64,
+    utterance_samples: u64,
+}
+
+impl VoiceEndpoint {
+    pub fn new() -> Self {
+        Self::new_with_detector(
+            VoiceEndpointConfig::default(),
+            Box::new(EarshotVadDetector::new()),
+        )
+    }
+
+    pub fn new_with_detector(
+        config: VoiceEndpointConfig,
+        detector: Box<dyn VoiceActivityDetector>,
+    ) -> Self {
+        let sample_rate = if config.sample_rate == 0 {
+            detector.sample_rate()
+        } else {
+            config.sample_rate
+        };
+        let config = VoiceEndpointConfig {
+            sample_rate: sample_rate.max(1),
+            speech_threshold: config.speech_threshold.clamp(0.0, 1.0),
+            ..config
+        };
         Self {
             config,
-            noise_floor_db: RMS_GATE_INITIAL_NOISE_FLOOR_DB,
-            peak_rms: 0.0,
+            detector,
+            frame_buffer: Vec::new(),
+            pre_roll: VecDeque::with_capacity(samples_for_ms(
+                config.sample_rate,
+                config.start_padding_ms,
+            )),
+            in_speech: false,
+            speech_streak_samples: 0,
+            silence_samples: 0,
+            utterance_samples: 0,
         }
     }
 
-    pub fn is_voiced(&mut self, frame: &[i16], update_noise_floor: bool) -> bool {
-        let rms = frame_rms(frame);
-        self.peak_rms = self.peak_rms.max(rms);
-        let db = rms_to_dbfs(rms);
-        let voiced = db >= self.threshold_db();
-        if update_noise_floor && !voiced {
-            self.noise_floor_db = (self.noise_floor_db * (1.0 - RMS_GATE_NOISE_FLOOR_ALPHA)
-                + db * RMS_GATE_NOISE_FLOOR_ALPHA)
-                .clamp(RMS_GATE_MIN_NOISE_FLOOR_DB, RMS_GATE_MAX_NOISE_FLOOR_DB);
+    pub fn push(&mut self, samples: &[i16]) -> Vec<VoiceEndpointAction> {
+        self.frame_buffer.extend_from_slice(samples);
+        let mut actions = Vec::new();
+        let frame_samples = self.detector.frame_samples().max(1);
+        while self.frame_buffer.len() >= frame_samples {
+            let frame = self.frame_buffer.drain(..frame_samples).collect::<Vec<_>>();
+            actions.extend(self.push_frame(frame));
         }
-        voiced
+        actions
     }
 
-    pub fn threshold_db(&self) -> f64 {
-        let adaptive = (self.noise_floor_db + self.config.noise_margin_db)
-            .clamp(self.config.min_threshold_db, self.config.max_threshold_db);
-        let reference_floor =
-            rms_to_dbfs(self.config.reference_rms) - self.config.reference_relax_db;
-        adaptive.max(reference_floor)
+    pub fn finish(&mut self) -> Vec<VoiceEndpointAction> {
+        let mut actions = Vec::new();
+        if !self.frame_buffer.is_empty() {
+            actions.extend(self.push_tail_frame());
+        }
+        if self.in_speech {
+            self.reset_utterance();
+            actions.push(VoiceEndpointAction::Stop);
+        }
+        actions
     }
 
-    pub fn observed_peak_rms(&self) -> f64 {
-        self.peak_rms
+    pub fn reset(&mut self) {
+        self.frame_buffer.clear();
+        self.pre_roll.clear();
+        self.reset_utterance();
+        self.detector.reset();
+    }
+
+    fn push_tail_frame(&mut self) -> Vec<VoiceEndpointAction> {
+        let frame = std::mem::take(&mut self.frame_buffer);
+        let mut vad_frame = frame.clone();
+        vad_frame.resize(self.detector.frame_samples().max(1), 0);
+        let score = self.predict_score(&vad_frame);
+        if self.in_speech {
+            return self.push_speech_frame(frame, score);
+        }
+        self.push_idle_frame(frame, score)
+    }
+
+    fn push_frame(&mut self, frame: Vec<i16>) -> Vec<VoiceEndpointAction> {
+        let score = self.predict_score(&frame);
+        if self.in_speech {
+            return self.push_speech_frame(frame, score);
+        }
+        self.push_idle_frame(frame, score)
+    }
+
+    fn push_idle_frame(&mut self, frame: Vec<i16>, score: f32) -> Vec<VoiceEndpointAction> {
+        let samples = frame.len() as u64;
+        self.push_pre_roll(&frame);
+        if self.is_speech_score(score) {
+            self.speech_streak_samples += samples;
+        } else {
+            self.speech_streak_samples = 0;
+        }
+        if self.speech_streak_samples < self.start_confirm_samples() {
+            return Vec::new();
+        }
+
+        self.in_speech = true;
+        self.silence_samples = 0;
+        let audio = self.pre_roll.iter().copied().collect::<Vec<_>>();
+        self.utterance_samples = audio.len() as u64;
+        self.pre_roll.clear();
+        vec![
+            VoiceEndpointAction::Start,
+            VoiceEndpointAction::Audio(audio),
+        ]
+    }
+
+    fn push_speech_frame(&mut self, frame: Vec<i16>, score: f32) -> Vec<VoiceEndpointAction> {
+        let samples = frame.len() as u64;
+        self.utterance_samples += samples;
+        if self.is_speech_score(score) {
+            self.silence_samples = 0;
+        } else {
+            self.silence_samples += samples;
+        }
+
+        let mut actions = vec![VoiceEndpointAction::Audio(frame)];
+        if self.silence_samples >= self.end_silence_samples()
+            || self.utterance_samples >= self.max_utterance_samples()
+        {
+            self.reset_utterance();
+            actions.push(VoiceEndpointAction::Stop);
+        }
+        actions
+    }
+
+    fn push_pre_roll(&mut self, frame: &[i16]) {
+        self.pre_roll.extend(frame.iter().copied());
+        let max = samples_for_ms(self.config.sample_rate, self.config.start_padding_ms);
+        while self.pre_roll.len() > max {
+            self.pre_roll.pop_front();
+        }
+    }
+
+    fn reset_utterance(&mut self) {
+        self.in_speech = false;
+        self.speech_streak_samples = 0;
+        self.silence_samples = 0;
+        self.utterance_samples = 0;
+        self.pre_roll.clear();
+    }
+
+    fn predict_score(&mut self, frame: &[i16]) -> f32 {
+        self.detector
+            .predict_i16(frame, !self.in_speech)
+            .clamp(0.0, 1.0)
+    }
+
+    fn is_speech_score(&self, score: f32) -> bool {
+        score >= self.config.speech_threshold
+    }
+
+    fn start_confirm_samples(&self) -> u64 {
+        samples_for_ms(self.config.sample_rate, self.config.start_confirm_ms) as u64
+    }
+
+    fn end_silence_samples(&self) -> u64 {
+        samples_for_ms(self.config.sample_rate, self.config.end_silence_ms) as u64
+    }
+
+    fn max_utterance_samples(&self) -> u64 {
+        samples_for_ms(self.config.sample_rate, self.config.max_utterance_ms) as u64
     }
 }
 
-impl Default for RmsEnergyGate {
+impl Default for VoiceEndpoint {
     fn default() -> Self {
-        Self::new(RmsEnergyGateConfig::default())
+        Self::new()
     }
 }
 
-pub fn frame_rms(frame: &[i16]) -> f64 {
-    if frame.is_empty() {
-        return 0.0;
-    }
-    let sum = frame
-        .iter()
-        .map(|sample| {
-            let value = f64::from(*sample);
-            value * value
-        })
-        .sum::<f64>();
-    (sum / frame.len() as f64).sqrt()
-}
-
-pub fn rms_to_dbfs(rms: f64) -> f64 {
-    if rms <= f64::EPSILON {
-        return RMS_GATE_MIN_NOISE_FLOOR_DB;
-    }
-    let normalized = rms / f64::from(i16::MAX);
-    if normalized <= f64::EPSILON {
-        RMS_GATE_MIN_NOISE_FLOOR_DB
-    } else {
-        (20.0 * normalized.log10()).clamp(RMS_GATE_MIN_NOISE_FLOOR_DB, 0.0)
-    }
+fn samples_for_ms(sample_rate: u32, ms: u64) -> usize {
+    ((u64::from(sample_rate) * ms) / 1000) as usize
 }
 
 /// Handle to a live microphone capture stream. Dropping it stops capture and
@@ -547,6 +712,33 @@ impl IntoSampleI16 for u16 {
 mod tests {
     use super::*;
 
+    #[derive(Debug, Default)]
+    struct TestVadDetector {
+        reset_count: usize,
+    }
+
+    impl VoiceActivityDetector for TestVadDetector {
+        fn sample_rate(&self) -> u32 {
+            VOICE_ENDPOINT_SAMPLE_RATE
+        }
+
+        fn frame_samples(&self) -> usize {
+            EARSHOT_VAD_FRAME_SAMPLES
+        }
+
+        fn predict_i16(&mut self, frame: &[i16], _update_background: bool) -> f32 {
+            if frame.iter().any(|sample| *sample != 0) {
+                1.0
+            } else {
+                0.0
+            }
+        }
+
+        fn reset(&mut self) {
+            self.reset_count += 1;
+        }
+    }
+
     #[test]
     fn sample_conversion_clamps_float_values() {
         assert_eq!(2.0_f32.into_i16(), i16::MAX);
@@ -570,26 +762,42 @@ mod tests {
     }
 
     #[test]
-    fn frame_rms_returns_zero_for_silence() {
-        assert_eq!(frame_rms(&[0, 0, 0]), 0.0);
+    fn voice_endpoint_waits_for_voice_before_starting() {
+        let mut endpoint = VoiceEndpoint::new_with_detector(
+            VoiceEndpointConfig::default(),
+            Box::new(TestVadDetector::default()),
+        );
+        let silence = vec![0; samples_for_ms(VOICE_ENDPOINT_SAMPLE_RATE, 1_000)];
+
+        assert!(endpoint.push(&silence).is_empty());
     }
 
     #[test]
-    fn frame_rms_returns_constant_sample_level() {
-        assert!((frame_rms(&[300, 300, 300]) - 300.0).abs() < f64::EPSILON);
+    fn voice_endpoint_starts_on_voice_and_stops_after_silence() {
+        let config = VoiceEndpointConfig::default();
+        let mut endpoint =
+            VoiceEndpoint::new_with_detector(config, Box::new(TestVadDetector::default()));
+        let speech =
+            vec![8_000; samples_for_ms(VOICE_ENDPOINT_SAMPLE_RATE, config.start_confirm_ms)];
+        let actions = endpoint.push(&speech);
+
+        assert!(matches!(
+            actions.as_slice(),
+            [VoiceEndpointAction::Start, VoiceEndpointAction::Audio(_)]
+        ));
+
+        let silence =
+            vec![0; samples_for_ms(VOICE_ENDPOINT_SAMPLE_RATE, config.end_silence_ms + 16)];
+        let actions = endpoint.push(&silence);
+
+        assert!(matches!(actions.last(), Some(VoiceEndpointAction::Stop)));
     }
 
     #[test]
-    fn rms_to_dbfs_converts_relative_to_full_scale() {
-        assert!((rms_to_dbfs(300.0) - -40.77).abs() < 0.02);
-    }
+    fn earshot_vad_uses_expected_frame_size_and_ignores_silence() {
+        let mut detector = EarshotVadDetector::new();
 
-    #[test]
-    fn rms_energy_gate_tracks_peak_rms() {
-        let mut gate = RmsEnergyGate::default();
-
-        assert!(!gate.is_voiced(&[0; 320], true));
-        assert!(gate.is_voiced(&[8_000; 320], true));
-        assert!((gate.observed_peak_rms() - 8_000.0).abs() < 1.0);
+        assert_eq!(detector.frame_samples(), EARSHOT_VAD_FRAME_SAMPLES);
+        assert!(detector.predict_i16(&[0; EARSHOT_VAD_FRAME_SAMPLES], true) < 0.5);
     }
 }

@@ -7,6 +7,7 @@ version.workspace = true
 
 [dependencies]
 cpal.workspace = true
+earshot.workspace = true
 hound.workspace = true
 thiserror.workspace = true
 
