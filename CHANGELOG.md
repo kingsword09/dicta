@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.10.29](https://github.com/kingsword09/dicta/compare/v0.10.28...v0.10.29) - 2026-07-22
+
+### Dependency Updates ⬆️
+- chore(deps): bump the dependencies group with 2 updates by @dependabot[bot] in https://github.com/kingsword09/dicta/pull/79
+
 ## [v0.10.28](https://github.com/kingsword09/dicta/compare/v0.10.27...v0.10.28) - 2026-07-12
 
 ### Other Changes
